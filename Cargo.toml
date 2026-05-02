@@ -1,0 +1,25 @@
+[workspace]
+members = [
+    "crates/vigil-cli",
+    "crates/vigil-core",
+    "crates/vigil-proxy",
+    "crates/vigil-mcp",
+    "crates/vigil-tui",
+    "crates/vigil-watch",
+]
+default-members = ["crates/vigil-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Cliff Harsey <steven.cliff.harsey@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/cliffjames/vigil"
+
+[workspace.metadata]
+description = "Runtime observability and policy enforcement for AI coding agents"
+
+[workspace.dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }

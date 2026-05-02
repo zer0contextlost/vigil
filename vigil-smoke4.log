@@ -1,0 +1,15 @@
+2026-05-02T11:03:32.928677Z  INFO vigil: vigil logging started → vigil-smoke4.log
+2026-05-02T11:03:32.929397Z  INFO vigil: starting vigil proxy port=8877
+2026-05-02T11:03:32.929687Z  INFO vigil: spawning agent cmd=claude
+2026-05-02T11:03:32.932352Z  INFO vigil_proxy: proxy listening addr=127.0.0.1:8877
+2026-05-02T11:03:32.939296Z  INFO vigil::win_console: agent spawned in new console window pid=8528 cmd="claude"
+2026-05-02T11:03:32.939350Z  INFO vigil: agent process started pid=8528
+2026-05-02T11:03:35.149655Z  INFO vigil_proxy: LLM request forwarded upstream provider="anthropic" model=claude-sonnet-4-6
+2026-05-02T11:03:38.433482Z  INFO vigil_proxy: SSE first chunk preview=event: message_start
+data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","id":"msg_01Ap7Jwx5tgp9yfGR5uGJvrw","type":"message","role":"assistant","content":[],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":54135,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"output_tokens":1,"service_tier":"standard","inference_geo":"not_available"}}              }
+
+ chunk_len=498
+2026-05-02T11:03:38.819991Z  INFO vigil_proxy: SSE stream complete model=claude-sonnet-4-6 input_tokens=3 output_tokens=12 blank_lines_seen=8 data_lines_seen=8 events_dispatched=8 json_parse_failures=0 pending_bytes=0
+2026-05-02T11:03:38.820025Z  INFO vigil_proxy: LLM response received model=claude-sonnet-4-6 input_tokens=3 output_tokens=12 cost_usd=0.000189
+2026-05-02T11:03:39.200325Z  INFO vigil: agent process exited
+2026-05-02T11:03:40.702957Z  INFO vigil: session saved path=C:\Users\Cliff\.vigil\sessions\a18f77d9-6edf-4b92-b702-555858039521.json

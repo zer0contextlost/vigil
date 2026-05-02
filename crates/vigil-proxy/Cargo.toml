@@ -1,0 +1,26 @@
+[package]
+name = "vigil-proxy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = "0.1"
+http = "1.0"
+bytes = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rcgen = "0.12"
+rustls = { version = "0.23", features = ["std", "ring"] }
+tokio-rustls = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+vigil-core = { path = "../vigil-core" }
+tracing = { workspace = true }

@@ -1,0 +1,32 @@
+[package]
+name = "vigil"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Runtime observability and policy enforcement for AI coding agents"
+keywords = ["ai", "agents", "security", "observability", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "../../README.md"
+homepage = "https://github.com/vigil-dev/vigil"
+documentation = "https://github.com/vigil-dev/vigil"
+
+[[bin]]
+name = "vigil"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.0", features = ["derive"] }
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+vigil-core = { path = "../vigil-core" }
+vigil-proxy = { path = "../vigil-proxy" }
+vigil-tui = { path = "../vigil-tui" }
+vigil-watch = { path = "../vigil-watch" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security"] }

@@ -1,0 +1,10 @@
+2026-05-02T10:55:42.591879Z  INFO vigil: vigil logging started → vigil-smoke2.log
+2026-05-02T10:55:42.592671Z  INFO vigil: starting vigil proxy port=8877
+2026-05-02T10:55:42.592855Z  INFO vigil: spawning agent cmd=claude
+2026-05-02T10:55:42.594163Z  INFO vigil_proxy: proxy listening addr=127.0.0.1:8877
+2026-05-02T10:55:42.599922Z  INFO vigil::win_console: agent spawned in new console window pid=39576 cmd="claude"
+2026-05-02T10:55:42.599971Z  INFO vigil: agent process started pid=39576
+2026-05-02T10:55:45.350189Z  INFO vigil_proxy: LLM request forwarded upstream provider="anthropic" model=claude-sonnet-4-6
+2026-05-02T10:55:47.990187Z  INFO vigil_proxy: SSE stream complete model=claude-sonnet-4-6 input_tokens=0 output_tokens=0
+2026-05-02T10:55:48.501338Z  INFO vigil: agent process exited
+2026-05-02T10:55:50.004675Z  INFO vigil: session saved path=C:\Users\Cliff\.vigil\sessions\d060cdf3-661e-4e2c-956d-27f8a8166e0e.json

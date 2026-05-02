@@ -1,0 +1,61 @@
+policies:
+  # Hardcoded safety floor: destructive shell patterns are always blocked
+  # Examples: rm -rf, dd if=, mkfs, fork bombs, curl|sh, wget|sh
+
+  - name: block-rm-rf
+    matcher:
+      type: ToolCall
+      tool_name_pattern: "bash"
+    action: DENY
+    # Note: rm -rf is caught by hardcoded floor, always denied
+
+  - name: require-confirmation-for-git-commands
+    matcher:
+      type: ToolCall
+      tool_name_pattern: "bash"
+    action: CONFIRM
+    # User must confirm any Bash tool calls
+
+  - name: deny-writes-outside-project
+    matcher:
+      type: FsWriteOutside
+      root: "/home/user/myproject"
+    action: DENY
+    # Block any file writes outside the project root
+
+  - name: deny-writes-to-sensitive-dirs
+    matcher:
+      type: FsPath
+      path_pattern: ".env"
+    action: DENY
+    # Block writes to .env files
+
+  - name: deny-reads-from-secrets
+    matcher:
+      type: FsPath
+      path_pattern: "secrets"
+    action: DENY
+    # Block reads from files containing "secrets" in path
+
+  - name: restrict-to-openai-and-anthropic
+    matcher:
+      type: NetworkDomain
+      deny_unless_in: ["openai", "anthropic"]
+    action: DENY
+    # Only allow LLM calls to OpenAI or Anthropic
+
+  - name: token-budget-warning
+    matcher:
+      type: TokenBudget
+      max_tokens: 1000000
+    action: LOGONLY
+    # Log a warning when session hits 1M tokens
+
+  - name: tool-input-validation
+    matcher:
+      type: ToolCallInput
+      tool_name_pattern: "http_request"
+      input_field: "url"
+      value_pattern: "localhost"
+    action: DENY
+    # Deny http_request tool calls with localhost URLs
