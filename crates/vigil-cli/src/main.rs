@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost, PluginContext, PluginDecision};
+use vigil_core::{session::Session, store::SessionStore, AlertLabel, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost, PluginContext, PluginDecision};
 use vigil_proxy::Proxy;
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
@@ -47,6 +47,11 @@ enum PluginCommands {
     /// Copy a compiled plugin (.dll/.so/.dylib) into the auto-load directory
     Install {
         /// Path to the compiled shared library
+        path: PathBuf,
+    },
+    /// Validate a compiled plugin without installing it (checks ABI/rustc compatibility)
+    Check {
+        /// Path to the compiled shared library to validate
         path: PathBuf,
     },
 }
@@ -258,7 +263,7 @@ mod win_console {
 
     pub fn spawn(program: &str, args: &[String], extra_env: &[(&str, &str)]) -> Result<WinChild> {
         let mut cmdline = build_cmdline(program, args);
-        let mut env_block = build_env_block(extra_env);
+        let env_block = build_env_block(extra_env);
 
         let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -307,10 +312,43 @@ mod win_console {
 
         if ok == FALSE {
             let err = unsafe { GetLastError() };
-            return Err(anyhow!(
-                "CreateProcessW failed: Windows error code {}",
-                err
-            ));
+            // ERROR_FILE_NOT_FOUND (2): program may be a .cmd/.bat script that requires
+            // cmd.exe to interpret (e.g. cursor.cmd, aider.cmd installed by pip/npm).
+            // Retry once by wrapping in `cmd.exe /C <original cmdline>`.
+            if err == 2 {
+                let cmd_args: Vec<String> =
+                    std::iter::once("/C".to_string())
+                        .chain(std::iter::once(program.to_string()))
+                        .chain(args.iter().cloned())
+                        .collect();
+                let mut cmdline2 = build_cmdline("cmd.exe", &cmd_args);
+                let ok2 = unsafe {
+                    CreateProcessW(
+                        std::ptr::null(),
+                        cmdline2.as_mut_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        FALSE,
+                        CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT,
+                        env_block.as_ptr() as *const _,
+                        std::ptr::null(),
+                        &si,
+                        &mut pi,
+                    )
+                };
+                if ok2 == FALSE {
+                    let err2 = unsafe { GetLastError() };
+                    return Err(anyhow!(
+                        "cannot launch {:?} (error {}) or via cmd.exe /C (error {})",
+                        program, err, err2
+                    ));
+                }
+            } else {
+                return Err(anyhow!(
+                    "CreateProcessW failed: Windows error code {}",
+                    err
+                ));
+            }
         }
 
         unsafe { CloseHandle(pi.hThread); } // we don't need the thread handle
@@ -1099,8 +1137,8 @@ pub async fn run_agent_with_plugins(
                         });
                         let detail = serde_json::json!({"tool_name": tool_name, "elapsed_secs": secs});
                         let ctx = make_plugin_ctx(sid);
-                        plugin_host_tout.dispatch_alert(&ctx, "TOUT", &detail);
-                        plugin_host_tout.dispatch_event(&ctx, &ev);
+                        plugin_host_tout.dispatch_alert(&ctx, AlertLabel::Timeout, &detail).await;
+                        plugin_host_tout.dispatch_event(&ctx, &ev).await;
                         tx.send(ev).await.ok();
                         eprintln!("[TIMEOUT] Tool '{}' has been running {}s with no response", tool_name, secs);
                     }
@@ -1138,8 +1176,8 @@ pub async fn run_agent_with_plugins(
                 n.send("DURA", &sid.to_string(), detail.clone());
             }
             let ctx = make_plugin_ctx(sid);
-            plugin_host_dura.dispatch_alert(&ctx, "DURA", &detail);
-            plugin_host_dura.dispatch_event(&ctx, &ev);
+            plugin_host_dura.dispatch_alert(&ctx, AlertLabel::Duration, &detail).await;
+            plugin_host_dura.dispatch_event(&ctx, &ev).await;
             tx.send(ev).await.ok();
             eprintln!("[DURATION] Session has been running {}min", duration_mins);
         });
@@ -1207,8 +1245,8 @@ pub async fn run_agent_with_plugins(
                                 n.send("EXFL", &sid.to_string(), detail.clone());
                             }
                             let ctx = make_plugin_ctx(*sid);
-                            plugin_host_filter.dispatch_alert(&ctx, "EXFL", &detail);
-                            plugin_host_filter.dispatch_event(&ctx, &alert);
+                            plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                            plugin_host_filter.dispatch_event(&ctx, &alert).await;
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -1233,8 +1271,8 @@ pub async fn run_agent_with_plugins(
                                 n.send("EXFL", &sid.to_string(), detail.clone());
                             }
                             let ctx = make_plugin_ctx(*sid);
-                            plugin_host_filter.dispatch_alert(&ctx, "EXFL", &detail);
-                            plugin_host_filter.dispatch_event(&ctx, &alert);
+                            plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                            plugin_host_filter.dispatch_event(&ctx, &alert).await;
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -1268,8 +1306,8 @@ pub async fn run_agent_with_plugins(
                             n.send("COST", &session_id_for_alerts.to_string(), detail.clone());
                         }
                         let ctx = make_plugin_ctx(session_id_for_alerts);
-                        plugin_host_filter.dispatch_alert(&ctx, "COST", &detail);
-                        plugin_host_filter.dispatch_event(&ctx, &alert);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Cost, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
                         filtered_tx.send(alert).await.ok();
                         eprintln!("[COST] Session cost ${:.4} crossed alert threshold ${:.4}", session_cost, threshold);
                     }
@@ -1291,8 +1329,8 @@ pub async fn run_agent_with_plugins(
                             n.send("BURN", &session_id_for_alerts.to_string(), detail.clone());
                         }
                         let ctx = make_plugin_ctx(session_id_for_alerts);
-                        plugin_host_filter.dispatch_alert(&ctx, "BURN", &detail);
-                        plugin_host_filter.dispatch_event(&ctx, &alert);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::BurnRate, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
                         filtered_tx.send(alert).await.ok();
                         if let Some(ref path) = lock_path {
                             vigil_core::update_active(path, |s| {
@@ -1318,8 +1356,8 @@ pub async fn run_agent_with_plugins(
                         n.send("LOOP", &sid.to_string(), detail.clone());
                     }
                     let ctx = make_plugin_ctx(*sid);
-                    plugin_host_filter.dispatch_alert(&ctx, "LOOP", &detail);
-                    plugin_host_filter.dispatch_event(&ctx, &alert);
+                    plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Loop, &detail).await;
+                    plugin_host_filter.dispatch_event(&ctx, &alert).await;
                     filtered_tx.send(alert).await.ok();
                     if let Some(ref path) = lock_path {
                         vigil_core::update_active(path, |s| {
@@ -1395,14 +1433,14 @@ pub async fn run_agent_with_plugins(
                             n.send("DENY", &session_id.to_string(), detail.clone());
                         }
                         let ctx = make_plugin_ctx(*session_id);
-                        plugin_host_filter.dispatch_alert(&ctx, "DENY", &detail);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
                         let blocked = TimestampedEvent::new(Event::ToolCallResult {
                             agent: agent.clone(),
                             tool_name: tool_name.clone(),
                             blocked: true,
                             session_id: *session_id,
                         });
-                        plugin_host_filter.dispatch_event(&ctx, &blocked);
+                        plugin_host_filter.dispatch_event(&ctx, &blocked).await;
                         filtered_tx.send(blocked).await.ok();
                     }
                 }
@@ -1410,7 +1448,7 @@ pub async fn run_agent_with_plugins(
                     // After policy allows, consult plugins for tool calls.
                     if let Event::ToolCall { tool_name, input, agent, session_id, .. } = &event.event {
                         let ctx = make_plugin_ctx(*session_id);
-                        if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input) {
+                        if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input).await {
                             eprintln!("[PLUGIN DENY] {} — {}", tool_name, reason);
                             let detail = serde_json::json!({
                                 "tool_name": tool_name,
@@ -1420,21 +1458,21 @@ pub async fn run_agent_with_plugins(
                             if let Some(ref n) = notifier_filter {
                                 n.send("DENY", &session_id.to_string(), detail.clone());
                             }
-                            plugin_host_filter.dispatch_alert(&ctx, "DENY", &detail);
+                            plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
                             let blocked = TimestampedEvent::new(Event::ToolCallResult {
                                 agent: agent.clone(),
                                 tool_name: tool_name.clone(),
                                 blocked: true,
                                 session_id: *session_id,
                             });
-                            plugin_host_filter.dispatch_event(&ctx, &blocked);
+                            plugin_host_filter.dispatch_event(&ctx, &blocked).await;
                             filtered_tx.send(blocked).await.ok();
                             continue;
                         }
-                        plugin_host_filter.dispatch_event(&ctx, &event);
+                        plugin_host_filter.dispatch_event(&ctx, &event).await;
                     } else {
                         let ctx = make_plugin_ctx(session_id_for_alerts);
-                        plugin_host_filter.dispatch_event(&ctx, &event);
+                        plugin_host_filter.dispatch_event(&ctx, &event).await;
                     }
                     filtered_tx.send(event).await.ok();
                 }
@@ -1789,6 +1827,17 @@ async fn run_plugins_command(action: PluginCommands) -> anyhow::Result<()> {
             println!("It will auto-load on the next `vigil run`.");
         }
 
+        PluginCommands::Check { path } => {
+            println!("Checking plugin: {}", path.display());
+            match PluginHost::check_file(&path) {
+                Ok(name) => println!("OK  name={}", name),
+                Err(e) => {
+                    eprintln!("FAIL: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         PluginCommands::New { name, template, path } => {
             let template = match template {
                 Some(t) => t,
@@ -1941,7 +1990,7 @@ fn template_alert(name: &str) -> String {
 //! Configuration via environment variables:
 //!   PLUGIN_WEBHOOK_URL - URL to POST alerts to (optional)
 
-use vigil_plugin::{{declare_plugin, PluginContext, Value, VigilPlugin}};
+use vigil_plugin::{{async_trait, declare_plugin, AlertLabel, PluginContext, Value, VigilPlugin}};
 
 pub struct {struct_name} {{
     webhook_url: Option<String>,
@@ -1955,13 +2004,14 @@ impl {struct_name} {{
     }}
 }}
 
+#[async_trait]
 impl VigilPlugin for {struct_name} {{
     fn name(&self) -> &str {{ "{name}" }}
 
-    fn on_alert(&self, ctx: &PluginContext, label: &str, detail: &Value) {{
+    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {{
         let msg = format!(
             "[vigil {{}}] session={{}} {{}}",
-            label,
+            label.code(),
             &ctx.session_id.to_string()[..8],
             detail,
         );
@@ -2002,7 +2052,7 @@ fn template_gatekeeper(name: &str) -> String {
 //!   PLUGIN_BLOCK_TOOLS - comma-separated tool name substrings to deny
 //!                        e.g. "Bash,WebSearch"
 
-use vigil_plugin::{{declare_plugin, PluginContext, PluginDecision, Value, VigilPlugin}};
+use vigil_plugin::{{async_trait, declare_plugin, PluginContext, PluginDecision, Value, VigilPlugin}};
 
 pub struct {struct_name} {{
     block_patterns: Vec<String>,
@@ -2021,10 +2071,11 @@ impl {struct_name} {{
     }}
 }}
 
+#[async_trait]
 impl VigilPlugin for {struct_name} {{
     fn name(&self) -> &str {{ "{name}" }}
 
-    fn on_tool_call(
+    async fn on_tool_call(
         &self,
         _ctx: &PluginContext,
         tool_name: &str,
@@ -2072,7 +2123,7 @@ fn template_logger(name: &str) -> String {
 use std::fs::{{File, OpenOptions}};
 use std::io::Write;
 use std::sync::Mutex;
-use vigil_plugin::{{declare_plugin, Envelope, PluginContext, Value, VigilPlugin}};
+use vigil_plugin::{{async_trait, declare_plugin, AlertLabel, Envelope, PluginContext, Value, VigilPlugin}};
 
 pub struct {struct_name} {{
     file: Mutex<File>,
@@ -2102,10 +2153,11 @@ impl {struct_name} {{
     }}
 }}
 
+#[async_trait]
 impl VigilPlugin for {struct_name} {{
     fn name(&self) -> &str {{ "{name}" }}
 
-    fn on_event(&self, ctx: &PluginContext, envelope: &Envelope) {{
+    async fn on_event(&self, ctx: &PluginContext, envelope: &Envelope) {{
         self.write(&serde_json::json!({{
             "type": "event",
             "session_id": ctx.session_id,
@@ -2113,11 +2165,11 @@ impl VigilPlugin for {struct_name} {{
         }}));
     }}
 
-    fn on_alert(&self, ctx: &PluginContext, label: &str, detail: &Value) {{
+    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {{
         self.write(&serde_json::json!({{
             "type": "alert",
             "session_id": ctx.session_id,
-            "label": label,
+            "label": label.code(),
             "detail": detail,
         }}));
     }}
@@ -2135,18 +2187,19 @@ fn template_blank(name: &str) -> String {
 //!
 //! All three hooks are stubbed. Implement what you need.
 
-use vigil_plugin::{{declare_plugin, Envelope, PluginContext, PluginDecision, Value, VigilPlugin}};
+use vigil_plugin::{{async_trait, declare_plugin, AlertLabel, Envelope, PluginContext, PluginDecision, Value, VigilPlugin}};
 
 pub struct {struct_name};
 
+#[async_trait]
 impl VigilPlugin for {struct_name} {{
     fn name(&self) -> &str {{ "{name}" }}
 
-    fn on_event(&self, _ctx: &PluginContext, _envelope: &Envelope) {{}}
+    async fn on_event(&self, _ctx: &PluginContext, _envelope: &Envelope) {{}}
 
-    fn on_alert(&self, _ctx: &PluginContext, _label: &str, _detail: &Value) {{}}
+    async fn on_alert(&self, _ctx: &PluginContext, _label: AlertLabel, _detail: &Value) {{}}
 
-    fn on_tool_call(&self, _ctx: &PluginContext, _tool_name: &str, _input: &Value) -> PluginDecision {{
+    async fn on_tool_call(&self, _ctx: &PluginContext, _tool_name: &str, _input: &Value) -> PluginDecision {{
         PluginDecision::Allow
     }}
 }}

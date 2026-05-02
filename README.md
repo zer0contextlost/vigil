@@ -225,17 +225,20 @@ vigil run --plugin ./extra.dll -- claude   # load a specific plugin once
 Plugins implement the `VigilPlugin` trait from the `vigil-plugin` SDK crate:
 
 ```rust
-use vigil_plugin::{declare_plugin, Envelope, PluginContext, PluginDecision, Value, VigilPlugin};
+use vigil_plugin::{async_trait, declare_plugin, AlertLabel, Envelope, PluginContext, PluginDecision, Value, VigilPlugin};
 
 struct MyPlugin;
+
+#[async_trait]
 impl VigilPlugin for MyPlugin {
     fn name(&self) -> &str { "my-plugin" }
 
-    fn on_alert(&self, ctx: &PluginContext, label: &str, detail: &Value) {
+    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {
         // fires on BURN, LOOP, EXFL, DENY, COST, DURA, TOUT, WAPPR, PII
+        // use label.code() to get the short string, e.g. "BURN"
     }
 
-    fn on_tool_call(&self, _ctx: &PluginContext, tool_name: &str, _input: &Value) -> PluginDecision {
+    async fn on_tool_call(&self, _ctx: &PluginContext, tool_name: &str, _input: &Value) -> PluginDecision {
         // called after policy allows — return Deny to block
         PluginDecision::Allow
     }
