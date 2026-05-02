@@ -39,6 +39,10 @@ enum Commands {
         #[arg(long)]
         pii_watchlist: Option<PathBuf>,
 
+        /// Shared library plugin(s) to load (.dll / .so / .dylib). May be repeated.
+        #[arg(long = "plugin")]
+        plugins: Vec<PathBuf>,
+
         /// Agent command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         agent_and_args: Vec<String>,
@@ -67,6 +71,21 @@ enum Commands {
     Audit {
         /// Session ID (UUID) to audit
         session_id: String,
+    },
+
+    /// Verify hash chain and ed25519 signature of a recorded session
+    Verify {
+        /// Session ID (UUID) to verify
+        session_id: String,
+    },
+
+    /// Export a session to NDJSON with PII redacted
+    Export {
+        /// Session ID (UUID) to export
+        session_id: String,
+        /// Output file path (default: stdout)
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 
     /// Show all currently active vigil sessions
@@ -296,13 +315,21 @@ async fn main() -> Result<()> {
             config,
             log_file,
             pii_watchlist,
+            plugins,
             agent_and_args,
         }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
             let config_path_str = config.as_deref().map(|p| p.display().to_string());
             let vigil_config = config.as_deref()
                 .and_then(|p| vigil_core::VigilConfig::load(p).ok());
-            run_agent(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str).await?;
+            let mut plugin_host = PluginHost::new();
+            for path in &plugins {
+                match plugin_host.load_from_file(path) {
+                    Ok(()) => println!("Loaded plugin: {}", path.display()),
+                    Err(e) => eprintln!("Warning: {}", e),
+                }
+            }
+            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host).await?;
         }
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
@@ -336,6 +363,12 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Audit { session_id }) => {
             run_audit(&session_id)?;
+        }
+        Some(Commands::Verify { session_id }) => {
+            run_verify(&session_id)?;
+        }
+        Some(Commands::Export { session_id, output }) => {
+            run_export(&session_id, output.as_deref())?;
         }
         Some(Commands::Ps) => {
             run_ps()?;
@@ -480,6 +513,123 @@ fn run_audit(session_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil verify
+// ---------------------------------------------------------------------------
+
+fn run_verify(session_id: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    let actual_count = envelopes.len();
+
+    println!("vigil verify: {}", session_id);
+    println!("Events:     {}", actual_count);
+
+    // --- Hash chain ---
+    let mut chain_ok = true;
+    let mut chain_msg = String::from("OK");
+    let mut expected_prev = String::new();
+    let mut final_hash = String::new();
+
+    for (i, env) in envelopes.iter().enumerate() {
+        if env.prev_hash != expected_prev {
+            chain_ok = false;
+            chain_msg = format!(
+                "BROKEN at event {}, expected {} got {}",
+                i, expected_prev, env.prev_hash
+            );
+            break;
+        }
+        final_hash = env.compute_hash();
+        expected_prev = final_hash.clone();
+    }
+    println!("Hash chain: {}", chain_msg);
+
+    // --- ed25519 signature ---
+    let (sig_ok, sig_msg) = match vigil_core::store::SessionStore::load_meta(&uuid) {
+        Ok(meta) => {
+            if meta.chain_signature.is_none() {
+                (true, "SKIP (session predates signing)".to_string())
+            } else if meta.chain_root_hash != final_hash {
+                (false, format!("MISMATCH meta root={} actual={}", meta.chain_root_hash, final_hash))
+            } else {
+                match vigil_core::store::SessionStore::verify_signature(&meta, &final_hash) {
+                    Ok(()) => (true, "OK".to_string()),
+                    Err(e) => (false, format!("INVALID: {}", e)),
+                }
+            }
+        }
+        Err(e) => (false, format!("MISSING ({})", e)),
+    };
+    println!("Signature:  {}", sig_msg);
+    println!();
+
+    let issues = [!chain_ok, !sig_ok].iter().filter(|&&f| f).count();
+    if issues == 0 {
+        println!("PASS");
+    } else {
+        println!("FAIL -- {} issue(s) found", issues);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil export
+// ---------------------------------------------------------------------------
+
+fn run_export(session_id: &str, output: Option<&std::path::Path>) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    if envelopes.is_empty() {
+        anyhow::bail!("No events found for session {}", session_id);
+    }
+
+    let mut out_lines: Vec<String> = Vec::with_capacity(envelopes.len());
+    for env in &envelopes {
+        let mut val = serde_json::to_value(env)?;
+        redact_json_value(&mut val);
+        out_lines.push(serde_json::to_string(&val)?);
+    }
+
+    let content = out_lines.join("\n") + "\n";
+
+    if let Some(path) = output {
+        std::fs::write(path, &content)?;
+        println!("Exported {} events (redacted) → {}", envelopes.len(), path.display());
+    } else {
+        print!("{}", content);
+    }
+
+    Ok(())
+}
+
+/// Recursively walk a JSON value and replace any string that contains PII
+/// with "[REDACTED:<kind>]".
+fn redact_json_value(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::String(s) => {
+            let hits = vigil_core::scan_pii(s);
+            if !hits.is_empty() {
+                let labels: Vec<_> = hits.iter().map(|h| h.kind.as_str()).collect();
+                *s = format!("[REDACTED:{}]", labels.join(","));
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() { redact_json_value(v); }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() { redact_json_value(v); }
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------

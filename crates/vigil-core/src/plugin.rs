@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::path::Path;
 
 use crate::envelope::Envelope;
 
@@ -59,6 +60,37 @@ impl PluginHost {
     pub fn dispatch_alert(&self, label: &str, session_id: &str, detail: &Value) {
         for p in &self.plugins {
             p.on_alert(label, session_id, detail);
+        }
+    }
+
+    /// Load a plugin from a shared library (.dll / .so / .dylib).
+    ///
+    /// The library must export a C-ABI function with this exact signature:
+    /// ```c
+    /// // Rust: pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin>
+    /// ```
+    /// The returned pointer must be heap-allocated via `Box::into_raw(Box::new(plugin))`.
+    /// vigil takes ownership and will free it.
+    ///
+    /// **Compatibility note**: plugin and host must be compiled with the same Rust
+    /// toolchain and vigil-core version — `dyn VigilPlugin` vtable layout is not stable
+    /// across compiler versions.
+    pub fn load_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
+        unsafe {
+            let lib = libloading::Library::new(path)
+                .map_err(|e| anyhow::anyhow!("cannot load plugin {}: {}", path.display(), e))?;
+            let create: libloading::Symbol<unsafe extern "C" fn() -> *mut Box<dyn VigilPlugin>> =
+                lib.get(b"vigil_plugin_create\0")
+                    .map_err(|e| anyhow::anyhow!("symbol vigil_plugin_create not found in {}: {}", path.display(), e))?;
+            let raw = create();
+            if raw.is_null() {
+                anyhow::bail!("plugin {} returned null from vigil_plugin_create", path.display());
+            }
+            let plugin = *Box::from_raw(raw);
+            // Leak the Library so it lives as long as the plugin.
+            std::mem::forget(lib);
+            self.plugins.push(plugin);
+            Ok(())
         }
     }
 }
