@@ -902,7 +902,12 @@ pub async fn run_agent_with_plugins(
                     *g = Some((std::time::Instant::now(), tool_name.clone(), false));
                 }
             }
-            if let Event::LlmRequest { .. } = &event.event {
+            // Disarm on any event that signals the tool finished: normal completion
+            // (LlmRequest) or blocked by policy (ToolCallResult { blocked: true }).
+            if matches!(&event.event,
+                Event::LlmRequest { .. }
+                | Event::ToolCallResult { .. }
+            ) {
                 if let Ok(mut g) = last_tool_call_filter.lock() {
                     *g = None;
                 }

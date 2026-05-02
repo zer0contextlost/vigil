@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use ulid::{Generator, Ulid};
+use ulid::Generator;
 use uuid::Uuid;
 
 use crate::envelope::Envelope;
@@ -79,7 +79,8 @@ impl SessionStore {
     /// Append one envelope to the NDJSON file, update the hash chain, fsync.
     pub fn append(&mut self, envelope: &Envelope) -> Result<()> {
         let mut env = envelope.clone();
-        env.event_id = self.ulid_gen.generate().unwrap_or_else(|_| Ulid::new());
+        env.event_id = self.ulid_gen.generate()
+            .map_err(|e| anyhow::anyhow!("ULID generation failed (monotonicity overflow): {}", e))?;
         env.prev_hash = self.last_hash.clone();
         self.last_hash = env.compute_hash();
 

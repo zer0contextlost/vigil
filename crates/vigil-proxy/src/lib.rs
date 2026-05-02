@@ -555,7 +555,7 @@ async fn stream_sse_response(
 
                     if line_bytes.is_empty() {
                         if let Some(data) = event_data.take() {
-                            if data != "[DONE]" {
+                            if data != "[DONE]" && !data.is_empty() {
                                 if let Ok(event_json) = serde_json::from_str::<Value>(&data) {
                                     match provider {
                                         "openai" | "openrouter" => process_openai_sse_event(
@@ -587,7 +587,7 @@ async fn stream_sse_response(
         }
 
         // After parsing, decide: buffer or forward.
-        if state.holding && write_approval_threshold.is_some() {
+        if state.holding && write_approval_threshold.is_some() && client_alive {
             hold_buffer.push(chunk.to_vec());
         } else if client_alive {
             let frame_header = format!("{:x}\r\n", chunk.len());
