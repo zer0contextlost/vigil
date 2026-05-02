@@ -438,15 +438,34 @@ async fn handle_reverse_proxy(
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false);
 
-    // Write HTTP response status line + headers to client
+    // Write HTTP response status line + headers to client.
+    // Only forward a known-safe set to prevent header injection from upstream responses.
+    const ALLOWED_RESP_HEADERS: &[&str] = &[
+        "content-type",
+        "content-length",
+        "cache-control",
+        "x-request-id",
+        "anthropic-ratelimit-requests-limit",
+        "anthropic-ratelimit-requests-remaining",
+        "anthropic-ratelimit-requests-reset",
+        "anthropic-ratelimit-tokens-limit",
+        "anthropic-ratelimit-tokens-remaining",
+        "anthropic-ratelimit-tokens-reset",
+        "retry-after",
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+    ];
     let mut header_block = format!("HTTP/1.1 {}\r\n", status);
     for (k, v) in &resp_headers {
-        if let Ok(val) = v.to_str() {
-            // Skip transfer-encoding — we'll manage framing ourselves
-            if k.as_str().eq_ignore_ascii_case("transfer-encoding") {
-                continue;
+        let name = k.as_str().to_ascii_lowercase();
+        if ALLOWED_RESP_HEADERS.contains(&name.as_str()) {
+            if let Ok(val) = v.to_str() {
+                header_block.push_str(&format!("{}: {}\r\n", k, val));
             }
-            header_block.push_str(&format!("{}: {}\r\n", k, val));
         }
     }
 
@@ -611,7 +630,19 @@ async fn stream_sse_response(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let before = std::fs::read_to_string(&path_str).unwrap_or_default();
+            // Reject paths that escape the working directory to prevent path traversal.
+            let safe_path = std::env::current_dir().ok().and_then(|cwd| {
+                let p = std::path::Path::new(&path_str);
+                let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+                abs.canonicalize().ok().filter(|canon| canon.starts_with(&cwd))
+            });
+            if safe_path.is_none() && !path_str.is_empty() {
+                tracing::warn!(path = %path_str, "write approval: path rejected (outside cwd or invalid)");
+                // Skip approval — treat as no content to diff
+            }
+            let before = safe_path.as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
 
             let after = if tool_name.eq_ignore_ascii_case("Write") || tool_name.eq_ignore_ascii_case("NotebookEdit") {
                 input.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string()

@@ -24,13 +24,19 @@ impl fmt::Display for ProviderKind {
 }
 
 pub fn detect_provider_from_host(host: &str) -> ProviderKind {
-    match host {
-        h if h.contains("api.anthropic.com") => ProviderKind::Anthropic,
-        h if h.contains("api.openai.com") => ProviderKind::OpenAI,
-        h if h.contains("generativelanguage.googleapis.com") => ProviderKind::Gemini,
-        h if h.contains("openrouter.ai") => ProviderKind::OpenRouter,
-        h if h.contains("api.x.ai") => ProviderKind::XAI,
-        _ => ProviderKind::Unknown,
+    let h = host.to_ascii_lowercase();
+    if h.contains("api.anthropic.com") {
+        ProviderKind::Anthropic
+    } else if h.contains("api.openai.com") {
+        ProviderKind::OpenAI
+    } else if h.contains("generativelanguage.googleapis.com") {
+        ProviderKind::Gemini
+    } else if h.contains("openrouter.ai") {
+        ProviderKind::OpenRouter
+    } else if h.contains("api.x.ai") {
+        ProviderKind::XAI
+    } else {
+        ProviderKind::Unknown
     }
 }
 
