@@ -151,6 +151,7 @@ impl App {
             vigil_core::Event::ExfilAlert { .. } => {
                 self.counts.exfil_alerts += 1;
             }
+            vigil_core::Event::ToolTimeout { .. } => {}
         }
         if let Some(ref mut store) = self.store {
             let _ = store.append(event);
@@ -321,6 +322,8 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("WDECID", Style::default().fg(Color::Green)),
         vigil_core::Event::ExfilAlert { .. } =>
             ("EXFL", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::ToolTimeout { .. } =>
+            ("TOUT", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
@@ -331,6 +334,7 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
         | vigil_core::Event::BurnRateAlert { .. }
         | vigil_core::Event::LoopAlert { .. }
         | vigil_core::Event::ExfilAlert { .. }
+        | vigil_core::Event::ToolTimeout { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -388,6 +392,8 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("write {}", if *approved { "approved" } else { "rejected" }),
         vigil_core::Event::ExfilAlert { source, matches, .. } =>
             format!("{}: {}", source, matches.join(", ")),
+        vigil_core::Event::ToolTimeout { tool_name, elapsed_secs, .. } =>
+            format!("{} running {}s with no response", tool_name, elapsed_secs),
     }
 }
 
@@ -507,6 +513,13 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             for m in matches {
                 out.push(body_line(&format!("  [!] {}", m)));
             }
+        }
+        vigil_core::Event::ToolTimeout { tool_name, elapsed_secs, .. } => {
+            out.push(header_line("TOOL TIMEOUT".to_string(), Color::Yellow));
+            out.push(body_line(&format!("tool:    {}", tool_name)));
+            out.push(body_line(&format!("elapsed: {}s ({:.1}min)", elapsed_secs, *elapsed_secs as f64 / 60.0)));
+            out.push(body_line("The agent called this tool but no follow-up LLM request arrived in time."));
+            out.push(body_line("The tool may be hung. Consider interrupting the session."));
         }
     }
 

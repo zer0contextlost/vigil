@@ -46,6 +46,14 @@ pub struct ProxySection {
     /// patterns. Set to [] to disable all blocking.
     #[serde(default = "default_blocked_commands")]
     pub blocked_commands: Vec<String>,
+    /// Emit a ToolTimeout alert if no LlmRequest follows a tool call within
+    /// this many seconds. None disables the check. Recommended: 600 (10 min).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+    /// If set, automatically kill the agent process after this many seconds
+    /// of tool silence (must be >= tool_timeout_secs). Alert-only opt-in.
+    #[serde(default)]
+    pub tool_timeout_kill_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -117,4 +117,11 @@ pub enum Event {
         source: String,
         session_id: Uuid,
     },
+    /// Emitted when a tool call has been running longer than tool_timeout_secs
+    /// with no follow-up LlmRequest from the agent.
+    ToolTimeout {
+        tool_name: String,
+        elapsed_secs: u64,
+        session_id: Uuid,
+    },
 }

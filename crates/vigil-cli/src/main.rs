@@ -679,6 +679,8 @@ async fn run_agent(
     let loop_threshold = config.as_ref()
         .and_then(|c| c.budget.loop_detect_threshold)
         .unwrap_or(5);
+    let tool_timeout_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_secs);
+    let tool_timeout_kill_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_kill_secs);
 
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
@@ -784,10 +786,58 @@ async fn run_agent(
         }
     });
 
+    // Shared state for tool timeout tracking: (started_at, tool_name, alerted)
+    let last_tool_call: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, String, bool)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    if let Some(timeout_secs) = tool_timeout_secs {
+        let state = last_tool_call.clone();
+        let tx = filtered_tx.clone();
+        let sid = session_id;
+        let kill_secs = tool_timeout_kill_secs;
+        let kill_pid = child_pid;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let snapshot = state.lock().ok()
+                    .and_then(|g| g.as_ref().map(|(t, n, a)| (t.elapsed(), n.clone(), *a)));
+                if let Some((elapsed, tool_name, alerted)) = snapshot {
+                    let secs = elapsed.as_secs();
+                    if secs >= timeout_secs && !alerted {
+                        if let Ok(mut g) = state.lock() {
+                            if let Some(ref mut v) = *g { v.2 = true; }
+                        }
+                        let ev = TimestampedEvent::new(Event::ToolTimeout {
+                            tool_name: tool_name.clone(),
+                            elapsed_secs: secs,
+                            session_id: sid,
+                        });
+                        tx.send(ev).await.ok();
+                        eprintln!("[TIMEOUT] Tool '{}' has been running {}s with no response", tool_name, secs);
+                    }
+                    if let Some(ks) = kill_secs {
+                        if secs >= ks {
+                            eprintln!("[TIMEOUT] Killing agent (pid {}) after {}s", kill_pid, secs);
+                            #[cfg(windows)]
+                            { let _ = std::process::Command::new("taskkill")
+                                .args(["/PID", &kill_pid.to_string(), "/F"]).output(); }
+                            #[cfg(not(windows))]
+                            { let _ = std::process::Command::new("kill")
+                                .args(["-TERM", &kill_pid.to_string()]).output(); }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Policy filter: evaluate every raw event and forward allowed ones to the TUI.
     let lock_path = active_handle.as_ref().map(|h| h.path.clone());
     let engine_clone = engine.clone();
     let session_id_for_alerts = session_id;
+    let last_tool_call_filter = last_tool_call.clone();
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
@@ -795,6 +845,18 @@ async fn run_agent(
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut cred_tracker = CredentialTracker::new();
         while let Some(event) = raw_rx.recv().await {
+            // Tool timeout tracking: arm on ToolCall, disarm on LlmRequest
+            if let Event::ToolCall { tool_name, .. } = &event.event {
+                if let Ok(mut g) = last_tool_call_filter.lock() {
+                    *g = Some((std::time::Instant::now(), tool_name.clone(), false));
+                }
+            }
+            if let Event::LlmRequest { .. } = &event.event {
+                if let Ok(mut g) = last_tool_call_filter.lock() {
+                    *g = None;
+                }
+            }
+
             if let Event::LlmRequest { input_tokens, .. } = &event.event {
                 session_tokens += input_tokens;
             }
