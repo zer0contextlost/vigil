@@ -4,6 +4,7 @@ pub mod burn_rate;
 pub mod config;
 pub mod envelope;
 pub mod event;
+pub mod exfil;
 pub mod pii;
 pub mod policy;
 pub mod pricing;
@@ -14,6 +15,7 @@ pub mod session;
 pub mod store;
 
 pub use active::{ActiveSession, ActiveSessionHandle, create_handle, list_active, update_active};
+pub use exfil::CredentialTracker;
 pub use budget::{BudgetEnforcer, BudgetStatus};
 pub use burn_rate::{BurnRateTracker, LoopDetector};
 pub use config::VigilConfig;

@@ -29,6 +29,7 @@ pub struct EventCounts {
     pub mcp: usize,
     pub burn_alerts: usize,
     pub loop_alerts: usize,
+    pub exfil_alerts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +147,9 @@ impl App {
                 if self.pending_approval.as_ref().map(|p| p.approval_id == *approval_id).unwrap_or(false) {
                     self.pending_approval = None;
                 }
+            }
+            vigil_core::Event::ExfilAlert { .. } => {
+                self.counts.exfil_alerts += 1;
             }
         }
         if let Some(ref mut store) = self.store {
@@ -315,6 +319,8 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("WAPPR", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         vigil_core::Event::WriteApprovalDecision { .. } =>
             ("WDECID", Style::default().fg(Color::Green)),
+        vigil_core::Event::ExfilAlert { .. } =>
+            ("EXFL", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
@@ -324,6 +330,7 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
         | vigil_core::Event::PiiAlert { .. }
         | vigil_core::Event::BurnRateAlert { .. }
         | vigil_core::Event::LoopAlert { .. }
+        | vigil_core::Event::ExfilAlert { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -379,6 +386,8 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("write approval required: {} [{}]", truncate(path, 40), risk_level),
         vigil_core::Event::WriteApprovalDecision { approved, .. } =>
             format!("write {}", if *approved { "approved" } else { "rejected" }),
+        vigil_core::Event::ExfilAlert { source, matches, .. } =>
+            format!("{}: {}", source, matches.join(", ")),
     }
 }
 
@@ -492,6 +501,13 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(header_line(format!("WRITE DECISION  [{}]", label), color));
             out.push(body_line(&format!("approval_id: {}", approval_id)));
         }
+        vigil_core::Event::ExfilAlert { source, matches, .. } => {
+            out.push(header_line(format!("EXFIL ALERT  source: {}", source), Color::Red));
+            out.push(body_line("Credential fingerprint(s) from a file read detected in outbound content:"));
+            for m in matches {
+                out.push(body_line(&format!("  [!] {}", m)));
+            }
+        }
     }
 
     out
@@ -575,6 +591,13 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
         out.push(stat_row(
             "loop alerts",
             c.loop_alerts.to_string(),
+            Color::Red,
+        ));
+    }
+    if c.exfil_alerts > 0 {
+        out.push(stat_row(
+            "exfil alerts",
+            c.exfil_alerts.to_string(),
             Color::Red,
         ));
     }
