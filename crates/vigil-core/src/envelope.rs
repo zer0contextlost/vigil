@@ -81,6 +81,8 @@ fn extract_session_id(event: &Event) -> Uuid {
         | Event::WriteApprovalRequired { session_id, .. }
         | Event::WriteApprovalDecision { session_id, .. }
         | Event::ExfilAlert { session_id, .. }
-        | Event::ToolTimeout { session_id, .. } => *session_id,
+        | Event::ToolTimeout { session_id, .. }
+        | Event::CostAlert { session_id, .. }
+        | Event::SessionDurationAlert { session_id, .. } => *session_id,
     }
 }

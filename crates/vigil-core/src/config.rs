@@ -19,6 +19,8 @@ pub struct VigilConfig {
     pub policies: Vec<ConfigPolicy>,
     #[serde(default)]
     pub budget: BudgetSection,
+    #[serde(default)]
+    pub notify: NotifySection,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -80,6 +82,24 @@ pub struct BudgetSection {
     pub max_burn_rate_usd_per_min: Option<f64>,
     #[serde(default)]
     pub loop_detect_threshold: Option<u32>,
+    /// Emit a soft CostAlert warning (without stopping) at this spend level.
+    #[serde(default)]
+    pub cost_alert_usd: Option<f64>,
+    /// Emit a SessionDurationAlert (and optionally stop) after this many minutes.
+    #[serde(default)]
+    pub max_session_duration_mins: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySection {
+    /// HTTP endpoint to POST alert events to. Fire-and-forget with 3 retries.
+    #[serde(default)]
+    pub webhook: Option<String>,
+    /// Subset of alert labels to forward. Empty = all alerts.
+    /// Valid labels: BURN, TOUT, EXFL, LOOP, WAPPR, COST, DURA, DENY
+    #[serde(default)]
+    pub webhook_events: Vec<String>,
 }
 
 /// A policy rule as it appears in vigil.toml.

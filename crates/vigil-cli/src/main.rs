@@ -681,6 +681,12 @@ async fn run_agent(
         .unwrap_or(5);
     let tool_timeout_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_secs);
     let tool_timeout_kill_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_kill_secs);
+    let cost_alert_usd = config.as_ref().and_then(|c| c.budget.cost_alert_usd);
+    let max_session_duration_mins = config.as_ref().and_then(|c| c.budget.max_session_duration_mins);
+    let webhook_notifier = config.as_ref()
+        .and_then(|c| c.notify.webhook.clone())
+        .map(|url| vigil_core::WebhookNotifier::new(url,
+            config.as_ref().map(|c| c.notify.webhook_events.clone()).unwrap_or_default()));
 
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
@@ -833,14 +839,37 @@ async fn run_agent(
         });
     }
 
+    // Session duration timer — fires once after max_session_duration_mins.
+    if let Some(duration_mins) = max_session_duration_mins {
+        let tx = filtered_tx.clone();
+        let sid = session_id;
+        let notifier = webhook_notifier.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(duration_mins * 60)).await;
+            let ev = TimestampedEvent::new(Event::SessionDurationAlert {
+                elapsed_mins: duration_mins,
+                session_id: sid,
+            });
+            if let Some(ref n) = notifier {
+                n.send("DURA", &sid.to_string(), serde_json::json!({
+                    "elapsed_mins": duration_mins,
+                }));
+            }
+            tx.send(ev).await.ok();
+            eprintln!("[DURATION] Session has been running {}min", duration_mins);
+        });
+    }
+
     // Policy filter: evaluate every raw event and forward allowed ones to the TUI.
     let lock_path = active_handle.as_ref().map(|h| h.path.clone());
     let engine_clone = engine.clone();
     let session_id_for_alerts = session_id;
     let last_tool_call_filter = last_tool_call.clone();
+    let notifier_filter = webhook_notifier.clone();
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
+        let mut cost_alerted = false;
         let mut burn_tracker = BurnRateTracker::new();
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut cred_tracker = CredentialTracker::new();
@@ -878,10 +907,15 @@ async fn run_agent(
                         let hits = cred_tracker.check_outbound(&combined);
                         if !hits.is_empty() {
                             let alert = TimestampedEvent::new(Event::ExfilAlert {
-                                matches: hits,
+                                matches: hits.clone(),
                                 source: "llm_request".to_string(),
                                 session_id: *sid,
                             });
+                            if let Some(ref n) = notifier_filter {
+                                n.send("EXFL", &sid.to_string(), serde_json::json!({
+                                    "source": "llm_request", "matches": hits,
+                                }));
+                            }
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -897,10 +931,15 @@ async fn run_agent(
                         let hits = cred_tracker.check_outbound(&cmd);
                         if !hits.is_empty() {
                             let alert = TimestampedEvent::new(Event::ExfilAlert {
-                                matches: hits,
+                                matches: hits.clone(),
                                 source: tool_name.clone(),
                                 session_id: *sid,
                             });
+                            if let Some(ref n) = notifier_filter {
+                                n.send("EXFL", &sid.to_string(), serde_json::json!({
+                                    "source": tool_name, "matches": hits,
+                                }));
+                            }
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -919,6 +958,27 @@ async fn run_agent(
                 }
             }
 
+            // Soft cost alert — fires once when cost_alert_usd threshold is crossed
+            if !cost_alerted {
+                if let Some(threshold) = cost_alert_usd {
+                    if session_cost >= threshold {
+                        cost_alerted = true;
+                        let alert = TimestampedEvent::new(Event::CostAlert {
+                            threshold_usd: threshold,
+                            session_cost_usd: session_cost,
+                            session_id: session_id_for_alerts,
+                        });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("COST", &session_id_for_alerts.to_string(), serde_json::json!({
+                                "threshold_usd": threshold, "session_cost_usd": session_cost,
+                            }));
+                        }
+                        filtered_tx.send(alert).await.ok();
+                        eprintln!("[COST] Session cost ${:.4} crossed alert threshold ${:.4}", session_cost, threshold);
+                    }
+                }
+            }
+
             if let Event::LlmResponse { cost_usd, .. } = &event.event {
                 let (rate, projected) = burn_tracker.record(*cost_usd);
                 if let Some(limit) = burn_rate_limit {
@@ -929,6 +989,11 @@ async fn run_agent(
                             session_cost_usd: session_cost,
                             session_id: session_id_for_alerts,
                         });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("BURN", &session_id_for_alerts.to_string(), serde_json::json!({
+                                "rate_per_min_usd": rate, "projected_total_usd": projected,
+                            }));
+                        }
                         filtered_tx.send(alert).await.ok();
                         if let Some(ref path) = lock_path {
                             vigil_core::update_active(path, |s| {
@@ -949,6 +1014,11 @@ async fn run_agent(
                         repeat_count: count,
                         session_id: *sid,
                     });
+                    if let Some(ref n) = notifier_filter {
+                        n.send("LOOP", &sid.to_string(), serde_json::json!({
+                            "tool_name": tool_name, "repeat_count": count,
+                        }));
+                    }
                     filtered_tx.send(alert).await.ok();
                     if let Some(ref path) = lock_path {
                         vigil_core::update_active(path, |s| {
@@ -1015,6 +1085,13 @@ async fn run_agent(
                         ..
                     } = &event.event
                     {
+                        if let Some(ref n) = notifier_filter {
+                            n.send("DENY", &session_id.to_string(), serde_json::json!({
+                                "tool_name": tool_name,
+                                "policy": decision.policy_name,
+                                "reason": decision.reason,
+                            }));
+                        }
                         let blocked = TimestampedEvent::new(Event::ToolCallResult {
                             agent: agent.clone(),
                             tool_name: tool_name.clone(),

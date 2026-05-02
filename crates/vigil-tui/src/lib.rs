@@ -152,6 +152,8 @@ impl App {
                 self.counts.exfil_alerts += 1;
             }
             vigil_core::Event::ToolTimeout { .. } => {}
+            vigil_core::Event::CostAlert { .. } => {}
+            vigil_core::Event::SessionDurationAlert { .. } => {}
         }
         if let Some(ref mut store) = self.store {
             let _ = store.append(event);
@@ -324,6 +326,10 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("EXFL", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         vigil_core::Event::ToolTimeout { .. } =>
             ("TOUT", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::CostAlert { .. } =>
+            ("COST", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::SessionDurationAlert { .. } =>
+            ("DURA", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
@@ -335,6 +341,8 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
         | vigil_core::Event::LoopAlert { .. }
         | vigil_core::Event::ExfilAlert { .. }
         | vigil_core::Event::ToolTimeout { .. }
+        | vigil_core::Event::CostAlert { .. }
+        | vigil_core::Event::SessionDurationAlert { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -394,6 +402,10 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("{}: {}", source, matches.join(", ")),
         vigil_core::Event::ToolTimeout { tool_name, elapsed_secs, .. } =>
             format!("{} running {}s with no response", tool_name, elapsed_secs),
+        vigil_core::Event::CostAlert { threshold_usd, session_cost_usd, .. } =>
+            format!("cost ${:.4} crossed alert threshold ${:.4}", session_cost_usd, threshold_usd),
+        vigil_core::Event::SessionDurationAlert { elapsed_mins, .. } =>
+            format!("session running {}min", elapsed_mins),
     }
 }
 
@@ -520,6 +532,17 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(body_line(&format!("elapsed: {}s ({:.1}min)", elapsed_secs, *elapsed_secs as f64 / 60.0)));
             out.push(body_line("The agent called this tool but no follow-up LLM request arrived in time."));
             out.push(body_line("The tool may be hung. Consider interrupting the session."));
+        }
+        vigil_core::Event::CostAlert { threshold_usd, session_cost_usd, .. } => {
+            out.push(header_line("COST ALERT".to_string(), Color::Yellow));
+            out.push(body_line(&format!("threshold:    ${:.4}", threshold_usd)));
+            out.push(body_line(&format!("session cost: ${:.4}", session_cost_usd)));
+            out.push(body_line("Soft alert — session continues. Set budget.max_cost_usd to stop the session."));
+        }
+        vigil_core::Event::SessionDurationAlert { elapsed_mins, .. } => {
+            out.push(header_line("SESSION DURATION ALERT".to_string(), Color::Yellow));
+            out.push(body_line(&format!("elapsed: {}min ({:.1}h)", elapsed_mins, *elapsed_mins as f64 / 60.0)));
+            out.push(body_line("Session has exceeded budget.max_session_duration_mins."));
         }
     }
 
