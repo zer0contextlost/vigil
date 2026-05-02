@@ -84,4 +84,28 @@ pub enum Event {
         repeat_count: u32,
         session_id: Uuid,
     },
+    /// Emitted by the proxy when a Write/Edit tool call exceeds the risk threshold.
+    /// The filter task forwards this to the TUI which shows a diff preview and waits for approval.
+    WriteApprovalRequired {
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        before: String,
+        #[serde(default)]
+        after: String,
+        /// "Low" / "Medium" / "High" as string to keep Event serde simple.
+        #[serde(default)]
+        risk_level: String,
+        #[serde(default)]
+        reasons: Vec<String>,
+        session_id: Uuid,
+        /// Proxy sets this to a unique ID so the TUI can send the decision back on the right channel.
+        approval_id: Uuid,
+    },
+    /// Emitted by the filter task after the user approves or rejects a pending write.
+    WriteApprovalDecision {
+        approval_id: Uuid,
+        approved: bool,
+        session_id: Uuid,
+    },
 }

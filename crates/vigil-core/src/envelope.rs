@@ -77,6 +77,8 @@ fn extract_session_id(event: &Event) -> Uuid {
         | Event::McpCall { session_id, .. }
         | Event::PiiAlert { session_id, .. }
         | Event::BurnRateAlert { session_id, .. }
-        | Event::LoopAlert { session_id, .. } => *session_id,
+        | Event::LoopAlert { session_id, .. }
+        | Event::WriteApprovalRequired { session_id, .. }
+        | Event::WriteApprovalDecision { session_id, .. } => *session_id,
     }
 }
