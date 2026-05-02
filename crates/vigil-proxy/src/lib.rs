@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use vigil_core::{scan_pii, scan_watchlist, Event, TimestampedEvent};
+use vigil_core::{scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host};
 
 const MAX_HEADER_SIZE: usize = 65536;
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
@@ -64,13 +64,13 @@ impl Proxy {
 
 /// Detect LLM provider from hostname
 pub fn detect_provider(host: &str) -> Option<&'static str> {
-    match host {
-        h if h.contains("api.anthropic.com") => Some("anthropic"),
-        h if h.contains("api.openai.com") => Some("openai"),
-        h if h.contains("generativelanguage.googleapis.com") => Some("gemini"),
-        h if h.contains("openrouter.ai") => Some("openrouter"),
-        h if h.contains("api.x.ai") => Some("xai"),
-        _ => None,
+    match detect_provider_from_host(host) {
+        ProviderKind::Anthropic => Some("anthropic"),
+        ProviderKind::OpenAI => Some("openai"),
+        ProviderKind::Gemini => Some("gemini"),
+        ProviderKind::OpenRouter => Some("openrouter"),
+        ProviderKind::XAI => Some("xai"),
+        ProviderKind::Unknown => None,
     }
 }
 
@@ -544,14 +544,23 @@ async fn stream_sse_response(
                         if let Some(data) = event_data.take() {
                             if data != "[DONE]" {
                                 if let Ok(event_json) = serde_json::from_str::<Value>(&data) {
-                                    process_sse_event(
-                                        &event_json,
-                                        &mut state,
-                                        session_id,
-                                        provider,
-                                        event_tx,
-                                        pii_watchlist,
-                                    );
+                                    match provider {
+                                        "openai" | "openrouter" => process_openai_sse_event(
+                                            &event_json,
+                                            &mut state,
+                                            session_id,
+                                            event_tx,
+                                            pii_watchlist,
+                                        ),
+                                        _ => process_sse_event(
+                                            &event_json,
+                                            &mut state,
+                                            session_id,
+                                            provider,
+                                            event_tx,
+                                            pii_watchlist,
+                                        ),
+                                    }
                                 }
                             }
                         }
@@ -703,6 +712,80 @@ fn process_sse_event(
     }
 
     let _ = provider;
+}
+
+fn process_openai_sse_event(
+    event_json: &Value,
+    state: &mut SseState,
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<TimestampedEvent>,
+    pii_watchlist: &[String],
+) {
+    if let Some(model) = event_json.get("model").and_then(|v| v.as_str()) {
+        if !model.is_empty() {
+            state.model = model.to_string();
+        }
+    }
+
+    if let Some(content) = event_json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|c| c.as_str())
+    {
+        state.response_text.push_str(content);
+    }
+
+    if let Some(choices) = event_json.get("choices").and_then(|c| c.as_array()) {
+        for choice in choices {
+            if let Some(delta) = choice.get("delta") {
+                if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tool_calls {
+                        let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        if let Some(func) = tc.get("function") {
+                            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                if !name.is_empty() {
+                                    state.block_name.insert(idx, name.to_string());
+                                    state.block_input.insert(idx, String::new());
+                                    state.block_type.insert(idx, "tool_use".to_string());
+                                }
+                            }
+                            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                state.block_input.entry(idx).or_default().push_str(args);
+                            }
+                        }
+                    }
+                }
+                if choice.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls") {
+                    for (idx, tool_name) in state.block_name.clone() {
+                        let input_str = state.block_input.remove(&idx).unwrap_or_default();
+                        let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
+                        emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
+                        emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
+                        let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
+                            agent: "openai".to_string(),
+                            tool_name,
+                            input,
+                            session_id,
+                        }));
+                    }
+                    state.block_name.clear();
+                    state.block_type.clear();
+                }
+            }
+        }
+    }
+
+    if let Some(usage) = event_json.get("usage") {
+        if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            state.input_tokens = pt as u32;
+        }
+        if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            state.output_tokens = ct as u32;
+        }
+    }
 }
 
 fn emit_pii_alert_if_found(
