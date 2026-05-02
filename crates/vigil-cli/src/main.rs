@@ -434,9 +434,13 @@ fn run_audit(session_id: &str) -> Result<()> {
         for i in 1..envelopes.len() {
             let prev_str = envelopes[i - 1].event_id.to_string();
             let curr_str = envelopes[i].event_id.to_string();
-            if curr_str < prev_str {
+            if curr_str <= prev_str {
                 ulid_ok = false;
-                ulid_msg = format!("OUT OF ORDER at event {}", i);
+                ulid_msg = if curr_str == prev_str {
+                    format!("DUPLICATE ULID at events {} and {}", i - 1, i)
+                } else {
+                    format!("OUT OF ORDER at event {}", i)
+                };
                 break;
             }
         }
@@ -915,7 +919,7 @@ pub async fn run_agent_with_plugins(
             }
 
             if let Event::LlmRequest { input_tokens, .. } = &event.event {
-                session_tokens += input_tokens;
+                session_tokens = session_tokens.saturating_add(*input_tokens);
             }
 
             // Credential exfiltration detection — ingest file reads
@@ -977,7 +981,7 @@ pub async fn run_agent_with_plugins(
             }
 
             if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {
-                session_tokens += input_tokens + output_tokens;
+                session_tokens = session_tokens.saturating_add(input_tokens.saturating_add(*output_tokens));
                 session_cost += cost_usd;
                 if let Some(ref path) = lock_path {
                     vigil_core::update_active(path, |s| {
