@@ -26,6 +26,10 @@ pub struct VigilConfig {
 pub struct ProxySection {
     pub port: Option<u16>,
     pub metrics_port: Option<u16>,
+    /// Gate writes at this risk level or above. "Low", "Medium", or "High".
+    /// None (the default) disables write approval gating.
+    #[serde(default)]
+    pub write_approval_threshold: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

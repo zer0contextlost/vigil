@@ -116,6 +116,8 @@ impl App {
             vigil_core::Event::LoopAlert { .. } => {
                 self.counts.loop_alerts += 1;
             }
+            vigil_core::Event::WriteApprovalRequired { .. } => {}
+            vigil_core::Event::WriteApprovalDecision { .. } => {}
         }
         if let Some(ref mut store) = self.store {
             let _ = store.append(event);
@@ -260,6 +262,10 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("BURN", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         vigil_core::Event::LoopAlert { .. } =>
             ("LOOP", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::WriteApprovalRequired { .. } =>
+            ("WAPPR", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::WriteApprovalDecision { .. } =>
+            ("WDECID", Style::default().fg(Color::Green)),
     };
 
     let summary = event_summary(event);
@@ -320,6 +326,10 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("${:.3}/min projected ${:.2}", rate_per_min_usd, projected_total_usd),
         vigil_core::Event::LoopAlert { tool_name, repeat_count, .. } =>
             format!("{} repeated {}x", tool_name, repeat_count),
+        vigil_core::Event::WriteApprovalRequired { path, risk_level, .. } =>
+            format!("write approval required: {} [{}]", truncate(path, 40), risk_level),
+        vigil_core::Event::WriteApprovalDecision { approved, .. } =>
+            format!("write {}", if *approved { "approved" } else { "rejected" }),
     }
 }
 
@@ -420,6 +430,18 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(body_line(&format!("Tool:         {}", tool_name)));
             out.push(body_line(&format!("Repeat count: {}", repeat_count)));
             out.push(body_line("Same tool+input combination repeated too many times."));
+        }
+        vigil_core::Event::WriteApprovalRequired { path, risk_level, reasons, .. } => {
+            out.push(header_line(format!("WRITE APPROVAL REQUIRED  [{}]", risk_level), Color::Yellow));
+            out.push(body_line(&format!("Path: {}", path)));
+            for r in reasons {
+                out.push(body_line(&format!("  - {}", r)));
+            }
+        }
+        vigil_core::Event::WriteApprovalDecision { approval_id, approved, .. } => {
+            let (label, color) = if *approved { ("APPROVED", Color::Green) } else { ("REJECTED", Color::Red) };
+            out.push(header_line(format!("WRITE DECISION  [{}]", label), color));
+            out.push(body_line(&format!("approval_id: {}", approval_id)));
         }
     }
 
