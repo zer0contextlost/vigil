@@ -278,9 +278,10 @@ async fn main() -> Result<()> {
             agent_and_args,
         }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
+            let config_path_str = config.as_deref().map(|p| p.display().to_string());
             let vigil_config = config.as_deref()
                 .and_then(|p| vigil_core::VigilConfig::load(p).ok());
-            run_agent(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config).await?;
+            run_agent(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str).await?;
         }
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
@@ -315,22 +316,46 @@ async fn main() -> Result<()> {
         Some(Commands::Replay { session_id }) => {
             let uuid = uuid::Uuid::parse_str(&session_id)
                 .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
-            let session = Session::load(&uuid)?;
-            println!(
-                "Replaying session {} ({} events)...",
-                session_id,
-                session.events.len()
-            );
 
-            let (tx, rx) = tokio::sync::mpsc::channel(session.events.len().max(1));
-            for event in &session.events {
-                tx.try_send(event.clone()).ok();
+            let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+            if !envelopes.is_empty() {
+                println!("Replaying session {} ({} events, NDJSON)...", session_id, envelopes.len());
+                let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                let envelopes_clone = envelopes.clone();
+                tokio::spawn(async move {
+                    for (i, event) in envelopes_clone.iter().enumerate() {
+                        if i > 0 {
+                            let prev_ts = envelopes_clone[i - 1].timestamp;
+                            let delta = event.timestamp.signed_duration_since(prev_ts);
+                            let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                            if ms > 0 {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+                            }
+                        }
+                        if tx.send(event.clone()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let meta = vigil_core::store::SessionStore::load_meta(&uuid).ok();
+                let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
+                let mut session = vigil_core::session::Session::new(agent);
+                session.id = uuid;
+                let mut app = App::new(session);
+                app.is_replay = true;
+                vigil_tui::run_tui(app, rx).await?;
+            } else {
+                let session = vigil_core::session::Session::load(&uuid)?;
+                println!("Replaying session {} ({} events, JSON)...", session_id, session.events.len());
+                let (tx, rx) = tokio::sync::mpsc::channel(session.events.len().max(1));
+                for event in &session.events {
+                    tx.try_send(event.clone()).ok();
+                }
+                drop(tx);
+                let mut app = App::new(session);
+                app.is_replay = true;
+                vigil_tui::run_tui(app, rx).await?;
             }
-            drop(tx);
-
-            let mut app = App::new(session);
-            app.is_replay = true;
-            vigil_tui::run_tui(app, rx).await?;
         }
     }
 
@@ -347,7 +372,7 @@ async fn run_interactive() -> Result<()> {
         return Ok(());
     }
     let watchlist = load_pii_watchlist(None);
-    run_agent(8877, None, None, args, watchlist, None).await
+    run_agent(8877, None, None, args, watchlist, None, None).await
 }
 
 /// Load PII watchlist terms: explicit file path first, then auto-load ~/.vigil/watchlist.txt.
@@ -407,6 +432,7 @@ async fn run_agent(
     agent_and_args: Vec<String>,
     pii_watchlist: Vec<String>,
     config: Option<vigil_core::VigilConfig>,
+    config_path: Option<String>,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -584,6 +610,7 @@ async fn run_agent(
 
     let mut app = App::new(session);
     app.store = store;
+    app.config_path = config_path;
     let mut tui_handle = tokio::spawn(async move { vigil_tui::run_tui(app, filtered_rx).await });
 
     // Wait for TUI exit (user pressed q) or agent exit — whichever comes first.
