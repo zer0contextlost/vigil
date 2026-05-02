@@ -15,12 +15,40 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum PluginTemplate {
+    /// React to alerts — good for notifications and webhooks
+    Alert,
+    /// Gate tool calls — allow or block based on custom logic
+    Gatekeeper,
+    /// Log events — write structured data to a file or external system
+    Logger,
+    /// Blank slate — all three methods stubbed, no logic
+    Blank,
+}
+
 #[derive(Subcommand)]
 enum PluginCommands {
-    /// List plugins in ~/.vigil/plugins/ and any loaded via --plugin
+    /// List plugins in ~/.vigil/plugins/
     List,
     /// Show the plugins directory path
     Dir,
+    /// Scaffold a new plugin crate with an interactive template picker
+    New {
+        /// Name of the plugin (used as the crate name and directory)
+        name: String,
+        /// Template to use (skips the interactive prompt)
+        #[arg(long, short)]
+        template: Option<PluginTemplate>,
+        /// Directory to create the plugin in (default: ./<name>)
+        #[arg(long, short)]
+        path: Option<PathBuf>,
+    },
+    /// Copy a compiled plugin (.dll/.so/.dylib) into the auto-load directory
+    Install {
+        /// Path to the compiled shared library
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -406,7 +434,7 @@ async fn main() -> Result<()> {
             println!("Tagged session {} as {:?}", uuid, name);
         }
         Some(Commands::Plugins { action }) => {
-            run_plugins_command(action)?;
+            run_plugins_command(action).await?;
         }
         Some(Commands::Sessions) => {
             let summaries = Session::list_all()?;
@@ -1710,42 +1738,437 @@ fn load_plugins_from_dir(dir: &PathBuf, host: &mut PluginHost) {
     }
 }
 
-fn run_plugins_command(action: PluginCommands) -> anyhow::Result<()> {
+async fn run_plugins_command(action: PluginCommands) -> anyhow::Result<()> {
     match action {
         PluginCommands::Dir => {
             let dir = plugins_dir()?;
             println!("{}", dir.display());
             println!("Place .dll / .so / .dylib files here to auto-load on vigil run.");
         }
+
         PluginCommands::List => {
             let dir = plugins_dir()?;
             if !dir.exists() {
                 println!("Plugin directory {} does not exist yet.", dir.display());
-                println!("Create it and drop plugin libraries there to auto-load.");
+                println!("Run `vigil plugins new <name>` to scaffold your first plugin.");
                 return Ok(());
             }
-            let dylib_exts = if cfg!(target_os = "windows") { vec!["dll"] }
-                else if cfg!(target_os = "macos") { vec!["dylib"] }
-                else { vec!["so"] };
+            let dylib_exts = dylib_extensions();
             let mut found = false;
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         if dylib_exts.contains(&ext) {
-                            println!("  {}", path.display());
+                            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                            println!("  {}  ({} KB)", path.file_name().unwrap_or_default().to_string_lossy(), size / 1024);
                             found = true;
                         }
                     }
                 }
             }
             if !found {
-                println!("No plugins found in {}.", dir.display());
-                println!("See PLUGINS.md for how to author a plugin.");
+                println!("No plugins in {}.", dir.display());
+                println!("Run `vigil plugins new <name>` to scaffold one.");
             }
+        }
+
+        PluginCommands::Install { path } => {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !dylib_extensions().contains(&ext) {
+                anyhow::bail!("Expected a shared library (.dll / .so / .dylib), got: {}", path.display());
+            }
+            if !path.exists() {
+                anyhow::bail!("File not found: {}", path.display());
+            }
+            let dir = plugins_dir()?;
+            std::fs::create_dir_all(&dir)?;
+            let dest = dir.join(path.file_name().unwrap());
+            std::fs::copy(&path, &dest)?;
+            println!("Installed {} → {}", path.file_name().unwrap().to_string_lossy(), dest.display());
+            println!("It will auto-load on the next `vigil run`.");
+        }
+
+        PluginCommands::New { name, template, path } => {
+            let template = match template {
+                Some(t) => t,
+                None => prompt_template()?,
+            };
+            let dest = path.unwrap_or_else(|| PathBuf::from(&name));
+            scaffold_plugin(&name, &template, &dest)?;
         }
     }
     Ok(())
+}
+
+fn dylib_extensions() -> Vec<&'static str> {
+    if cfg!(target_os = "windows") { vec!["dll"] }
+    else if cfg!(target_os = "macos") { vec!["dylib"] }
+    else { vec!["so"] }
+}
+
+fn prompt_template() -> anyhow::Result<PluginTemplate> {
+    println!();
+    println!("What should this plugin do?");
+    println!("  1. React to alerts  — notifications, webhooks, Slack");
+    println!("  2. Gate tool calls  — allow or block based on custom logic");
+    println!("  3. Log events       — structured logging to file or external system");
+    println!("  4. Blank slate      — all three methods stubbed, no logic");
+    println!();
+    print!("Choice [1-4] (default: 1): ");
+    use std::io::Write as _;
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(match line.trim() {
+        "2" => PluginTemplate::Gatekeeper,
+        "3" => PluginTemplate::Logger,
+        "4" => PluginTemplate::Blank,
+        _   => PluginTemplate::Alert,
+    })
+}
+
+fn scaffold_plugin(name: &str, template: &PluginTemplate, dest: &PathBuf) -> anyhow::Result<()> {
+    if dest.exists() {
+        anyhow::bail!("{} already exists", dest.display());
+    }
+    let src_dir = dest.join("src");
+    std::fs::create_dir_all(&src_dir)?;
+
+    // Cargo.toml
+    let crate_name = name.replace('-', "_").to_lowercase();
+    std::fs::write(dest.join("Cargo.toml"), format!(
+r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vigil-plugin = {{ git = "https://github.com/zer0contextlost/vigil" }}
+serde_json = "1.0"
+"#))?;
+
+    // rust-toolchain.toml — pins the channel so vtable layout matches
+    std::fs::write(dest.join("rust-toolchain.toml"),
+r#"[toolchain]
+channel = "stable"
+"#)?;
+
+    // .gitignore
+    std::fs::write(dest.join(".gitignore"),
+r#"/target/
+Cargo.lock
+"#)?;
+
+    // src/lib.rs — template-specific
+    let lib_rs = match template {
+        PluginTemplate::Alert     => template_alert(name),
+        PluginTemplate::Gatekeeper => template_gatekeeper(name),
+        PluginTemplate::Logger    => template_logger(name),
+        PluginTemplate::Blank     => template_blank(name),
+    };
+    std::fs::write(src_dir.join("lib.rs"), lib_rs)?;
+
+    // Install script (Windows)
+    std::fs::write(dest.join("install.ps1"), format!(
+r#"# Build and install {name} into the vigil auto-load directory
+cargo build --release
+$dll = Get-ChildItem target\release\*.dll | Select-Object -First 1
+if ($dll) {{
+    $pluginsDir = "$env:USERPROFILE\.vigil\plugins"
+    New-Item -ItemType Directory -Force $pluginsDir | Out-Null
+    Copy-Item $dll.FullName $pluginsDir -Force
+    Write-Host "Installed $($dll.Name) → $pluginsDir"
+}} else {{
+    Write-Host "Build failed — no .dll found in target\release\"
+}}
+"#))?;
+
+    // Install script (Unix)
+    std::fs::write(dest.join("install.sh"), format!(
+r#"#!/usr/bin/env bash
+# Build and install {name} into the vigil auto-load directory
+set -e
+cargo build --release
+EXT=$([ "$(uname)" = "Darwin" ] && echo "dylib" || echo "so")
+LIB=$(ls target/release/*.{crate_name}.$EXT 2>/dev/null | head -1 || ls target/release/lib{crate_name}.$EXT 2>/dev/null | head -1 || ls target/release/*.$EXT 2>/dev/null | head -1)
+if [ -z "$LIB" ]; then
+    echo "Build failed — no .$EXT found in target/release/"
+    exit 1
+fi
+mkdir -p ~/.vigil/plugins
+cp "$LIB" ~/.vigil/plugins/
+echo "Installed $(basename $LIB) → ~/.vigil/plugins/"
+"#))?;
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(dest.join("install.sh"), std::fs::Permissions::from_mode(0o755)); }
+
+    println!();
+    println!("Created {}/ with {} template.", dest.display(), template_label(template));
+    println!();
+    println!("  Next steps:");
+    println!("    cd {}", dest.display());
+    println!("    # Edit src/lib.rs");
+    if cfg!(windows) {
+        println!("    .\\install.ps1          # build + copy to ~/.vigil/plugins/");
+    } else {
+        println!("    ./install.sh           # build + copy to ~/.vigil/plugins/");
+    }
+    println!("    vigil plugins list     # confirm it's loaded");
+    println!("    vigil run -- claude    # it auto-loads on every run");
+    println!();
+    Ok(())
+}
+
+fn template_label(t: &PluginTemplate) -> &'static str {
+    match t {
+        PluginTemplate::Alert      => "alert-notifier",
+        PluginTemplate::Gatekeeper => "tool-gatekeeper",
+        PluginTemplate::Logger     => "event-logger",
+        PluginTemplate::Blank      => "blank",
+    }
+}
+
+fn template_alert(name: &str) -> String {
+    format!(r#"//! {name} - vigil alert-notifier plugin
+//!
+//! Reacts to vigil alerts (BURN, LOOP, EXFL, DENY, COST, DURA, TOUT, WAPPR, PII).
+//! Edit `on_alert` to forward alerts to Slack, a webhook, a file, etc.
+//!
+//! Configuration via environment variables:
+//!   PLUGIN_WEBHOOK_URL - URL to POST alerts to (optional)
+
+use vigil_plugin::{{declare_plugin, PluginContext, Value, VigilPlugin}};
+
+pub struct {struct_name} {{
+    webhook_url: Option<String>,
+}}
+
+impl {struct_name} {{
+    fn new() -> Self {{
+        Self {{
+            webhook_url: std::env::var("PLUGIN_WEBHOOK_URL").ok(),
+        }}
+    }}
+}}
+
+impl VigilPlugin for {struct_name} {{
+    fn name(&self) -> &str {{ "{name}" }}
+
+    fn on_alert(&self, ctx: &PluginContext, label: &str, detail: &Value) {{
+        let msg = format!(
+            "[vigil {{}}] session={{}} {{}}",
+            label,
+            &ctx.session_id.to_string()[..8],
+            detail,
+        );
+        eprintln!("{{}}", msg);
+
+        if let Some(url) = &self.webhook_url {{
+            // Spawn a task so we don't block the event loop.
+            let url = url.clone();
+            let body = serde_json::json!({{
+                "label": label,
+                "session_id": ctx.session_id.to_string(),
+                "detail": detail,
+            }});
+            tokio::spawn(async move {{
+                // Add your HTTP client here — e.g. reqwest:
+                // let _ = reqwest::Client::new().post(&url).json(&body).send().await;
+                let _ = (url, body); // remove this line once you add the client
+            }});
+        }}
+    }}
+}}
+
+declare_plugin!({struct_name}::new());
+"#,
+        name = name,
+        struct_name = to_struct_name(name),
+    )
+}
+
+fn template_gatekeeper(name: &str) -> String {
+    format!(r#"//! {name} - vigil tool-gatekeeper plugin
+//!
+//! Inspects every tool call that the built-in policy engine allows.
+//! Return `PluginDecision::Deny(reason)` to block; the agent receives
+//! an HTTP 403 and a DENY alert fires in the TUI.
+//!
+//! Configuration via environment variables:
+//!   PLUGIN_BLOCK_TOOLS - comma-separated tool name substrings to deny
+//!                        e.g. "Bash,WebSearch"
+
+use vigil_plugin::{{declare_plugin, PluginContext, PluginDecision, Value, VigilPlugin}};
+
+pub struct {struct_name} {{
+    block_patterns: Vec<String>,
+}}
+
+impl {struct_name} {{
+    fn new() -> Self {{
+        let block_patterns = std::env::var("PLUGIN_BLOCK_TOOLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        Self {{ block_patterns }}
+    }}
+}}
+
+impl VigilPlugin for {struct_name} {{
+    fn name(&self) -> &str {{ "{name}" }}
+
+    fn on_tool_call(
+        &self,
+        _ctx: &PluginContext,
+        tool_name: &str,
+        input: &Value,
+    ) -> PluginDecision {{
+        // --- pattern-based block (driven by PLUGIN_BLOCK_TOOLS env var) ---
+        let lower = tool_name.to_lowercase();
+        for pattern in &self.block_patterns {{
+            if lower.contains(pattern.as_str()) {{
+                return PluginDecision::Deny(format!(
+                    "{name}: '{{}}' matches blocked pattern '{{}}'",
+                    tool_name, pattern,
+                ));
+            }}
+        }}
+
+        // --- add your own logic here ---
+        // Example: block any shell command containing "rm -rf"
+        // if tool_name.eq_ignore_ascii_case("Bash") {{
+        //     if input.to_string().contains("rm -rf") {{
+        //         return PluginDecision::Deny("rm -rf is not allowed".into());
+        //     }}
+        // }}
+
+        let _ = input; // remove when you use input
+        PluginDecision::Allow
+    }}
+}}
+
+declare_plugin!({struct_name}::new());
+"#,
+        name = name,
+        struct_name = to_struct_name(name),
+    )
+}
+
+fn template_logger(name: &str) -> String {
+    format!(r#"//! {name} - vigil event-logger plugin
+//!
+//! Writes every event to a NDJSON file for offline analysis.
+//!
+//! Configuration via environment variables:
+//!   PLUGIN_LOG_PATH - path to log file (default: ~/.vigil/{name}.ndjson)
+
+use std::fs::{{File, OpenOptions}};
+use std::io::Write;
+use std::sync::Mutex;
+use vigil_plugin::{{declare_plugin, Envelope, PluginContext, Value, VigilPlugin}};
+
+pub struct {struct_name} {{
+    file: Mutex<File>,
+}}
+
+impl {struct_name} {{
+    fn new() -> Self {{
+        let path = std::env::var("PLUGIN_LOG_PATH").unwrap_or_else(|_| {{
+            let home = std::env::var(if cfg!(windows) {{ "USERPROFILE" }} else {{ "HOME" }})
+                .unwrap_or_default();
+            format!("{{}}/.vigil/{name}.ndjson", home)
+        }});
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|e| panic!("{name}: cannot open {{}}: {{}}", path, e));
+        Self {{ file: Mutex::new(file) }}
+    }}
+
+    fn write(&self, record: &serde_json::Value) {{
+        if let Ok(line) = serde_json::to_string(record) {{
+            if let Ok(mut f) = self.file.lock() {{
+                let _ = writeln!(f, "{{}}", line);
+            }}
+        }}
+    }}
+}}
+
+impl VigilPlugin for {struct_name} {{
+    fn name(&self) -> &str {{ "{name}" }}
+
+    fn on_event(&self, ctx: &PluginContext, envelope: &Envelope) {{
+        self.write(&serde_json::json!({{
+            "type": "event",
+            "session_id": ctx.session_id,
+            "envelope": envelope,
+        }}));
+    }}
+
+    fn on_alert(&self, ctx: &PluginContext, label: &str, detail: &Value) {{
+        self.write(&serde_json::json!({{
+            "type": "alert",
+            "session_id": ctx.session_id,
+            "label": label,
+            "detail": detail,
+        }}));
+    }}
+}}
+
+declare_plugin!({struct_name}::new());
+"#,
+        name = name,
+        struct_name = to_struct_name(name),
+    )
+}
+
+fn template_blank(name: &str) -> String {
+    format!(r#"//! {name} - vigil plugin
+//!
+//! All three hooks are stubbed. Implement what you need.
+
+use vigil_plugin::{{declare_plugin, Envelope, PluginContext, PluginDecision, Value, VigilPlugin}};
+
+pub struct {struct_name};
+
+impl VigilPlugin for {struct_name} {{
+    fn name(&self) -> &str {{ "{name}" }}
+
+    fn on_event(&self, _ctx: &PluginContext, _envelope: &Envelope) {{}}
+
+    fn on_alert(&self, _ctx: &PluginContext, _label: &str, _detail: &Value) {{}}
+
+    fn on_tool_call(&self, _ctx: &PluginContext, _tool_name: &str, _input: &Value) -> PluginDecision {{
+        PluginDecision::Allow
+    }}
+}}
+
+declare_plugin!({struct_name});
+"#,
+        name = name,
+        struct_name = to_struct_name(name),
+    )
+}
+
+fn to_struct_name(name: &str) -> String {
+    name.split(['-', '_'])
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
