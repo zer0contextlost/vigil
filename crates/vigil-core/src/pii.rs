@@ -78,16 +78,18 @@ fn redact(s: &str, keep: usize) -> String {
     format!("***{}", tail)
 }
 
-/// Scan `text` against a personal watchlist (case-insensitive substring match).
+/// Scan `text` against a personal watchlist (literal case-insensitive substring match —
+/// NOT regex; special characters in terms are treated as plain text).
 /// Terms are things like your full name, address, phone number as you wrote it, etc.
 pub fn scan_watchlist<'a>(text: &str, terms: &'a [String]) -> Vec<PiiMatch> {
     let lower = text.to_lowercase();
     terms
         .iter()
         .filter(|t| !t.trim().is_empty() && lower.contains(&t.to_lowercase()))
-        .map(|t| PiiMatch {
+        .map(|_t| PiiMatch {
             kind: "watchlist".into(),
-            snippet: redact(t, 4),
+            // Never echo back any part of the watchlist term — it is user-supplied PII.
+            snippet: "[watchlist term]".into(),
         })
         .collect()
 }
