@@ -4,7 +4,7 @@ No more ooopsies!
 
 Runtime observability and policy enforcement for AI coding agents.
 
-vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Codex, Cursor, Aider, and Gemini CLI.
+vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, and any agent that respects `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`.
 
 ## Install
 
@@ -30,6 +30,23 @@ vigil run --config vigil.toml -- claude
 vigil run --plugin ./my-plugin.dll -- claude
 ```
 
+## Using vigil with Cursor (or any IDE)
+
+IDEs like Cursor can't be launched by vigil — use `vigil proxy` instead. It starts the proxy and dashboard without spawning a child process:
+
+```bash
+vigil proxy
+vigil proxy --port 8877 --config vigil.toml
+```
+
+Once the proxy is running, point your IDE at it:
+
+**Cursor** — Settings → Models → Enable BYOK with your Anthropic API key, then set *Override OpenAI Base URL* to `http://127.0.0.1:8877/v1`. Cursor sends OpenAI-format requests; vigil translates and forwards them.
+
+**Note:** Cursor's Agent, Edit, and Composer features route through Cursor's own servers and are not interceptable this way. Only direct BYOK model calls are visible to vigil.
+
+**Other agents** — Set `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` (Anthropic SDK) or `OPENAI_BASE_URL=http://127.0.0.1:8877` (OpenAI SDK) in the environment before launching the agent.
+
 ## Session commands
 
 ```bash
@@ -43,10 +60,10 @@ vigil sessions
 vigil tag <session-id> my-label
 vigil tag my-label  better-label
 
-# Replay a session in the TUI
-vigil replay <session-id-or-name>
+# Replay a session in the TUI (full UUID required)
+vigil replay <session-id>
 
-# Replay a session prefix, then continue live
+# Replay a session prefix, then continue live (full UUID required)
 vigil fork <session-id> --prefix-events 20 -- claude
 
 # Show all currently running vigil sessions on this machine
@@ -219,9 +236,12 @@ vigil POSTs JSON to the webhook on each matching alert. Retries up to 3 times wi
 Drop a compiled shared library in `~/.vigil/plugins/` to auto-load it on every `vigil run`. See [PLUGINS.md](PLUGINS.md) for authoring instructions and examples.
 
 ```bash
-vigil plugins list   # list plugins in ~/.vigil/plugins/
-vigil plugins dir    # print the auto-load directory path
-vigil run --plugin ./extra.dll -- claude   # load a specific plugin once
+vigil plugins list                  # list plugins in ~/.vigil/plugins/
+vigil plugins dir                   # print the auto-load directory path
+vigil plugins new <name>            # scaffold a new plugin crate interactively
+vigil plugins install <path>        # copy a compiled plugin to the auto-load dir
+vigil plugins check <path>          # validate ABI/rustc compatibility without installing
+vigil run --plugin ./extra.dll -- claude   # load a specific plugin for one run
 ```
 
 Plugins implement the `VigilPlugin` trait from the `vigil-plugin` SDK crate:
@@ -290,7 +310,7 @@ All `tools/call` requests are PII-scanned and logged as `McpCall` events.
 
 ## Architecture
 
-Six Rust crates:
+Seven Rust crates:
 
 | Crate | Role |
 |-------|------|
@@ -298,8 +318,9 @@ Six Rust crates:
 | `vigil-proxy` | HTTP reverse proxy, SSE parser (Anthropic + OpenAI formats), write-approval gate |
 | `vigil-core` | Event types, Envelope/hash chain, SessionStore, ed25519 signing, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner, PluginHost |
 | `vigil-tui` | ratatui dashboard, session browser, replay |
-| `vigil-watch` | Process tree monitor (sysinfo) — no-op on Windows |
+| `vigil-watch` | Process tree monitor (sysinfo) — tracks child processes spawned by the agent |
 | `vigil-mcp` | vigil-mcp-shim binary for stdio JSON-RPC MCP servers |
+| `vigil-plugin` | Plugin SDK — `VigilPlugin` trait, `declare_plugin!` macro, ABI versioning |
 
 Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in the agent's environment. The proxy forwards to the real API over TLS.
 
