@@ -1,5 +1,19 @@
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::sync::OnceLock;
+
+fn compiled_patterns() -> &'static [Regex] {
+    static COMPILED: OnceLock<Vec<Regex>> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        PATTERNS.iter().filter_map(|p| Regex::new(p).ok()).collect()
+    })
+}
+
+fn base64_pattern() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[A-Za-z0-9+/]{32,}={0,2}").unwrap())
+}
 
 /// A set of SHA-256 fingerprints of known-sensitive values seen in file reads.
 #[derive(Debug, Default, Clone)]
@@ -77,13 +91,11 @@ fn extract_credentials(content: &str, path: &str) -> Vec<String> {
     }
 
     // Direct regex patterns for high-value credential strings
-    for pattern in PATTERNS {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            for mat in re.find_iter(content) {
-                let s = mat.as_str().to_string();
-                if s.len() > 8 {
-                    creds.push(s);
-                }
+    for re in compiled_patterns() {
+        for mat in re.find_iter(content) {
+            let s = mat.as_str().to_string();
+            if s.len() > 8 {
+                creds.push(s);
             }
         }
     }
@@ -96,19 +108,15 @@ fn extract_candidates(text: &str) -> Vec<String> {
     let mut candidates = Vec::new();
 
     // Named credential patterns
-    for pattern in PATTERNS {
-        if let Ok(re) = regex::Regex::new(pattern) {
-            for mat in re.find_iter(text) {
-                candidates.push(mat.as_str().to_string());
-            }
+    for re in compiled_patterns() {
+        for mat in re.find_iter(text) {
+            candidates.push(mat.as_str().to_string());
         }
     }
 
     // Base64-ish tokens (catches many bearer tokens / API keys)
-    if let Ok(re) = regex::Regex::new(r"[A-Za-z0-9+/]{32,}={0,2}") {
-        for mat in re.find_iter(text) {
-            candidates.push(mat.as_str().to_string());
-        }
+    for mat in base64_pattern().find_iter(text) {
+        candidates.push(mat.as_str().to_string());
     }
 
     // KEY=value style inline (e.g. env var in a shell command)
