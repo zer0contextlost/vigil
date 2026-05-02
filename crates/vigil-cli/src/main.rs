@@ -552,7 +552,8 @@ async fn run_fork(
         println!();
 
         let watchlist = load_pii_watchlist(None);
-        run_agent(8877, None, None, agent_and_args, watchlist, None, None).await?;
+        let port = find_available_port(8877)?;
+        run_agent(port, None, None, agent_and_args, watchlist, None, None).await?;
     }
 
     Ok(())
@@ -1397,6 +1398,15 @@ async fn vigil_init(output: PathBuf, force: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn find_available_port(start: u16) -> anyhow::Result<u16> {
+    for port in start..=start.saturating_add(20) {
+        if std::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], port))).is_ok() {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("no available port found in range {}–{}", start, start.saturating_add(20))
 }
 
 fn format_duration(d: chrono::Duration) -> String {

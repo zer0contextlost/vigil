@@ -642,7 +642,9 @@ async fn stream_sse_response(
                     let mut map = pending_approvals.lock().unwrap();
                     map.insert(approval_id, approval_tx);
                 }
-                let _ = event_tx.try_send(TimestampedEvent::new(Event::WriteApprovalRequired {
+                // Use send (not try_send) so the approval request is guaranteed to reach the TUI.
+                // If the channel is closed the approval gate must reject — never silently proceed.
+                if event_tx.send(TimestampedEvent::new(Event::WriteApprovalRequired {
                     path: path_str.clone(),
                     before: before.clone(),
                     after: after.clone(),
@@ -650,16 +652,29 @@ async fn stream_sse_response(
                     reasons: risk.reasons.clone(),
                     session_id,
                     approval_id,
-                }));
+                })).await.is_err() {
+                    tracing::error!(approval_id = %approval_id, "approval event channel closed — rejecting write");
+                    hold_buffer.clear();
+                    state.holding = false;
+                    state.holding_tool_idx = None;
+                    continue;
+                }
 
                 // Wait for user decision (with 5-minute timeout).
-                let approved = tokio::time::timeout(
+                let approved = match tokio::time::timeout(
                     tokio::time::Duration::from_secs(300),
                     approval_rx,
-                )
-                .await
-                .unwrap_or(Ok(false))
-                .unwrap_or(false);
+                ).await {
+                    Ok(Ok(decision)) => decision,
+                    Ok(Err(_)) => {
+                        tracing::error!(approval_id = %approval_id, "approval channel dropped — rejecting write");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!(approval_id = %approval_id, "approval timeout (300s) — rejecting write");
+                        false
+                    }
+                };
 
                 if approved {
                     // Flush the hold buffer and resume.
