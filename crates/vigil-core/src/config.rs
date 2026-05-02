@@ -41,7 +41,9 @@ pub struct ProxySection {
     pub write_approval_threshold: Option<String>,
     /// Shell command substrings to block. Each entry is matched as a
     /// case-sensitive substring against Bash/shell tool call inputs.
-    /// Defaults to a short list of destructive patterns; set to [] to disable.
+    /// Best-effort — not a security boundary; a determined agent can bypass
+    /// simple substring checks. Defaults to a short list of destructive
+    /// patterns. Set to [] to disable all blocking.
     #[serde(default = "default_blocked_commands")]
     pub blocked_commands: Vec<String>,
 }

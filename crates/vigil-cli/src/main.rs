@@ -670,6 +670,9 @@ async fn run_agent(
     };
     let engine = Arc::new(engine);
 
+    let observational_only = config.is_none()
+        || config.as_ref().map(|c| c.proxy.blocked_commands.is_empty() && c.policies.is_empty()).unwrap_or(true);
+
     let budget_enforcer = config.as_ref().map(|c| BudgetEnforcer::new(c.budget.clone()));
     let burn_rate_limit = config.as_ref().and_then(|c| c.budget.max_burn_rate_usd_per_min);
     let loop_threshold = config.as_ref()
@@ -690,6 +693,9 @@ async fn run_agent(
     println!("Routing agent traffic via ANTHROPIC_BASE_URL=http://127.0.0.1:{}", port);
     println!();
     println!("Press 'q' in the dashboard to quit");
+    if observational_only {
+        println!("NOTE: running in observational mode — no blocked_commands or policies configured.");
+    }
     println!();
 
     let proxy_url = format!("http://127.0.0.1:{}", port);
