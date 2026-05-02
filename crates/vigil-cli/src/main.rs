@@ -71,6 +71,18 @@ enum Commands {
 
     /// Show all currently active vigil sessions
     Ps,
+
+    /// Replay a session prefix and continue with a live agent
+    Fork {
+        /// Session ID to fork from
+        session_id: String,
+        /// Replay the first N events, then go live (0 = full session prefix)
+        #[arg(long, default_value = "0")]
+        prefix_events: usize,
+        /// Agent command and arguments (same as vigil run)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        agent_and_args: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +340,9 @@ async fn main() -> Result<()> {
         Some(Commands::Ps) => {
             run_ps()?;
         }
+        Some(Commands::Fork { session_id, prefix_events, agent_and_args }) => {
+            run_fork(&session_id, prefix_events, agent_and_args).await?;
+        }
         Some(Commands::Replay { session_id }) => {
             let uuid = uuid::Uuid::parse_str(&session_id)
                 .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
@@ -458,6 +473,86 @@ fn run_audit(session_id: &str) -> Result<()> {
     } else {
         println!("FAIL -- {} issue(s) found", issues);
         std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil fork
+// ---------------------------------------------------------------------------
+
+async fn run_fork(
+    session_id_str: &str,
+    prefix_events: usize,
+    agent_and_args: Vec<String>,
+) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id_str)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    if envelopes.is_empty() {
+        anyhow::bail!("Session {} not found or empty", session_id_str);
+    }
+
+    let prefix = if prefix_events == 0 {
+        envelopes.len() // fork from end = full replay then go live
+    } else {
+        prefix_events.min(envelopes.len())
+    };
+
+    println!("vigil fork: {} ({} prefix events)", session_id_str, prefix);
+    println!("Replaying prefix...");
+
+    let meta = vigil_core::store::SessionStore::load_meta(&uuid).ok();
+    let agent_name = if !agent_and_args.is_empty() {
+        agent_and_args[0].clone()
+    } else {
+        meta.as_ref()
+            .map(|m| m.agent.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+
+    let new_session_id = uuid::Uuid::new_v4();
+    let store = vigil_core::store::SessionStore::create(new_session_id, &agent_name).ok();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<vigil_core::TimestampedEvent>(1024);
+
+    // Send prefix events instantly (no timestamp pacing)
+    let prefix_envelopes = envelopes[..prefix].to_vec();
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        for env in prefix_envelopes {
+            if tx_clone.send(env).await.is_err() {
+                break;
+            }
+        }
+        // tx_clone dropped here — if no live agent, TUI will see channel close
+    });
+
+    let mut session = vigil_core::session::Session::new(agent_name.clone());
+    session.id = new_session_id;
+    let mut app = App::new(session);
+    app.store = store;
+    app.is_replay = agent_and_args.is_empty();
+
+    if agent_and_args.is_empty() {
+        // Pure replay with no live continuation — drop our tx copy so the TUI
+        // sees the channel close after the prefix is consumed.
+        drop(tx);
+        vigil_tui::run_tui(app, rx).await?;
+    } else {
+        // Show prefix in TUI first (instant replay), then start a live session.
+        // Drop tx so the TUI exits after the prefix events are displayed.
+        drop(tx);
+        vigil_tui::run_tui(app, rx).await?;
+
+        println!();
+        println!("Fork prefix complete. Starting live session...");
+        println!();
+
+        let watchlist = load_pii_watchlist(None);
+        run_agent(8877, None, None, agent_and_args, watchlist, None, None).await?;
     }
 
     Ok(())
