@@ -73,4 +73,15 @@ pub enum Event {
         kinds: Vec<String>,
         session_id: Uuid,
     },
+    BurnRateAlert {
+        rate_per_min_usd: f64,
+        projected_total_usd: f64,
+        session_cost_usd: f64,
+        session_id: Uuid,
+    },
+    LoopAlert {
+        tool_name: String,
+        repeat_count: u32,
+        session_id: Uuid,
+    },
 }

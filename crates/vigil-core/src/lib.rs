@@ -1,4 +1,5 @@
 pub mod budget;
+pub mod burn_rate;
 pub mod config;
 pub mod envelope;
 pub mod event;
@@ -11,6 +12,7 @@ pub mod session;
 pub mod store;
 
 pub use budget::{BudgetEnforcer, BudgetStatus};
+pub use burn_rate::{BurnRateTracker, LoopDetector};
 pub use config::VigilConfig;
 pub use envelope::{Envelope, TimestampedEvent, SCHEMA_VERSION};
 pub use event::Event;
