@@ -94,6 +94,75 @@ pub fn scan_watchlist<'a>(text: &str, terms: &'a [String]) -> Vec<PiiMatch> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_watchlist_no_term_echo() {
+        let terms = vec!["SuperSecret123".to_string()];
+        let hits = scan_watchlist("I know SuperSecret123 exists", &terms);
+        assert_eq!(hits.len(), 1);
+        // The term itself must never appear in the snippet
+        assert!(!hits[0].snippet.contains("SuperSecret"));
+        assert!(!hits[0].snippet.contains("123"));
+        assert_eq!(hits[0].snippet, "[watchlist term]");
+    }
+
+    #[test]
+    fn test_watchlist_case_insensitive_match() {
+        let terms = vec!["john doe".to_string()];
+        let hits = scan_watchlist("Hello JOHN DOE please sign in", &terms);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn test_watchlist_no_match() {
+        let terms = vec!["secret".to_string()];
+        let hits = scan_watchlist("nothing interesting here", &terms);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_watchlist_empty_terms_ignored() {
+        let terms = vec!["".to_string(), "  ".to_string()];
+        let hits = scan_watchlist("anything", &terms);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_scan_email() {
+        let hits = scan("send mail to user@example.com please");
+        assert!(hits.iter().any(|h| h.kind == "email"));
+        // Must not echo full address
+        assert!(!hits.iter().any(|h| h.snippet.contains("user@example.com")));
+    }
+
+    #[test]
+    fn test_scan_aws_key() {
+        let hits = scan("key is AKIAIOSFODNN7EXAMPLE");
+        assert!(hits.iter().any(|h| h.kind == "AWS key"));
+    }
+
+    #[test]
+    fn test_scan_github_pat() {
+        let hits = scan("token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890");
+        assert!(hits.iter().any(|h| h.kind == "GitHub PAT"));
+    }
+
+    #[test]
+    fn test_scan_no_false_positive_loopback() {
+        let hits = scan("connecting to 127.0.0.1 and 192.168.1.1");
+        assert!(!hits.iter().any(|h| h.kind == "IP address"));
+    }
+
+    #[test]
+    fn test_scan_public_ip() {
+        let hits = scan("server at 8.8.8.8 is up");
+        assert!(hits.iter().any(|h| h.kind == "IP address"));
+    }
+}
+
 /// Scan `text` for PII and return all matches found.
 pub fn scan(text: &str) -> Vec<PiiMatch> {
     let p = patterns();

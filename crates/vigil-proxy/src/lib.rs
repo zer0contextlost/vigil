@@ -16,6 +16,29 @@ const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
+/// Response headers that are safe to forward to the client.
+/// Any header NOT in this list is silently dropped to prevent header injection
+/// from a compromised or malicious upstream.
+pub const ALLOWED_RESP_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "cache-control",
+    "x-request-id",
+    "anthropic-ratelimit-requests-limit",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-limit",
+    "anthropic-ratelimit-tokens-remaining",
+    "anthropic-ratelimit-tokens-reset",
+    "retry-after",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+];
+
 pub type PendingApprovals = Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>;
 
 #[derive(Debug, Clone)]
@@ -440,25 +463,6 @@ async fn handle_reverse_proxy(
 
     // Write HTTP response status line + headers to client.
     // Only forward a known-safe set to prevent header injection from upstream responses.
-    const ALLOWED_RESP_HEADERS: &[&str] = &[
-        "content-type",
-        "content-length",
-        "cache-control",
-        "x-request-id",
-        "anthropic-ratelimit-requests-limit",
-        "anthropic-ratelimit-requests-remaining",
-        "anthropic-ratelimit-requests-reset",
-        "anthropic-ratelimit-tokens-limit",
-        "anthropic-ratelimit-tokens-remaining",
-        "anthropic-ratelimit-tokens-reset",
-        "retry-after",
-        "x-ratelimit-limit-requests",
-        "x-ratelimit-limit-tokens",
-        "x-ratelimit-remaining-requests",
-        "x-ratelimit-remaining-tokens",
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset-tokens",
-    ];
     let mut header_block = format!("HTTP/1.1 {}\r\n", status);
     for (k, v) in &resp_headers {
         let name = k.as_str().to_ascii_lowercase();
@@ -1387,6 +1391,38 @@ mod tests {
         let raw = b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nx-api-key: sk-123\r\n\r\n";
         let (_, _, _, headers, _) = parse_http_headers(raw).unwrap();
         assert_eq!(headers.get("x-api-key").unwrap(), "sk-123");
+    }
+
+    #[test]
+    fn test_response_header_allowlist_blocks_injected_headers() {
+        // Simulate what an upstream could send to try to inject headers.
+        // build_allowed_response_headers should only pass safe headers through.
+        let dangerous = [
+            "set-cookie",
+            "x-custom-injected",
+            "location",
+            "www-authenticate",
+            "proxy-authenticate",
+        ];
+        for h in &dangerous {
+            assert!(
+                !ALLOWED_RESP_HEADERS.contains(h),
+                "dangerous header '{}' must not be in the allowlist",
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn test_response_header_allowlist_passes_safe_headers() {
+        let safe = ["content-type", "cache-control", "x-request-id", "retry-after"];
+        for h in &safe {
+            assert!(
+                ALLOWED_RESP_HEADERS.contains(h),
+                "safe header '{}' should be in the allowlist",
+                h
+            );
+        }
     }
 }
 
