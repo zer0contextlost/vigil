@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use ulid::{Generator, Ulid};
 use uuid::Uuid;
 
 use crate::envelope::Envelope;
@@ -32,6 +33,7 @@ pub struct SessionStore {
     pub last_hash: String,
     session_key: [u8; 32],
     pub meta: SessionMeta,
+    ulid_gen: Generator,
 }
 
 impl SessionStore {
@@ -70,12 +72,14 @@ impl SessionStore {
             last_hash: String::new(),
             session_key,
             meta,
+            ulid_gen: Generator::new(),
         })
     }
 
     /// Append one envelope to the NDJSON file, update the hash chain, fsync.
     pub fn append(&mut self, envelope: &Envelope) -> Result<()> {
         let mut env = envelope.clone();
+        env.event_id = self.ulid_gen.generate().unwrap_or_else(|_| Ulid::new());
         env.prev_hash = self.last_hash.clone();
         self.last_hash = env.compute_hash();
 
