@@ -40,13 +40,19 @@ impl BurnRateTracker {
     }
 
     pub fn rate_per_min(&self) -> f64 {
-        if self.window.len() < 2 {
+        if self.window.is_empty() {
             return 0.0;
         }
         let window_cost: f64 = self.window.iter().map(|(_, c)| c).sum();
-        let elapsed = self.window.back().unwrap().0
-            .duration_since(self.window.front().unwrap().0)
-            .as_secs_f64();
+        // With a single data point use time since session start so the very first
+        // expensive call can still trigger a burn-rate alert.
+        let elapsed = if self.window.len() == 1 {
+            self.session_start.elapsed().as_secs_f64()
+        } else {
+            self.window.back().unwrap().0
+                .duration_since(self.window.front().unwrap().0)
+                .as_secs_f64()
+        };
         if elapsed < 1.0 {
             return 0.0;
         }
