@@ -19,6 +19,17 @@ pub struct VigilConfig {
     pub policies: Vec<ConfigPolicy>,
     #[serde(default)]
     pub budget: BudgetSection,
+    #[serde(default)]
+    pub notify: NotifySection,
+}
+
+fn default_blocked_commands() -> Vec<String> {
+    vec![
+        "rm -rf".to_string(),
+        "dd if=".to_string(),
+        "mkfs".to_string(),
+        ":(){ :|:& };:".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -26,6 +37,25 @@ pub struct VigilConfig {
 pub struct ProxySection {
     pub port: Option<u16>,
     pub metrics_port: Option<u16>,
+    /// Gate writes at this risk level or above. "Low", "Medium", or "High".
+    /// None (the default) disables write approval gating.
+    #[serde(default)]
+    pub write_approval_threshold: Option<String>,
+    /// Shell command substrings to block. Each entry is matched as a
+    /// case-sensitive substring against Bash/shell tool call inputs.
+    /// Best-effort — not a security boundary; a determined agent can bypass
+    /// simple substring checks. Defaults to a short list of destructive
+    /// patterns. Set to [] to disable all blocking.
+    #[serde(default = "default_blocked_commands")]
+    pub blocked_commands: Vec<String>,
+    /// Emit a ToolTimeout alert if no LlmRequest follows a tool call within
+    /// this many seconds. None disables the check. Recommended: 600 (10 min).
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+    /// If set, automatically kill the agent process after this many seconds
+    /// of tool silence (must be >= tool_timeout_secs). Alert-only opt-in.
+    #[serde(default)]
+    pub tool_timeout_kill_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -48,6 +78,28 @@ pub struct BudgetSection {
     pub max_tokens: Option<u32>,
     /// Time window when agent is allowed to run, "HH:MM-HH:MM" local time.
     pub allowed_hours: Option<String>,
+    #[serde(default)]
+    pub max_burn_rate_usd_per_min: Option<f64>,
+    #[serde(default)]
+    pub loop_detect_threshold: Option<u32>,
+    /// Emit a soft CostAlert warning (without stopping) at this spend level.
+    #[serde(default)]
+    pub cost_alert_usd: Option<f64>,
+    /// Emit a SessionDurationAlert (and optionally stop) after this many minutes.
+    #[serde(default)]
+    pub max_session_duration_mins: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySection {
+    /// HTTP endpoint to POST alert events to. Fire-and-forget with 3 retries.
+    #[serde(default)]
+    pub webhook: Option<String>,
+    /// Subset of alert labels to forward. Empty = all alerts.
+    /// Valid labels: BURN, TOUT, EXFL, LOOP, WAPPR, COST, DURA, DENY
+    #[serde(default)]
+    pub webhook_events: Vec<String>,
 }
 
 /// A policy rule as it appears in vigil.toml.
@@ -73,8 +125,8 @@ impl VigilConfig {
 
     pub fn validate(&self) -> anyhow::Result<Vec<String>> {
         let mut warnings = Vec::new();
-        if self.policies.is_empty() {
-            warnings.push("No policies defined — all events will be allowed".to_string());
+        if self.policies.is_empty() && self.proxy.blocked_commands.is_empty() {
+            warnings.push("No policies or blocked commands defined — all events will be allowed".to_string());
         }
         if let Some(hours) = &self.budget.allowed_hours {
             if !hours.contains('-') || hours.len() != 11 {
@@ -108,7 +160,18 @@ impl VigilConfig {
     }
 
     /// Convert the policies in this config to the format PolicyEngine expects.
+    /// Blocked commands are prepended as synthetic ToolCallInput deny policies.
     pub fn to_policies(&self) -> Vec<Policy> {
-        self.policies.iter().cloned().map(Into::into).collect()
+        let mut policies: Vec<Policy> = self.proxy.blocked_commands.iter().map(|pattern| Policy {
+            name: format!("block-cmd:{}", pattern),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::ToolCallInput {
+                tool_name_pattern: "Bash".to_string(),
+                input_field: "command".to_string(),
+                value_pattern: pattern.clone(),
+            },
+        }).collect();
+        policies.extend(self.policies.iter().cloned().map(Into::into));
+        policies
     }
 }

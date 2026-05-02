@@ -31,6 +31,8 @@ pub struct SessionSummary {
     pub total_cost_usd: f64,
     pub policy_violations: u32,
     pub event_count: usize,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl Session {
@@ -75,6 +77,7 @@ impl Session {
             total_cost_usd: self.total_cost_usd,
             policy_violations: self.policy_violations,
             event_count: self.events.len(),
+            name: None,
         }
     }
 
@@ -95,31 +98,65 @@ impl Session {
     }
 
     pub fn list_all() -> anyhow::Result<Vec<SessionSummary>> {
+        use crate::store::SessionMeta;
+
         let sessions_dir = Self::sessions_dir()?;
         if !sessions_dir.exists() {
             return Ok(Vec::new());
         }
 
-        let mut summaries = Vec::new();
+        let mut summaries: std::collections::HashMap<Uuid, SessionSummary> = std::collections::HashMap::new();
+
         for entry in std::fs::read_dir(&sessions_dir)? {
             let entry = entry?;
             let path = entry.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if path.extension().and_then(|s| s.to_str()) == Some("json")
-                && !name.ends_with(".meta.json")
-                && !name.ends_with(".summary.json")
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            // New format: <uuid>.meta.json
+            if fname.ends_with(".meta.json") {
+                if let Ok(json) = std::fs::read_to_string(&path) {
+                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&json) {
+                        let summary = SessionSummary {
+                            id: meta.session_id,
+                            agent: meta.agent.clone(),
+                            started_at: meta.started_at,
+                            ended_at: meta.ended_at,
+                            total_input_tokens: meta.total_input_tokens,
+                            total_output_tokens: meta.total_output_tokens,
+                            total_cost_usd: meta.total_cost_usd,
+                            policy_violations: meta.policy_violations,
+                            event_count: meta.event_count as usize,
+                            name: meta.name.clone(),
+                        };
+                        summaries.insert(meta.session_id, summary);
+                    }
+                }
+            }
+
+            // Legacy format: <uuid>.json (no .meta suffix)
+            if path.extension().and_then(|s| s.to_str()) == Some("json")
+                && !fname.ends_with(".meta.json")
+                && !fname.ends_with(".summary.json")
             {
                 if let Ok(json) = std::fs::read_to_string(&path) {
                     if let Ok(session) = serde_json::from_str::<Session>(&json) {
-                        summaries.push(session.to_summary());
+                        // Only insert if not already present from meta.json
+                        summaries.entry(session.id).or_insert_with(|| session.to_summary());
                     }
                 }
             }
         }
 
-        // Sort by started_at descending (newest first)
-        summaries.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        Ok(summaries)
+        let mut result: Vec<SessionSummary> = summaries.into_values().collect();
+        result.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(result)
+    }
+
+    /// Look up a session by name label. Returns the first match.
+    pub fn find_by_name(name: &str) -> anyhow::Result<Option<SessionSummary>> {
+        Ok(Self::list_all()?.into_iter().find(|s| {
+            s.name.as_deref().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)
+        }))
     }
 
     pub fn sessions_dir() -> anyhow::Result<PathBuf> {

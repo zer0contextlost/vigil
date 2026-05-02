@@ -29,6 +29,10 @@ pub enum Event {
         /// Full assistant text accumulated from SSE text_delta events.
         #[serde(default)]
         response_text: Option<String>,
+        #[serde(default)]
+        cache_read_input_tokens: u32,
+        #[serde(default)]
+        cache_creation_input_tokens: u32,
     },
     ToolCall {
         agent: String,
@@ -67,6 +71,68 @@ pub enum Event {
         source: String,
         /// Human-readable list of what was found, e.g. ["email", "phone"]
         kinds: Vec<String>,
+        session_id: Uuid,
+    },
+    BurnRateAlert {
+        rate_per_min_usd: f64,
+        projected_total_usd: f64,
+        session_cost_usd: f64,
+        session_id: Uuid,
+    },
+    LoopAlert {
+        tool_name: String,
+        repeat_count: u32,
+        session_id: Uuid,
+    },
+    /// Emitted by the proxy when a Write/Edit tool call exceeds the risk threshold.
+    /// The filter task forwards this to the TUI which shows a diff preview and waits for approval.
+    WriteApprovalRequired {
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        before: String,
+        #[serde(default)]
+        after: String,
+        /// "Low" / "Medium" / "High" as string to keep Event serde simple.
+        #[serde(default)]
+        risk_level: String,
+        #[serde(default)]
+        reasons: Vec<String>,
+        session_id: Uuid,
+        /// Proxy sets this to a unique ID so the TUI can send the decision back on the right channel.
+        approval_id: Uuid,
+    },
+    /// Emitted by the filter task after the user approves or rejects a pending write.
+    WriteApprovalDecision {
+        approval_id: Uuid,
+        approved: bool,
+        session_id: Uuid,
+    },
+    /// Emitted when a credential fingerprinted from a file read is detected in an
+    /// outbound LLM request or shell tool call.
+    ExfilAlert {
+        /// Partially-redacted matched credential snippets (e.g. "sk-a***")
+        matches: Vec<String>,
+        /// "llm_request" or the tool name (e.g. "Bash")
+        source: String,
+        session_id: Uuid,
+    },
+    /// Emitted when a tool call has been running longer than tool_timeout_secs
+    /// with no follow-up LlmRequest from the agent.
+    ToolTimeout {
+        tool_name: String,
+        elapsed_secs: u64,
+        session_id: Uuid,
+    },
+    /// Soft cost warning fired once when session cost crosses cost_alert_usd.
+    CostAlert {
+        threshold_usd: f64,
+        session_cost_usd: f64,
+        session_id: Uuid,
+    },
+    /// Fired once when session wall-clock duration exceeds max_session_duration_mins.
+    SessionDurationAlert {
+        elapsed_mins: u64,
         session_id: Uuid,
     },
 }

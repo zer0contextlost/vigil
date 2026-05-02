@@ -23,3 +23,7 @@ Cargo.lock
 
 # Test files
 test_output/
+
+# Generated / runtime files
+*.log
+.agent-sentinel.yaml

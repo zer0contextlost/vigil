@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -15,6 +16,8 @@ use vigil_core::{Event, TimestampedEvent};
 pub struct McpShimConfig {
     pub server_command: String,
     pub server_args: Vec<String>,
+    pub session_id: Uuid,
+    pub pii_watchlist: Vec<String>,
 }
 
 pub struct McpShim {
@@ -62,7 +65,7 @@ impl McpShim {
 
         let event_tx_req = self.event_tx.clone();
         let server_name = self.config.server_command.clone();
-        let session_id = Uuid::new_v4();
+        let session_id = self.config.session_id;
 
         // Task: read child stdout, forward to our stdout, intercept responses
         let event_tx_res = self.event_tx.clone();
@@ -122,6 +125,25 @@ impl McpShim {
                             } else {
                                 ("unknown".to_string(), Value::Null)
                             };
+
+                            // PII scan on tool call params
+                            {
+                                let param_text = input.to_string();
+                                let mut hits = vigil_core::scan_pii(&param_text);
+                                hits.extend(vigil_core::scan_watchlist(&param_text, &self.config.pii_watchlist));
+                                if !hits.is_empty() {
+                                    let kinds: Vec<String> = {
+                                        let mut seen = HashSet::new();
+                                        hits.iter().filter(|h| seen.insert(h.kind.clone())).map(|h| h.kind.clone()).collect()
+                                    };
+                                    let pii_event = TimestampedEvent::new(Event::PiiAlert {
+                                        source: format!("mcp:{}", tool_name),
+                                        kinds,
+                                        session_id,
+                                    });
+                                    event_tx_req.send(pii_event).await.ok();
+                                }
+                            }
 
                             let event = TimestampedEvent::new(Event::McpCall {
                                 server: server_name.clone(),

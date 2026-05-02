@@ -1,61 +1,64 @@
+# vigil example policy file
+# Pass with: vigil run --policy example-policy.yaml -- <agent>
+#
+# Actions: Deny, Confirm, LogOnly
+# Matchers: ToolCall, FsWriteOutside, FsPath, NetworkDomain, TokenBudget, AnyLlmRequest, ToolCallInput
+# First-match wins. See POLICY_ENGINE.md for the hardcoded safety floor.
+
 policies:
-  # Hardcoded safety floor: destructive shell patterns are always blocked
-  # Examples: rm -rf, dd if=, mkfs, fork bombs, curl|sh, wget|sh
-
-  - name: block-rm-rf
+  # Block any Bash tool call
+  - name: block-bash
     matcher:
       type: ToolCall
-      tool_name_pattern: "bash"
-    action: DENY
-    # Note: rm -rf is caught by hardcoded floor, always denied
+      tool_name_pattern: "Bash"
+    action: Deny
 
-  - name: require-confirmation-for-git-commands
-    matcher:
-      type: ToolCall
-      tool_name_pattern: "bash"
-    action: CONFIRM
-    # User must confirm any Bash tool calls
-
+  # Block file writes outside the project root
   - name: deny-writes-outside-project
     matcher:
       type: FsWriteOutside
-      root: "/home/user/myproject"
-    action: DENY
-    # Block any file writes outside the project root
+      root: "."
+    action: Deny
 
-  - name: deny-writes-to-sensitive-dirs
+  # Log reads of .env files without blocking
+  - name: log-env-reads
     matcher:
       type: FsPath
       path_pattern: ".env"
-    action: DENY
-    # Block writes to .env files
+    action: LogOnly
 
-  - name: deny-reads-from-secrets
+  # Block reads of files containing "secrets" in path
+  - name: deny-secrets-reads
     matcher:
       type: FsPath
       path_pattern: "secrets"
-    action: DENY
-    # Block reads from files containing "secrets" in path
+    action: Deny
 
-  - name: restrict-to-openai-and-anthropic
+  # Only allow LLM calls to OpenAI or Anthropic endpoints
+  - name: restrict-to-known-providers
     matcher:
       type: NetworkDomain
       deny_unless_in: ["openai", "anthropic"]
-    action: DENY
-    # Only allow LLM calls to OpenAI or Anthropic
+    action: Deny
 
+  # Log a warning when session hits 1M tokens
   - name: token-budget-warning
     matcher:
       type: TokenBudget
       max_tokens: 1000000
-    action: LOGONLY
-    # Log a warning when session hits 1M tokens
+    action: LogOnly
 
-  - name: tool-input-validation
+  # Log all LLM requests
+  - name: log-all-requests
+    matcher:
+      type: AnyLlmRequest
+    action: LogOnly
+
+  # Block http_request tool calls targeting localhost
+  - name: deny-localhost-requests
     matcher:
       type: ToolCallInput
       tool_name_pattern: "http_request"
       input_field: "url"
       value_pattern: "localhost"
-    action: DENY
-    # Deny http_request tool calls with localhost URLs
+    action: Deny

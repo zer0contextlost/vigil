@@ -11,11 +11,11 @@ default-members = ["crates/vigil-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-authors = ["Cliff Harsey <steven.cliff.harsey@gmail.com>"]
+authors = ["Cliff Harsey"]
 license = "MIT"
-repository = "https://github.com/cliffjames/vigil"
+repository = "https://github.com/zer0contextlost/vigil"
 
 [workspace.metadata]
 description = "Runtime observability and policy enforcement for AI coding agents"

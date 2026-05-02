@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, Event, PolicyEngine, TimestampedEvent};
+use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost};
 use vigil_proxy::Proxy;
-use vigil_tui::App;
+use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
 
 #[derive(Parser)]
@@ -13,6 +13,14 @@ use vigil_watch::{WatchConfig, Watcher};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// List plugins in ~/.vigil/plugins/ and any loaded via --plugin
+    List,
+    /// Show the plugins directory path
+    Dir,
 }
 
 #[derive(Subcommand)]
@@ -27,6 +35,10 @@ enum Commands {
         #[arg(long)]
         policy: Option<PathBuf>,
 
+        /// vigil.toml configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
+
         /// Write debug log to this file (tail -f <file> to watch in another terminal)
         #[arg(long)]
         log_file: Option<PathBuf>,
@@ -34,6 +46,14 @@ enum Commands {
         /// File containing personal watchlist terms for PII detection (one per line)
         #[arg(long)]
         pii_watchlist: Option<PathBuf>,
+
+        /// Shared library plugin(s) to load (.dll / .so / .dylib). May be repeated.
+        #[arg(long = "plugin")]
+        plugins: Vec<PathBuf>,
+
+        /// Human-readable label for this session (shown in vigil sessions / browse)
+        #[arg(long)]
+        name: Option<String>,
 
         /// Agent command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -50,13 +70,66 @@ enum Commands {
         force: bool,
     },
 
-    /// List past sessions
+    /// List past sessions (text table)
     Sessions,
+
+    /// Browse past sessions in an interactive TUI
+    Browse,
+
+    /// Tag a session with a human-readable name
+    Tag {
+        /// Session ID (UUID) or existing name
+        session_id: String,
+        /// Label to assign
+        name: String,
+    },
+
+    /// Manage vigil plugins
+    Plugins {
+        #[command(subcommand)]
+        action: PluginCommands,
+    },
 
     /// Replay a recorded session
     Replay {
         /// Session ID to replay
         session_id: String,
+    },
+
+    /// Verify hash chain integrity of a recorded session
+    Audit {
+        /// Session ID (UUID) to audit
+        session_id: String,
+    },
+
+    /// Verify hash chain and ed25519 signature of a recorded session
+    Verify {
+        /// Session ID (UUID) to verify
+        session_id: String,
+    },
+
+    /// Export a session to NDJSON with PII redacted
+    Export {
+        /// Session ID (UUID) to export
+        session_id: String,
+        /// Output file path (default: stdout)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Show all currently active vigil sessions
+    Ps,
+
+    /// Replay a session prefix and continue with a live agent
+    Fork {
+        /// Session ID to fork from
+        session_id: String,
+        /// Replay the first N events, then go live (0 = full session prefix)
+        #[arg(long, default_value = "0")]
+        prefix_events: usize,
+        /// Agent command and arguments (same as vigil run)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        agent_and_args: Vec<String>,
     },
 }
 
@@ -268,15 +341,72 @@ async fn main() -> Result<()> {
         Some(Commands::Run {
             port,
             policy,
+            config,
             log_file,
             pii_watchlist,
+            plugins,
+            name,
             agent_and_args,
         }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
-            run_agent(port, policy, log_file.as_ref(), agent_and_args, watchlist).await?;
+            let config_path_str = config.as_deref().map(|p| p.display().to_string());
+            let vigil_config = config.as_deref()
+                .and_then(|p| vigil_core::VigilConfig::load(p).ok());
+            let mut plugin_host = PluginHost::new();
+            // Auto-load plugins from ~/.vigil/plugins/
+            if let Ok(dir) = plugins_dir() {
+                load_plugins_from_dir(&dir, &mut plugin_host);
+            }
+            for path in &plugins {
+                match plugin_host.load_from_file(path) {
+                    Ok(()) => println!("Loaded plugin: {}", path.display()),
+                    Err(e) => eprintln!("Warning: {}", e),
+                }
+            }
+            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host, name).await?;
         }
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
+        }
+        Some(Commands::Browse) => {
+            let summaries = Session::list_all()?;
+            match vigil_tui::run_session_browser(summaries).await? {
+                Some(BrowseAction::Replay(id)) => {
+                    let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
+                    let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                    let envelopes_clone = envelopes.clone();
+                    tokio::spawn(async move {
+                        for (i, env) in envelopes_clone.iter().enumerate() {
+                            if i > 0 {
+                                let prev_ts = envelopes_clone[i - 1].timestamp;
+                                let delta = env.timestamp.signed_duration_since(prev_ts);
+                                let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                                if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
+                            }
+                            if tx.send(env.clone()).await.is_err() { break; }
+                        }
+                    });
+                    let meta = vigil_core::store::SessionStore::load_meta(&id).ok();
+                    let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
+                    let mut session = vigil_core::session::Session::new(agent);
+                    session.id = id;
+                    let mut app = App::new(session);
+                    app.is_replay = true;
+                    vigil_tui::run_tui(app, rx).await?;
+                }
+                Some(BrowseAction::Delete(id)) => {
+                    confirm_delete_session(&id)?;
+                }
+                Some(BrowseAction::Quit) | None => {}
+            }
+        }
+        Some(Commands::Tag { session_id, name }) => {
+            let uuid = resolve_session_id(&session_id)?;
+            SessionStore::tag(&uuid, &name)?;
+            println!("Tagged session {} as {:?}", uuid, name);
+        }
+        Some(Commands::Plugins { action }) => {
+            run_plugins_command(action)?;
         }
         Some(Commands::Sessions) => {
             let summaries = Session::list_all()?;
@@ -305,26 +435,353 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Some(Commands::Audit { session_id }) => {
+            run_audit(&session_id)?;
+        }
+        Some(Commands::Verify { session_id }) => {
+            run_verify(&session_id)?;
+        }
+        Some(Commands::Export { session_id, output }) => {
+            run_export(&session_id, output.as_deref())?;
+        }
+        Some(Commands::Ps) => {
+            run_ps()?;
+        }
+        Some(Commands::Fork { session_id, prefix_events, agent_and_args }) => {
+            run_fork(&session_id, prefix_events, agent_and_args).await?;
+        }
         Some(Commands::Replay { session_id }) => {
             let uuid = uuid::Uuid::parse_str(&session_id)
                 .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
-            let session = Session::load(&uuid)?;
-            println!(
-                "Replaying session {} ({} events)...",
-                session_id,
-                session.events.len()
-            );
 
-            let (tx, rx) = tokio::sync::mpsc::channel(session.events.len().max(1));
-            for event in &session.events {
-                tx.try_send(event.clone()).ok();
+            let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+            if !envelopes.is_empty() {
+                println!("Replaying session {} ({} events, NDJSON)...", session_id, envelopes.len());
+                let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                let envelopes_clone = envelopes.clone();
+                tokio::spawn(async move {
+                    for (i, event) in envelopes_clone.iter().enumerate() {
+                        if i > 0 {
+                            let prev_ts = envelopes_clone[i - 1].timestamp;
+                            let delta = event.timestamp.signed_duration_since(prev_ts);
+                            let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                            if ms > 0 {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+                            }
+                        }
+                        if tx.send(event.clone()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let meta = vigil_core::store::SessionStore::load_meta(&uuid).ok();
+                let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
+                let mut session = vigil_core::session::Session::new(agent);
+                session.id = uuid;
+                let mut app = App::new(session);
+                app.is_replay = true;
+                vigil_tui::run_tui(app, rx).await?;
+            } else {
+                let session = vigil_core::session::Session::load(&uuid)?;
+                println!("Replaying session {} ({} events, JSON)...", session_id, session.events.len());
+                let (tx, rx) = tokio::sync::mpsc::channel(session.events.len().max(1));
+                for event in &session.events {
+                    tx.try_send(event.clone()).ok();
+                }
+                drop(tx);
+                let mut app = App::new(session);
+                app.is_replay = true;
+                vigil_tui::run_tui(app, rx).await?;
             }
-            drop(tx);
-
-            let mut app = App::new(session);
-            app.is_replay = true;
-            vigil_tui::run_tui(app, rx).await?;
         }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil audit
+// ---------------------------------------------------------------------------
+
+fn run_audit(session_id: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    let actual_count = envelopes.len();
+
+    println!("vigil audit: {}", session_id);
+    println!("Events:     {}", actual_count);
+
+    // --- Hash chain check ---
+    let mut chain_ok = true;
+    let mut chain_msg = String::from("OK");
+    let mut expected_prev = String::new();
+
+    for (i, env) in envelopes.iter().enumerate() {
+        if env.prev_hash != expected_prev {
+            chain_ok = false;
+            chain_msg = format!(
+                "BROKEN at event {}, expected {} got {}",
+                i,
+                expected_prev,
+                env.prev_hash
+            );
+            break;
+        }
+        expected_prev = env.compute_hash();
+    }
+    println!("Hash chain: {}", chain_msg);
+
+    // --- ULID monotonicity check ---
+    let mut ulid_ok = true;
+    let mut ulid_msg = String::from("OK");
+
+    if actual_count > 1 {
+        for i in 1..envelopes.len() {
+            let prev_str = envelopes[i - 1].event_id.to_string();
+            let curr_str = envelopes[i].event_id.to_string();
+            if curr_str <= prev_str {
+                ulid_ok = false;
+                ulid_msg = if curr_str == prev_str {
+                    format!("DUPLICATE ULID at events {} and {}", i - 1, i)
+                } else {
+                    format!("OUT OF ORDER at event {}", i)
+                };
+                break;
+            }
+        }
+    }
+    println!("ULID order: {}", ulid_msg);
+
+    // --- Meta count check ---
+    let (meta_ok, meta_msg) = match vigil_core::store::SessionStore::load_meta(&uuid) {
+        Ok(meta) => {
+            if meta.event_count == actual_count as u64 {
+                (true, String::from("OK"))
+            } else {
+                (
+                    false,
+                    format!(
+                        "MISMATCH meta={} actual={}",
+                        meta.event_count, actual_count
+                    ),
+                )
+            }
+        }
+        Err(e) => (false, format!("MISSING ({})", e)),
+    };
+    println!("Meta count: {}", meta_msg);
+    println!();
+
+    let issues = [!chain_ok, !ulid_ok, !meta_ok]
+        .iter()
+        .filter(|&&f| f)
+        .count();
+
+    if issues == 0 {
+        println!("PASS");
+    } else {
+        println!("FAIL -- {} issue(s) found", issues);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil verify
+// ---------------------------------------------------------------------------
+
+fn run_verify(session_id: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    let actual_count = envelopes.len();
+
+    println!("vigil verify: {}", session_id);
+    println!("Events:     {}", actual_count);
+
+    // --- Hash chain ---
+    let mut chain_ok = true;
+    let mut chain_msg = String::from("OK");
+    let mut expected_prev = String::new();
+    let mut final_hash = String::new();
+
+    for (i, env) in envelopes.iter().enumerate() {
+        if env.prev_hash != expected_prev {
+            chain_ok = false;
+            chain_msg = format!(
+                "BROKEN at event {}, expected {} got {}",
+                i, expected_prev, env.prev_hash
+            );
+            break;
+        }
+        final_hash = env.compute_hash();
+        expected_prev = final_hash.clone();
+    }
+    println!("Hash chain: {}", chain_msg);
+
+    // --- ed25519 signature ---
+    let (sig_ok, sig_msg) = match vigil_core::store::SessionStore::load_meta(&uuid) {
+        Ok(meta) => {
+            if meta.chain_signature.is_none() {
+                (true, "SKIP (session predates signing)".to_string())
+            } else if meta.chain_root_hash != final_hash {
+                (false, format!("MISMATCH meta root={} actual={}", meta.chain_root_hash, final_hash))
+            } else {
+                match vigil_core::store::SessionStore::verify_signature(&meta, &final_hash) {
+                    Ok(()) => (true, "OK".to_string()),
+                    Err(e) => (false, format!("INVALID: {}", e)),
+                }
+            }
+        }
+        Err(e) => (false, format!("MISSING ({})", e)),
+    };
+    println!("Signature:  {}", sig_msg);
+    println!();
+
+    let issues = [!chain_ok, !sig_ok].iter().filter(|&&f| f).count();
+    if issues == 0 {
+        println!("PASS");
+    } else {
+        println!("FAIL -- {} issue(s) found", issues);
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil export
+// ---------------------------------------------------------------------------
+
+fn run_export(session_id: &str, output: Option<&std::path::Path>) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    if envelopes.is_empty() {
+        anyhow::bail!("No events found for session {}", session_id);
+    }
+
+    let mut out_lines: Vec<String> = Vec::with_capacity(envelopes.len());
+    for env in &envelopes {
+        let mut val = serde_json::to_value(env)?;
+        redact_json_value(&mut val);
+        out_lines.push(serde_json::to_string(&val)?);
+    }
+
+    let content = out_lines.join("\n") + "\n";
+
+    if let Some(path) = output {
+        std::fs::write(path, &content)?;
+        println!("Exported {} events (redacted) → {}", envelopes.len(), path.display());
+    } else {
+        print!("{}", content);
+    }
+
+    Ok(())
+}
+
+/// Recursively walk a JSON value and replace any string that contains PII
+/// with "[REDACTED:<kind>]".
+fn redact_json_value(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::String(s) => {
+            let hits = vigil_core::scan_pii(s);
+            if !hits.is_empty() {
+                let labels: Vec<_> = hits.iter().map(|h| h.kind.as_str()).collect();
+                *s = format!("[REDACTED:{}]", labels.join(","));
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() { redact_json_value(v); }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() { redact_json_value(v); }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// vigil fork
+// ---------------------------------------------------------------------------
+
+async fn run_fork(
+    session_id_str: &str,
+    prefix_events: usize,
+    agent_and_args: Vec<String>,
+) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id_str)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    if envelopes.is_empty() {
+        anyhow::bail!("Session {} not found or empty", session_id_str);
+    }
+
+    let prefix = if prefix_events == 0 {
+        envelopes.len() // fork from end = full replay then go live
+    } else {
+        prefix_events.min(envelopes.len())
+    };
+
+    println!("vigil fork: {} ({} prefix events)", session_id_str, prefix);
+    println!("Replaying prefix...");
+
+    let meta = vigil_core::store::SessionStore::load_meta(&uuid).ok();
+    let agent_name = if !agent_and_args.is_empty() {
+        agent_and_args[0].clone()
+    } else {
+        meta.as_ref()
+            .map(|m| m.agent.clone())
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+
+    let new_session_id = uuid::Uuid::new_v4();
+    let store = vigil_core::store::SessionStore::create(new_session_id, &agent_name).ok();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<vigil_core::TimestampedEvent>(1024);
+
+    // Send prefix events instantly (no timestamp pacing)
+    let prefix_envelopes = envelopes[..prefix].to_vec();
+    let tx_clone = tx.clone();
+    tokio::spawn(async move {
+        for env in prefix_envelopes {
+            if tx_clone.send(env).await.is_err() {
+                break;
+            }
+        }
+        // tx_clone dropped here — if no live agent, TUI will see channel close
+    });
+
+    let mut session = vigil_core::session::Session::new(agent_name.clone());
+    session.id = new_session_id;
+    let mut app = App::new(session);
+    app.store = store;
+    app.is_replay = agent_and_args.is_empty();
+
+    if agent_and_args.is_empty() {
+        // Pure replay with no live continuation — drop our tx copy so the TUI
+        // sees the channel close after the prefix is consumed.
+        drop(tx);
+        vigil_tui::run_tui(app, rx).await?;
+    } else {
+        // Show prefix in TUI first (instant replay), then start a live session.
+        // Drop tx so the TUI exits after the prefix events are displayed.
+        drop(tx);
+        vigil_tui::run_tui(app, rx).await?;
+
+        println!();
+        println!("Fork prefix complete. Starting live session...");
+        println!();
+
+        let watchlist = load_pii_watchlist(None);
+        let port = find_available_port(8877)?;
+        run_agent(port, None, None, agent_and_args, watchlist, None, None).await?;
     }
 
     Ok(())
@@ -340,7 +797,7 @@ async fn run_interactive() -> Result<()> {
         return Ok(());
     }
     let watchlist = load_pii_watchlist(None);
-    run_agent(8877, None, None, args, watchlist).await
+    run_agent(8877, None, None, args, watchlist, None, None).await
 }
 
 /// Load PII watchlist terms: explicit file path first, then auto-load ~/.vigil/watchlist.txt.
@@ -399,6 +856,22 @@ async fn run_agent(
     log_file: Option<&PathBuf>,
     agent_and_args: Vec<String>,
     pii_watchlist: Vec<String>,
+    config: Option<vigil_core::VigilConfig>,
+    config_path: Option<String>,
+) -> Result<()> {
+    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None).await
+}
+
+pub async fn run_agent_with_plugins(
+    port: u16,
+    policy: Option<PathBuf>,
+    log_file: Option<&PathBuf>,
+    agent_and_args: Vec<String>,
+    pii_watchlist: Vec<String>,
+    config: Option<vigil_core::VigilConfig>,
+    config_path: Option<String>,
+    plugins: PluginHost,
+    session_name: Option<String>,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -409,19 +882,65 @@ async fn run_agent(
     let agent_name = agent_and_args[0].clone();
     let session = Session::new(agent_name.clone());
     let session_id = session.id;
-    let store = SessionStore::create(session_id, &agent_name).ok();
+    let mut store = SessionStore::create(session_id, &agent_name).ok();
+
+    if let Some(ref n) = session_name {
+        if let Some(ref mut s) = store { s.set_name(n.as_str()); }
+    }
+
+    let active_handle = vigil_core::create_handle(&session_id).ok();
+    if let Some(ref handle) = active_handle {
+        let _ = handle.write(&vigil_core::ActiveSession {
+            session_id,
+            agent: agent_name.clone(),
+            started_at: chrono::Utc::now(),
+            session_cost_usd: 0.0,
+            session_tokens: 0,
+            burn_rate_per_min: 0.0,
+            last_event: "starting".to_string(),
+            needs_attention: false,
+            pid: std::process::id(),
+        });
+    }
 
     let engine = if let Some(policy_path) = &policy {
         PolicyEngine::from_file(policy_path)?
+    } else if let Some(cfg) = &config {
+        let policies = cfg.to_policies();
+        if policies.is_empty() {
+            PolicyEngine::default()
+        } else {
+            PolicyEngine::new(vigil_core::PolicyConfig { policies })?
+        }
     } else {
         PolicyEngine::default()
     };
     let engine = Arc::new(engine);
 
+    // Warn when no enforcement is active. Check the compiled policy count rather
+    // than the raw config lists so defaults (blocked_commands) are counted too.
+    let observational_only = config.is_none() || engine.policy_count() == 0;
+
+    let budget_enforcer = config.as_ref().map(|c| BudgetEnforcer::new(c.budget.clone()));
+    let burn_rate_limit = config.as_ref().and_then(|c| c.budget.max_burn_rate_usd_per_min);
+    let loop_threshold = config.as_ref()
+        .and_then(|c| c.budget.loop_detect_threshold)
+        .unwrap_or(5);
+    let tool_timeout_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_secs);
+    let tool_timeout_kill_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_kill_secs);
+    let cost_alert_usd = config.as_ref().and_then(|c| c.budget.cost_alert_usd);
+    let max_session_duration_mins = config.as_ref().and_then(|c| c.budget.max_session_duration_mins);
+    let webhook_notifier = config.as_ref()
+        .and_then(|c| c.notify.webhook.clone())
+        .map(|url| vigil_core::WebhookNotifier::new(url,
+            config.as_ref().map(|c| c.notify.webhook_events.clone()).unwrap_or_default()));
+
+    let plugin_host = Arc::new(plugins);
+
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
 
-    println!("vigil v0.1.0");
+    println!("vigil v{}", env!("CARGO_PKG_VERSION"));
     println!("Session ID: {}", session_id);
     println!("Agent: {}", agent_name);
     if let Some(lf) = log_file {
@@ -432,22 +951,50 @@ async fn run_agent(
     println!("Routing agent traffic via ANTHROPIC_BASE_URL=http://127.0.0.1:{}", port);
     println!();
     println!("Press 'q' in the dashboard to quit");
+    if observational_only {
+        println!("NOTE: running in observational mode — no blocked_commands or policies configured.");
+    }
     println!();
 
     let proxy_url = format!("http://127.0.0.1:{}", port);
     tracing::info!(port, "starting vigil proxy");
+
+    let write_approval_threshold = config.as_ref()
+        .and_then(|c| c.proxy.write_approval_threshold.as_deref())
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "low" => Some(vigil_core::RiskLevel::Low),
+            "medium" => Some(vigil_core::RiskLevel::Medium),
+            "high" => Some(vigil_core::RiskLevel::High),
+            _ => None,
+        });
+
+    let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel::<(uuid::Uuid, bool)>(32);
 
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
         upstream_override: None,
         pii_watchlist,
+        write_approval_threshold,
     };
     let proxy = Proxy::new(proxy_config, raw_tx.clone());
+    let pending_approvals_for_resolver = proxy.pending_approvals.clone();
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = proxy.run().await {
             tracing::error!(err = %e, "proxy error");
             eprintln!("Proxy error: {}", e);
+        }
+    });
+
+    let resolver_handle = tokio::spawn(async move {
+        while let Some((approval_id, approved)) = decision_rx.recv().await {
+            let tx = {
+                let mut map = pending_approvals_for_resolver.lock().unwrap();
+                map.remove(&approval_id)
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(approved);
+            }
         }
     });
 
@@ -494,13 +1041,288 @@ async fn run_agent(
         }
     });
 
+    // Shared state for tool timeout tracking: (started_at, tool_name, alerted)
+    let last_tool_call: std::sync::Arc<std::sync::Mutex<Option<(std::time::Instant, String, bool)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    if let Some(timeout_secs) = tool_timeout_secs {
+        let state = last_tool_call.clone();
+        let tx = filtered_tx.clone();
+        let sid = session_id;
+        let kill_secs = tool_timeout_kill_secs;
+        let kill_pid = child_pid;
+        let plugin_host_tout = plugin_host.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let snapshot = state.lock().ok()
+                    .and_then(|g| g.as_ref().map(|(t, n, a)| (t.elapsed(), n.clone(), *a)));
+                if let Some((elapsed, tool_name, alerted)) = snapshot {
+                    let secs = elapsed.as_secs();
+                    if secs >= timeout_secs && !alerted {
+                        if let Ok(mut g) = state.lock() {
+                            if let Some(ref mut v) = *g { v.2 = true; }
+                        }
+                        let ev = TimestampedEvent::new(Event::ToolTimeout {
+                            tool_name: tool_name.clone(),
+                            elapsed_secs: secs,
+                            session_id: sid,
+                        });
+                        let detail = serde_json::json!({"tool_name": tool_name, "elapsed_secs": secs});
+                        plugin_host_tout.dispatch_alert("TOUT", &sid.to_string(), &detail);
+                        plugin_host_tout.dispatch_event(&ev);
+                        tx.send(ev).await.ok();
+                        eprintln!("[TIMEOUT] Tool '{}' has been running {}s with no response", tool_name, secs);
+                    }
+                    if let Some(ks) = kill_secs {
+                        if secs >= ks {
+                            eprintln!("[TIMEOUT] Killing agent (pid {}) after {}s", kill_pid, secs);
+                            #[cfg(windows)]
+                            { let _ = std::process::Command::new("taskkill")
+                                .args(["/PID", &kill_pid.to_string(), "/F"]).output(); }
+                            #[cfg(not(windows))]
+                            { let _ = std::process::Command::new("kill")
+                                .args(["-TERM", &kill_pid.to_string()]).output(); }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Session duration timer — fires once after max_session_duration_mins.
+    if let Some(duration_mins) = max_session_duration_mins {
+        let tx = filtered_tx.clone();
+        let sid = session_id;
+        let notifier = webhook_notifier.clone();
+        let plugin_host_dura = plugin_host.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(duration_mins * 60)).await;
+            let ev = TimestampedEvent::new(Event::SessionDurationAlert {
+                elapsed_mins: duration_mins,
+                session_id: sid,
+            });
+            let detail = serde_json::json!({"elapsed_mins": duration_mins});
+            if let Some(ref n) = notifier {
+                n.send("DURA", &sid.to_string(), detail.clone());
+            }
+            plugin_host_dura.dispatch_alert("DURA", &sid.to_string(), &detail);
+            plugin_host_dura.dispatch_event(&ev);
+            tx.send(ev).await.ok();
+            eprintln!("[DURATION] Session has been running {}min", duration_mins);
+        });
+    }
+
     // Policy filter: evaluate every raw event and forward allowed ones to the TUI.
+    let lock_path = active_handle.as_ref().map(|h| h.path.clone());
     let engine_clone = engine.clone();
+    let session_id_for_alerts = session_id;
+    let last_tool_call_filter = last_tool_call.clone();
+    let notifier_filter = webhook_notifier.clone();
+    let plugin_host_filter = plugin_host.clone();
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
+        let mut session_cost = 0f64;
+        let mut cost_alerted = false;
+        let mut burn_tracker = BurnRateTracker::new();
+        let mut loop_detector = LoopDetector::new(loop_threshold);
+        let mut cred_tracker = CredentialTracker::new();
         while let Some(event) = raw_rx.recv().await {
+            // Tool timeout tracking: arm on ToolCall, disarm on LlmRequest
+            if let Event::ToolCall { tool_name, .. } = &event.event {
+                if let Ok(mut g) = last_tool_call_filter.lock() {
+                    *g = Some((std::time::Instant::now(), tool_name.clone(), false));
+                }
+            }
+            // Disarm on any event that signals the tool finished: normal completion
+            // (LlmRequest) or blocked by policy (ToolCallResult { blocked: true }).
+            if matches!(&event.event,
+                Event::LlmRequest { .. }
+                | Event::ToolCallResult { .. }
+            ) {
+                if let Ok(mut g) = last_tool_call_filter.lock() {
+                    *g = None;
+                }
+            }
+
             if let Event::LlmRequest { input_tokens, .. } = &event.event {
-                session_tokens += input_tokens;
+                session_tokens = session_tokens.saturating_add(*input_tokens);
+            }
+
+            // Credential exfiltration detection — ingest file reads
+            if let Event::FsRead { path, .. } = &event.event {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    cred_tracker.ingest_file(&content, path);
+                }
+            }
+
+            // Credential exfiltration detection — check LLM prompts
+            if let Event::LlmRequest { last_user_message, system_prompt, session_id: sid, .. } = &event.event {
+                if !cred_tracker.is_empty() {
+                    let mut combined = String::new();
+                    if let Some(msg) = last_user_message { combined.push_str(msg); combined.push('\n'); }
+                    if let Some(sys) = system_prompt { combined.push_str(sys); combined.push('\n'); }
+                    if !combined.is_empty() {
+                        let hits = cred_tracker.check_outbound(&combined);
+                        if !hits.is_empty() {
+                            let detail = serde_json::json!({"source": "llm_request", "matches": hits});
+                            let alert = TimestampedEvent::new(Event::ExfilAlert {
+                                matches: hits.clone(),
+                                source: "llm_request".to_string(),
+                                session_id: *sid,
+                            });
+                            if let Some(ref n) = notifier_filter {
+                                n.send("EXFL", &sid.to_string(), detail.clone());
+                            }
+                            plugin_host_filter.dispatch_alert("EXFL", &sid.to_string(), &detail);
+                            plugin_host_filter.dispatch_event(&alert);
+                            filtered_tx.send(alert).await.ok();
+                        }
+                    }
+                }
+            }
+
+            // Credential exfiltration detection — check shell tool call inputs
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let shell_tools = ["Bash", "bash", "shell", "run_command", "execute"];
+                if shell_tools.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                    if !cred_tracker.is_empty() {
+                        let cmd = input.to_string();
+                        let hits = cred_tracker.check_outbound(&cmd);
+                        if !hits.is_empty() {
+                            let detail = serde_json::json!({"source": tool_name, "matches": hits});
+                            let alert = TimestampedEvent::new(Event::ExfilAlert {
+                                matches: hits.clone(),
+                                source: tool_name.clone(),
+                                session_id: *sid,
+                            });
+                            if let Some(ref n) = notifier_filter {
+                                n.send("EXFL", &sid.to_string(), detail.clone());
+                            }
+                            plugin_host_filter.dispatch_alert("EXFL", &sid.to_string(), &detail);
+                            plugin_host_filter.dispatch_event(&alert);
+                            filtered_tx.send(alert).await.ok();
+                        }
+                    }
+                }
+            }
+
+            if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {
+                session_tokens = session_tokens.saturating_add(input_tokens.saturating_add(*output_tokens));
+                session_cost += cost_usd;
+                if let Some(ref path) = lock_path {
+                    vigil_core::update_active(path, |s| {
+                        s.session_cost_usd = session_cost;
+                        s.session_tokens = session_tokens;
+                        s.last_event = "RES".to_string();
+                    });
+                }
+            }
+
+            // Soft cost alert — fires once when cost_alert_usd threshold is crossed
+            if !cost_alerted {
+                if let Some(threshold) = cost_alert_usd {
+                    if session_cost >= threshold {
+                        cost_alerted = true;
+                        let detail = serde_json::json!({"threshold_usd": threshold, "session_cost_usd": session_cost});
+                        let alert = TimestampedEvent::new(Event::CostAlert {
+                            threshold_usd: threshold,
+                            session_cost_usd: session_cost,
+                            session_id: session_id_for_alerts,
+                        });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("COST", &session_id_for_alerts.to_string(), detail.clone());
+                        }
+                        plugin_host_filter.dispatch_alert("COST", &session_id_for_alerts.to_string(), &detail);
+                        plugin_host_filter.dispatch_event(&alert);
+                        filtered_tx.send(alert).await.ok();
+                        eprintln!("[COST] Session cost ${:.4} crossed alert threshold ${:.4}", session_cost, threshold);
+                    }
+                }
+            }
+
+            if let Event::LlmResponse { cost_usd, .. } = &event.event {
+                let (rate, projected) = burn_tracker.record(*cost_usd);
+                if let Some(limit) = burn_rate_limit {
+                    if rate > limit {
+                        let detail = serde_json::json!({"rate_per_min_usd": rate, "projected_total_usd": projected});
+                        let alert = TimestampedEvent::new(Event::BurnRateAlert {
+                            rate_per_min_usd: rate,
+                            projected_total_usd: projected,
+                            session_cost_usd: session_cost,
+                            session_id: session_id_for_alerts,
+                        });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("BURN", &session_id_for_alerts.to_string(), detail.clone());
+                        }
+                        plugin_host_filter.dispatch_alert("BURN", &session_id_for_alerts.to_string(), &detail);
+                        plugin_host_filter.dispatch_event(&alert);
+                        filtered_tx.send(alert).await.ok();
+                        if let Some(ref path) = lock_path {
+                            vigil_core::update_active(path, |s| {
+                                s.burn_rate_per_min = rate;
+                                s.needs_attention = true;
+                                s.last_event = "BURN".to_string();
+                            });
+                        }
+                    }
+                }
+            }
+
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                if let Some(count) = loop_detector.check(tool_name, &input_str) {
+                    let detail = serde_json::json!({"tool_name": tool_name, "repeat_count": count});
+                    let alert = TimestampedEvent::new(Event::LoopAlert {
+                        tool_name: tool_name.clone(),
+                        repeat_count: count,
+                        session_id: *sid,
+                    });
+                    if let Some(ref n) = notifier_filter {
+                        n.send("LOOP", &sid.to_string(), detail.clone());
+                    }
+                    plugin_host_filter.dispatch_alert("LOOP", &sid.to_string(), &detail);
+                    plugin_host_filter.dispatch_event(&alert);
+                    filtered_tx.send(alert).await.ok();
+                    if let Some(ref path) = lock_path {
+                        vigil_core::update_active(path, |s| {
+                            s.needs_attention = true;
+                            s.last_event = "LOOP".to_string();
+                        });
+                    }
+                }
+            }
+
+            if let Some(ref enforcer) = budget_enforcer {
+                match enforcer.check(session_cost, session_tokens) {
+                    BudgetStatus::Ok => {}
+                    BudgetStatus::CostExceeded { limit, actual } => {
+                        tracing::warn!(limit, actual, "budget: cost limit exceeded");
+                        eprintln!("[BUDGET] Cost limit ${:.4} exceeded (actual ${:.4}) — stopping", limit, actual);
+                        break;
+                    }
+                    BudgetStatus::TokensExceeded { limit, actual } => {
+                        tracing::warn!(limit, actual, "budget: token limit exceeded");
+                        eprintln!("[BUDGET] Token limit {} exceeded (actual {}) — stopping", limit, actual);
+                        break;
+                    }
+                    BudgetStatus::OutsideAllowedHours { window } => {
+                        tracing::warn!(%window, "budget: outside allowed hours");
+                        eprintln!("[BUDGET] Outside allowed hours {} — stopping", window);
+                        break;
+                    }
+                }
+            }
+
+            if let Event::WriteApprovalRequired { .. } = &event.event {
+                if let Some(ref path) = lock_path {
+                    vigil_core::update_active(path, |s| {
+                        s.needs_attention = true;
+                        s.last_event = "WAPPR".to_string();
+                    });
+                }
             }
 
             let decision = engine_clone.evaluate(&event.event, session_tokens);
@@ -529,16 +1351,27 @@ async fn run_agent(
                         ..
                     } = &event.event
                     {
+                        let detail = serde_json::json!({
+                            "tool_name": tool_name,
+                            "policy": decision.policy_name,
+                            "reason": decision.reason,
+                        });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("DENY", &session_id.to_string(), detail.clone());
+                        }
+                        plugin_host_filter.dispatch_alert("DENY", &session_id.to_string(), &detail);
                         let blocked = TimestampedEvent::new(Event::ToolCallResult {
                             agent: agent.clone(),
                             tool_name: tool_name.clone(),
                             blocked: true,
                             session_id: *session_id,
                         });
+                        plugin_host_filter.dispatch_event(&blocked);
                         filtered_tx.send(blocked).await.ok();
                     }
                 }
                 _ => {
+                    plugin_host_filter.dispatch_event(&event);
                     filtered_tx.send(event).await.ok();
                 }
             }
@@ -547,6 +1380,8 @@ async fn run_agent(
 
     let mut app = App::new(session);
     app.store = store;
+    app.config_path = config_path;
+    app.decision_tx = Some(decision_tx);
     let mut tui_handle = tokio::spawn(async move { vigil_tui::run_tui(app, filtered_rx).await });
 
     // Wait for TUI exit (user pressed q) or agent exit — whichever comes first.
@@ -581,6 +1416,7 @@ async fn run_agent(
     proxy_handle.abort();
     watcher_handle.abort();
     filter_handle.abort();
+    resolver_handle.abort();
 
     if let Some(mut app) = final_app {
         app.session.finish();
@@ -608,6 +1444,40 @@ async fn run_agent(
         println!("Agent: {}", agent_name);
     }
 
+    if let Some(ref handle) = active_handle {
+        handle.remove();
+    }
+
+    Ok(())
+}
+
+fn run_ps() -> anyhow::Result<()> {
+    let sessions = vigil_core::list_active();
+    if sessions.is_empty() {
+        println!("No active vigil sessions.");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
+        "SESSION ID", "AGENT", "TOKENS", "COST", "$/MIN", "STATUS"
+    );
+    println!("{}", "-".repeat(85));
+    for s in &sessions {
+        let status = if s.needs_attention {
+            "! ATTENTION".to_string()
+        } else {
+            s.last_event.clone()
+        };
+        println!(
+            "{:<36}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
+            s.session_id,
+            truncate(&s.agent, 12),
+            s.session_tokens,
+            format!("${:.4}", s.session_cost_usd),
+            format!("${:.3}/m", s.burn_rate_per_min),
+            status,
+        );
+    }
     Ok(())
 }
 
@@ -761,6 +1631,120 @@ async fn vigil_init(output: PathBuf, force: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plugin helpers
+// ---------------------------------------------------------------------------
+
+fn plugins_dir() -> anyhow::Result<PathBuf> {
+    let home = if cfg!(target_os = "windows") {
+        std::env::var("USERPROFILE").ok()
+    } else {
+        std::env::var("HOME").ok()
+    }.ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(PathBuf::from(home).join(".vigil").join("plugins"))
+}
+
+fn load_plugins_from_dir(dir: &PathBuf, host: &mut PluginHost) {
+    if !dir.exists() { return; }
+    let dylib_exts = if cfg!(target_os = "windows") { vec!["dll"] }
+        else if cfg!(target_os = "macos") { vec!["dylib"] }
+        else { vec!["so"] };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if dylib_exts.contains(&ext) {
+                    match host.load_from_file(&path) {
+                        Ok(()) => println!("Auto-loaded plugin: {}", path.display()),
+                        Err(e) => eprintln!("Warning: {}", e),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_plugins_command(action: PluginCommands) -> anyhow::Result<()> {
+    match action {
+        PluginCommands::Dir => {
+            let dir = plugins_dir()?;
+            println!("{}", dir.display());
+            println!("Place .dll / .so / .dylib files here to auto-load on vigil run.");
+        }
+        PluginCommands::List => {
+            let dir = plugins_dir()?;
+            if !dir.exists() {
+                println!("Plugin directory {} does not exist yet.", dir.display());
+                println!("Create it and drop plugin libraries there to auto-load.");
+                return Ok(());
+            }
+            let dylib_exts = if cfg!(target_os = "windows") { vec!["dll"] }
+                else if cfg!(target_os = "macos") { vec!["dylib"] }
+                else { vec!["so"] };
+            let mut found = false;
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if dylib_exts.contains(&ext) {
+                            println!("  {}", path.display());
+                            found = true;
+                        }
+                    }
+                }
+            }
+            if !found {
+                println!("No plugins found in {}.", dir.display());
+                println!("See PLUGINS.md for how to author a plugin.");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve a session ID string — accepts full UUID or a human-readable name label.
+fn resolve_session_id(s: &str) -> anyhow::Result<uuid::Uuid> {
+    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+        return Ok(uuid);
+    }
+    // Try name lookup
+    match Session::find_by_name(s)? {
+        Some(summary) => Ok(summary.id),
+        None => anyhow::bail!("No session found with ID or name {:?}", s),
+    }
+}
+
+/// Delete all files for a session after confirmation.
+fn confirm_delete_session(id: &uuid::Uuid) -> anyhow::Result<()> {
+    println!("Delete session {}? This cannot be undone. [y/N] ", id);
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if line.trim().eq_ignore_ascii_case("y") {
+        let dir = vigil_core::store::sessions_dir()?;
+        for ext in &["ndjson", "meta.json"] {
+            let path = dir.join(format!("{}.{}", id, ext));
+            if path.exists() { std::fs::remove_file(&path)?; }
+        }
+        println!("Session {} deleted.", id);
+    } else {
+        println!("Cancelled.");
+    }
+    Ok(())
+}
+
+fn find_available_port(start: u16) -> anyhow::Result<u16> {
+    for port in start..=start.saturating_add(20) {
+        if std::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], port))).is_ok() {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("no available port found in range {}–{}", start, start.saturating_add(20))
 }
 
 fn format_duration(d: chrono::Duration) -> String {

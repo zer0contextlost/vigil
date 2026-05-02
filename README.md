@@ -2,100 +2,226 @@
 
 Runtime observability and policy enforcement for AI coding agents.
 
-vigil sees and gates every tool call, file write, and API request your AI coding agent makes — across Claude Code, Codex, Cursor, Aider, and Gemini CLI.
-
-## Demo
-
-![vigil demo](demo/demo.gif)
-
-*vigil catching a destructive shell command in real time. The BLOCKED event fires before the command executes.*
-
-> **Record your own:** see [demo/README.md](demo/README.md)
+vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, and records tamper-evident NDJSON session files. Works with Claude Code, Codex, Cursor, Aider, and Gemini CLI.
 
 ## Install
 
 ```bash
-# Via cargo
-cargo install --git https://github.com/vigil-dev/vigil vigil
-
-# Or clone and build
-git clone https://github.com/vigil-dev/vigil
+git clone https://github.com/zer0contextlost/vigil
 cd vigil
 cargo install --path crates/vigil-cli
 ```
 
-After install, `vigil` is available in your PATH.
-
-## Quick Start
+## Quick start
 
 ```bash
+# Run Claude Code under vigil
 vigil run -- claude
+
+# With a config file (budget limits, PII watchlist, policies)
+vigil run --config vigil.toml -- claude
+
+# List recorded sessions
+vigil sessions
+
+# Show all currently running vigil sessions
+vigil ps
+
+# Replay a session in the TUI
+vigil replay <session-uuid>
+
+# Fork a session: replay N events as context, then go live
+vigil fork <session-uuid> --prefix-events 10 -- claude
+
+# Verify a session's hash chain integrity
+vigil audit <session-uuid>
 ```
 
-This starts vigil with a proxy on port 8877, spawns your Claude Code agent, and shows a live dashboard of all its activity.
+## What vigil records
 
-## What vigil monitors
-
-| Event | What it catches |
-|-------|----------------|
-| `LLM_REQ/RES` | Every model call: provider, model, tokens, cost |
+| Event | What it captures |
+|-------|-----------------|
+| `REQ / RES` | Every model call: provider, model, tokens, cost (including cache tokens) |
 | `TOOL` | Tool calls before execution — inspectable and blockable |
-| `BLOCKED` | Tool calls stopped by policy |
-| `FSREAD/WRITE` | File reads and writes by the agent process |
-| `SPAWN` | Child processes spawned by the agent |
-| `MCP` | MCP server tool calls (via vigil-mcp-shim) |
+| `DENY / OK` | Policy decisions on tool calls |
+| `READ / WRIT` | File reads and writes inferred from tool call parameters |
+| `PROC` | Child processes spawned by the agent |
+| `MCP` | MCP server tool calls via vigil-mcp-shim |
+| `PII!` | PII detections (regex + custom watchlist) |
+| `BURN` | Burn-rate alarm: $/min exceeded threshold |
+| `LOOP` | Loop detection: same tool+input repeated N times |
+| `WAPPR` | Write approval required: agent wants to write a risky file |
+| `EXFL` | Credential exfiltration: secret from a file read appeared in outbound LLM request |
 
-## Policy Configuration
+## Configuration (vigil.toml)
 
-Create a `.agent-sentinel.yaml` file to define policies:
+```toml
+[proxy]
+port = 8877
+# Shell command substrings to block. Matched case-sensitively against
+# Bash tool inputs. Default list shown below — set to [] to disable all blocking.
+blocked_commands = [
+  "rm -rf",
+  "dd if=",
+  "mkfs",
+  ":(){ :|:& };:",
+]
+
+[session]
+store_raw = true
+
+[pii]
+watchlist_file = "~/.vigil/watchlist.txt"
+
+[budget]
+max_cost_usd = 5.00
+max_tokens = 500000
+allowed_hours = "09:00-18:00"
+
+[[policies]]
+name = "block-bash"
+action = "Deny"
+[policies.matcher]
+type = "ToolCall"
+tool_name_pattern = "Bash"
+```
+
+Pass with `vigil run --config vigil.toml -- <agent>`.
+
+## Policy enforcement
+
+Policies are evaluated in order; first match wins. Supported actions: `Deny`, `Confirm`, `LogOnly`.
 
 ```yaml
 policies:
-  - name: "Block file deletion"
-    action: DENY
+  - name: block-writes-outside-project
     matcher:
-      type: ToolCall
-      tool_name_pattern: "^(rm|delete).*"
+      type: FsWriteOutside
+      root: "."
+    action: Deny
 
-  - name: "Confirm before shell"
-    action: CONFIRM
+  - name: no-env-reads
     matcher:
-      type: ToolCall
-      tool_name_pattern: "^(bash|sh|cmd)$"
+      type: FsPath
+      path_pattern: ".env"
+    action: LogOnly
 
-  - name: "Log all LLM requests"
-    action: LOGONLY
-    matcher:
-      type: AnyLlmRequest
-
-  - name: "Token budget"
-    action: DENY
+  - name: token-budget
     matcher:
       type: TokenBudget
-      max_tokens: 100000
+      max_tokens: 1000000
+    action: LogOnly
 ```
 
-Pass it with:
+See `example-policy.yaml` for all matcher types. See `POLICY_ENGINE.md` for hardcoded safety floors and engine details.
+
+## Budget enforcement
+
+When any budget limit is hit, the agent session is stopped and the TUI drains remaining events:
+
+```toml
+[budget]
+max_cost_usd = 5.00          # stop if session cost exceeds $5
+max_tokens = 500000          # stop if total tokens exceed 500k
+allowed_hours = "09:00-18:00" # only allow runs during business hours
+```
+
+Overnight windows work too: `"22:00-06:00"`.
+
+## PII detection
+
+Two mechanisms run on every LLM request/response and tool call:
+
+Regex patterns: email, US phone, SSN, credit card, AWS key, GitHub PAT, JWT, public IPv4, URLs with PII params. Custom terms: case-insensitive substring match against a watchlist file. Both emit `PiiAlert` events with partial redaction before storage.
+
+## Pricing
+
+Model pricing is loaded from `~/.vigil/pricing.toml` if present, otherwise built-in defaults are used. To override:
+
+```toml
+[[model]]
+pattern = "claude-sonnet-4"
+input_per_million = 3.0
+output_per_million = 15.0
+```
+
+Patterns are matched as case-insensitive substrings. Put more-specific patterns first.
+
+## MCP shim
+
+To intercept MCP server tool calls, replace your MCP server command with `vigil-mcp-shim`:
 
 ```bash
-vigil run --policy .agent-sentinel.yaml -- claude
+vigil-mcp-shim --session-id <uuid> --ndjson ~/.vigil/sessions/<uuid>.ndjson <real-server> [args]
 ```
+
+All `tools/call` requests are PII-scanned and logged as `McpCall` events.
+
+## Audit
+
+`vigil audit <session-uuid>` verifies the integrity of a recorded session:
+
+```
+vigil audit: 3f2a1b4c-...
+Events:     42
+Hash chain: OK
+ULID order: OK
+Meta count: OK
+
+PASS
+```
+
+Exits with code 0 (PASS) or 1 (FAIL). Suitable for CI use.
+
+## Burn-rate alarms and loop detection
+
+```toml
+[budget]
+max_burn_rate_usd_per_min = 0.50   # alert when spending exceeds this rate
+loop_detect_threshold = 5          # alert when same tool+input repeats N times
+```
+
+A `BURN` event fires with a projected session total whenever the rolling $/min rate exceeds the limit. A `LOOP` event fires when the same tool+input hash is seen N times in a session.
+
+## Diff-gated write approval
+
+```toml
+[proxy]
+write_approval_threshold = "High"   # Low / Medium / High
+```
+
+When set, vigil buffers the SSE stream at any Write/Edit/MultiEdit/NotebookEdit tool call, scores the diff, and if risk meets the threshold shows a full-screen TUI overlay with before/after diff. Press `y` to approve or `n` to reject (agent receives HTTP 403). 5-minute timeout auto-rejects.
+
+Risk scoring: crown jewels paths (`.env`, `auth`, `migration`, `payment`, private keys) → High; >40% lines deleted → High; >10 lines deleted → Medium; file >500 lines → Medium.
+
+## Credential exfiltration detection
+
+vigil fingerprints secrets (API keys, tokens, `.env` values) from files the agent reads. If a fingerprint later appears in an outbound LLM request or shell command, an `EXFL` event fires with a redacted match.
+
+No credentials are stored — only SHA-256 hashes. Redacted matches show the first 4 characters followed by `***`.
+
+## Multi-session dashboard
+
+```bash
+vigil ps
+```
+
+Shows all currently running vigil sessions on this machine with per-session burn rate, token count, cost, and attention flags. Uses `~/.vigil/active/` lock files with PID verification to detect stale entries.
 
 ## Architecture
 
-vigil consists of five Rust crates:
+Six Rust crates:
 
-- **vigil-core** — Event types, policy engine, session model
-- **vigil-proxy** — HTTPS MITM proxy for observing LLM API calls
-- **vigil-mcp** — MCP protocol shim for intercepting tool calls
-- **vigil-tui** — ratatui-based dashboard showing live activity
-- **vigil-cli** — Command-line interface and session orchestrator
+| Crate | Role |
+|-------|------|
+| vigil-cli | Binary, CLI args, agent spawning, TUI orchestration, budget enforcement |
+| vigil-proxy | HTTP reverse proxy, SSE parser (Anthropic + OpenAI formats), event emission |
+| vigil-core | Event types, Envelope/hash chain, SessionStore, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner |
+| vigil-tui | ratatui dashboard, App state, replay |
+| vigil-watch | Process tree monitor (sysinfo-based) |
+| vigil-mcp | vigil-mcp-shim binary: intercepts stdio JSON-RPC MCP servers |
 
-The proxy runs on a configurable port and intercepts HTTPS traffic to known LLM providers. The MCP shim spawns the real MCP server as a child process and pipes JSON-RPC messages through, logging all tool invocations. The TUI shows a scrollable event log with cost tracking and policy decision markers.
-
-## Status
-
-Early development. v0.1 focus: HTTPS proxy + process supervisor + TUI dashboard. No kernel/eBPF needed.
+Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in the agent's environment. The proxy forwards to the real API over TLS.
 
 ## License
 

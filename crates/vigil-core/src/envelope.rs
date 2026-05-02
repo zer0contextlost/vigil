@@ -75,6 +75,14 @@ fn extract_session_id(event: &Event) -> Uuid {
         | Event::FsWrite { session_id, .. }
         | Event::ProcessSpawn { session_id, .. }
         | Event::McpCall { session_id, .. }
-        | Event::PiiAlert { session_id, .. } => *session_id,
+        | Event::PiiAlert { session_id, .. }
+        | Event::BurnRateAlert { session_id, .. }
+        | Event::LoopAlert { session_id, .. }
+        | Event::WriteApprovalRequired { session_id, .. }
+        | Event::WriteApprovalDecision { session_id, .. }
+        | Event::ExfilAlert { session_id, .. }
+        | Event::ToolTimeout { session_id, .. }
+        | Event::CostAlert { session_id, .. }
+        | Event::SessionDurationAlert { session_id, .. } => *session_id,
     }
 }

@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use serde_json;
@@ -27,11 +27,25 @@ pub struct EventCounts {
     pub fs_writes: usize,
     pub spawns: usize,
     pub mcp: usize,
+    pub burn_alerts: usize,
+    pub loop_alerts: usize,
+    pub exfil_alerts: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingApprovalInfo {
+    pub approval_id: uuid::Uuid,
+    pub path: String,
+    pub risk_level: String,
+    pub reasons: Vec<String>,
+    pub before: String,
+    pub after: String,
 }
 
 pub struct App {
     pub session: Session,
     pub store: Option<vigil_core::store::SessionStore>,
+    pub config_path: Option<String>,
     pub event_log: Vec<Line<'static>>,
     pub raw_events: Vec<TimestampedEvent>,
     pub selected: usize,
@@ -44,6 +58,12 @@ pub struct App {
     pub detail_focused: bool,
     pub detail_scroll: usize,
     pub counts: EventCounts,
+    /// Most recent burn rate ($/min) from the last BurnRateAlert, if any.
+    pub last_burn_rate: Option<f64>,
+    /// Channel to send approval decisions back to the resolver task.
+    pub decision_tx: Option<tokio::sync::mpsc::Sender<(uuid::Uuid, bool)>>,
+    /// Pending write approval waiting for user input.
+    pub pending_approval: Option<PendingApprovalInfo>,
 }
 
 impl App {
@@ -51,6 +71,7 @@ impl App {
         Self {
             session,
             store: None,
+            config_path: None,
             event_log: Vec::new(),
             raw_events: Vec::new(),
             selected: 0,
@@ -63,6 +84,9 @@ impl App {
             detail_focused: false,
             detail_scroll: 0,
             counts: EventCounts::default(),
+            last_burn_rate: None,
+            decision_tx: None,
+            pending_approval: None,
         }
     }
 
@@ -102,6 +126,34 @@ impl App {
             vigil_core::Event::PiiAlert { .. } => {
                 self.session.pii_detections += 1;
             }
+            vigil_core::Event::BurnRateAlert { rate_per_min_usd, .. } => {
+                self.counts.burn_alerts += 1;
+                self.last_burn_rate = Some(*rate_per_min_usd);
+            }
+            vigil_core::Event::LoopAlert { .. } => {
+                self.counts.loop_alerts += 1;
+            }
+            vigil_core::Event::WriteApprovalRequired { approval_id, path, risk_level, reasons, before, after, .. } => {
+                self.pending_approval = Some(PendingApprovalInfo {
+                    approval_id: *approval_id,
+                    path: path.clone(),
+                    risk_level: risk_level.clone(),
+                    reasons: reasons.clone(),
+                    before: before.clone(),
+                    after: after.clone(),
+                });
+            }
+            vigil_core::Event::WriteApprovalDecision { approval_id, .. } => {
+                if self.pending_approval.as_ref().map(|p| p.approval_id == *approval_id).unwrap_or(false) {
+                    self.pending_approval = None;
+                }
+            }
+            vigil_core::Event::ExfilAlert { .. } => {
+                self.counts.exfil_alerts += 1;
+            }
+            vigil_core::Event::ToolTimeout { .. } => {}
+            vigil_core::Event::CostAlert { .. } => {}
+            vigil_core::Event::SessionDurationAlert { .. } => {}
         }
         if let Some(ref mut store) = self.store {
             let _ = store.append(event);
@@ -211,6 +263,26 @@ impl App {
                     self.detail_scroll = 0;
                 }
             }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(ref info) = self.pending_approval {
+                    let id = info.approval_id;
+                    if let Some(ref tx) = self.decision_tx {
+                        let tx = tx.clone();
+                        tokio::spawn(async move { let _ = tx.send((id, true)).await; });
+                    }
+                    self.pending_approval = None;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(ref info) = self.pending_approval {
+                    let id = info.approval_id;
+                    if let Some(ref tx) = self.decision_tx {
+                        let tx = tx.clone();
+                        tokio::spawn(async move { let _ = tx.send((id, false)).await; });
+                    }
+                    self.pending_approval = None;
+                }
+            }
             _ => {}
         }
     }
@@ -242,12 +314,35 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("MCP ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)),
         vigil_core::Event::PiiAlert { .. } =>
             ("PII!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::BurnRateAlert { .. } =>
+            ("BURN", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::LoopAlert { .. } =>
+            ("LOOP", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::WriteApprovalRequired { .. } =>
+            ("WAPPR", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::WriteApprovalDecision { .. } =>
+            ("WDECID", Style::default().fg(Color::Green)),
+        vigil_core::Event::ExfilAlert { .. } =>
+            ("EXFL", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::ToolTimeout { .. } =>
+            ("TOUT", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::CostAlert { .. } =>
+            ("COST", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::SessionDurationAlert { .. } =>
+            ("DURA", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
     let is_alert = matches!(
         &event.event,
-        vigil_core::Event::ToolCallResult { blocked: true, .. } | vigil_core::Event::PiiAlert { .. }
+        vigil_core::Event::ToolCallResult { blocked: true, .. }
+        | vigil_core::Event::PiiAlert { .. }
+        | vigil_core::Event::BurnRateAlert { .. }
+        | vigil_core::Event::LoopAlert { .. }
+        | vigil_core::Event::ExfilAlert { .. }
+        | vigil_core::Event::ToolTimeout { .. }
+        | vigil_core::Event::CostAlert { .. }
+        | vigil_core::Event::SessionDurationAlert { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -271,9 +366,14 @@ fn event_summary(event: &TimestampedEvent) -> String {
                 _ => format!("{}/{}", provider, model_short),
             }
         }
-        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, .. } => {
+        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, cache_read_input_tokens, cache_creation_input_tokens, .. } => {
             let model_short = model.split('-').next().unwrap_or(&model);
-            let base = format!("{}/{} {}in {}out ${:.4}", provider, model_short, input_tokens, output_tokens, cost_usd);
+            let cache_str = if *cache_read_input_tokens > 0 || *cache_creation_input_tokens > 0 {
+                format!(" c_r:{} c_w:{}", cache_read_input_tokens, cache_creation_input_tokens)
+            } else {
+                String::new()
+            };
+            let base = format!("{}/{} {}in {}out{} ${:.4}", provider, model_short, input_tokens, output_tokens, cache_str, cost_usd);
             match response_text.as_deref().map(|s| truncate(s, 30)) {
                 Some(p) if !p.is_empty() => format!("{} \"{}\"", base, p),
                 _ => base,
@@ -290,6 +390,22 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("{}/{}", server, method),
         vigil_core::Event::PiiAlert { source, kinds, .. } =>
             format!("in {} -- {}", source, kinds.join(", ")),
+        vigil_core::Event::BurnRateAlert { rate_per_min_usd, projected_total_usd, .. } =>
+            format!("${:.3}/min projected ${:.2}", rate_per_min_usd, projected_total_usd),
+        vigil_core::Event::LoopAlert { tool_name, repeat_count, .. } =>
+            format!("{} repeated {}x", tool_name, repeat_count),
+        vigil_core::Event::WriteApprovalRequired { path, risk_level, .. } =>
+            format!("write approval required: {} [{}]", truncate(path, 40), risk_level),
+        vigil_core::Event::WriteApprovalDecision { approved, .. } =>
+            format!("write {}", if *approved { "approved" } else { "rejected" }),
+        vigil_core::Event::ExfilAlert { source, matches, .. } =>
+            format!("{}: {}", source, matches.join(", ")),
+        vigil_core::Event::ToolTimeout { tool_name, elapsed_secs, .. } =>
+            format!("{} running {}s with no response", tool_name, elapsed_secs),
+        vigil_core::Event::CostAlert { threshold_usd, session_cost_usd, .. } =>
+            format!("cost ${:.4} crossed alert threshold ${:.4}", session_cost_usd, threshold_usd),
+        vigil_core::Event::SessionDurationAlert { elapsed_mins, .. } =>
+            format!("session running {}min", elapsed_mins),
     }
 }
 
@@ -321,9 +437,14 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
                 for l in msg.lines() { out.push(body_line(l)); }
             }
         }
-        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, .. } => {
+        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, cache_read_input_tokens, cache_creation_input_tokens, .. } => {
+            let cache_detail = if *cache_read_input_tokens > 0 || *cache_creation_input_tokens > 0 {
+                format!("  cache_r:{} cache_w:{}", cache_read_input_tokens, cache_creation_input_tokens)
+            } else {
+                String::new()
+            };
             out.push(header_line(
-                format!("RESPONSE  {}/{}  {}in {}out  ${:.4}", provider, model, input_tokens, output_tokens, cost_usd),
+                format!("RESPONSE  {}/{}  {}in {}out{}  ${:.4}", provider, model, input_tokens, output_tokens, cache_detail, cost_usd),
                 Color::Cyan,
             ));
             match response_text {
@@ -373,6 +494,55 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
         vigil_core::Event::PiiAlert { source, kinds, .. } => {
             out.push(header_line(format!("PII ALERT  source: {}", source), Color::Red));
             out.push(body_line(&format!("Detected: {}", kinds.join(", "))));
+        }
+        vigil_core::Event::BurnRateAlert { rate_per_min_usd, projected_total_usd, session_cost_usd, .. } => {
+            out.push(header_line("BURN RATE ALERT".to_string(), Color::Red));
+            out.push(body_line(&format!("Current rate:     ${:.4}/min", rate_per_min_usd)));
+            out.push(body_line(&format!("Session cost so far: ${:.4}", session_cost_usd)));
+            out.push(body_line(&format!("Projected total:  ${:.4}", projected_total_usd)));
+        }
+        vigil_core::Event::LoopAlert { tool_name, repeat_count, .. } => {
+            out.push(header_line("LOOP DETECTED".to_string(), Color::Red));
+            out.push(body_line(&format!("Tool:         {}", tool_name)));
+            out.push(body_line(&format!("Repeat count: {}", repeat_count)));
+            out.push(body_line("Same tool+input combination repeated too many times."));
+        }
+        vigil_core::Event::WriteApprovalRequired { path, risk_level, reasons, .. } => {
+            out.push(header_line(format!("WRITE APPROVAL REQUIRED  [{}]", risk_level), Color::Yellow));
+            out.push(body_line(&format!("Path: {}", path)));
+            for r in reasons {
+                out.push(body_line(&format!("  - {}", r)));
+            }
+        }
+        vigil_core::Event::WriteApprovalDecision { approval_id, approved, .. } => {
+            let (label, color) = if *approved { ("APPROVED", Color::Green) } else { ("REJECTED", Color::Red) };
+            out.push(header_line(format!("WRITE DECISION  [{}]", label), color));
+            out.push(body_line(&format!("approval_id: {}", approval_id)));
+        }
+        vigil_core::Event::ExfilAlert { source, matches, .. } => {
+            out.push(header_line(format!("EXFIL ALERT  source: {}", source), Color::Red));
+            out.push(body_line("Credential fingerprint(s) from a file read detected in outbound content:"));
+            for m in matches {
+                out.push(body_line(&format!("  [!] {}", m)));
+            }
+        }
+        vigil_core::Event::ToolTimeout { tool_name, elapsed_secs, .. } => {
+            out.push(header_line("TOOL TIMEOUT".to_string(), Color::Yellow));
+            out.push(body_line(&format!("tool:    {}", tool_name)));
+            out.push(body_line(&format!("elapsed: {}s ({:.1}min)", elapsed_secs, *elapsed_secs as f64 / 60.0)));
+            out.push(body_line("The agent called this tool but no follow-up LLM request arrived in time."));
+            out.push(body_line("The tool may be hung. Consider interrupting the session."));
+        }
+        vigil_core::Event::CostAlert { threshold_usd, session_cost_usd, .. } => {
+            out.push(header_line("COST ALERT".to_string(), Color::Yellow));
+            out.push(body_line(&format!("threshold:    ${:.4}", threshold_usd)));
+            out.push(body_line(&format!("session cost: ${:.4}", session_cost_usd)));
+            out.push(body_line("Soft alert — session continues. Set budget.max_cost_usd to stop the session."));
+        }
+        vigil_core::Event::SessionDurationAlert { elapsed_mins, .. } => {
+            out.push(header_line("SESSION DURATION ALERT".to_string(), Color::Yellow));
+            out.push(body_line(&format!("elapsed: {}min ({:.1}h)", elapsed_mins, *elapsed_mins as f64 / 60.0)));
+            out.push(body_line("Session has exceeded budget.max_session_duration_mins."));
         }
     }
 
@@ -438,6 +608,35 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
         pii.to_string(),
         if pii > 0 { Color::Red } else { Color::DarkGray },
     ));
+
+    if let Some(rate) = app.last_burn_rate {
+        out.push(stat_row(
+            "rate",
+            format!("${:.3}/min", rate),
+            Color::Red,
+        ));
+    }
+    if c.burn_alerts > 0 {
+        out.push(stat_row(
+            "burn alerts",
+            c.burn_alerts.to_string(),
+            Color::Red,
+        ));
+    }
+    if c.loop_alerts > 0 {
+        out.push(stat_row(
+            "loop alerts",
+            c.loop_alerts.to_string(),
+            Color::Red,
+        ));
+    }
+    if c.exfil_alerts > 0 {
+        out.push(stat_row(
+            "exfil alerts",
+            c.exfil_alerts.to_string(),
+            Color::Red,
+        ));
+    }
 
     out
 }
@@ -526,6 +725,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("")
     };
 
+    let cfg_span = match &app.config_path {
+        Some(p) => Span::styled(format!("  cfg:{}", p), Style::default().fg(Color::DarkGray)),
+        None => Span::raw(""),
+    };
+
     let header = Paragraph::new(Line::from(vec![
         status,
         Span::raw("  "),
@@ -535,6 +739,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ),
         position,
+        cfg_span,
         quit_hint,
     ]))
     .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
@@ -591,6 +796,60 @@ fn draw_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_detail_pane(frame: &mut Frame, app: &App, area: Rect) {
+    // If there is a pending approval, render the approval overlay instead.
+    if let Some(ref info) = app.pending_approval {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "  WRITE APPROVAL REQUIRED",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  -----------------------",
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  Path:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.path.clone(), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Risk:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.risk_level.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Reasons: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.reasons.join(", "), Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  --- BEFORE ---", Style::default().fg(Color::DarkGray))));
+        for l in info.before.lines().take(20) {
+            lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Gray))));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  --- AFTER ---", Style::default().fg(Color::DarkGray))));
+        for l in info.after.lines().take(20) {
+            lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Green))));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  [y] Approve   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("[n] Reject", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let approval_pane = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(
+                        "WRITE APPROVAL REQUIRED  y=approve  n=reject",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ))
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(approval_pane, area);
+        return;
+    }
+
     let content = if app.raw_events.is_empty() {
         vec![Line::from(Span::styled(
             "  Select an event with up/down to inspect it here",
@@ -626,7 +885,9 @@ fn draw_detail_pane(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.detail_focused {
+    let text = if app.pending_approval.is_some() {
+        "y=approve write  n=reject write"
+    } else if app.detail_focused {
         "TAB=back  up/dn PgUp/PgDn Home=scroll detail  Esc=list"
     } else {
         "q=quit  up/dn=select  PgUp/PgDn  End=tail  TAB=detail"
@@ -832,4 +1093,195 @@ async fn run_app<B: Backend>(
     }
 
     Ok(())
+}
+
+// ─── Session browser ─────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum BrowseAction {
+    Replay(uuid::Uuid),
+    Delete(uuid::Uuid),
+    Quit,
+}
+
+struct BrowserState {
+    sessions: Vec<vigil_core::session::SessionSummary>,
+    list_state: ListState,
+}
+
+impl BrowserState {
+    fn new(sessions: Vec<vigil_core::session::SessionSummary>) -> Self {
+        let mut list_state = ListState::default();
+        if !sessions.is_empty() {
+            list_state.select(Some(0));
+        }
+        Self { sessions, list_state }
+    }
+
+    fn selected(&self) -> Option<&vigil_core::session::SessionSummary> {
+        self.list_state.selected().and_then(|i| self.sessions.get(i))
+    }
+
+    fn move_up(&mut self) {
+        if self.sessions.is_empty() { return; }
+        let i = self.list_state.selected().unwrap_or(0);
+        self.list_state.select(Some(if i == 0 { self.sessions.len() - 1 } else { i - 1 }));
+    }
+
+    fn move_down(&mut self) {
+        if self.sessions.is_empty() { return; }
+        let i = self.list_state.selected().unwrap_or(0);
+        self.list_state.select(Some((i + 1) % self.sessions.len()));
+    }
+}
+
+pub async fn run_session_browser(
+    sessions: Vec<vigil_core::session::SessionSummary>,
+) -> Result<Option<BrowseAction>> {
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut state = BrowserState::new(sessions);
+    let mut action: Option<BrowseAction> = None;
+
+    loop {
+        terminal.draw(|f| draw_browser(f, &mut state))?;
+
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press { continue; }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        action = Some(BrowseAction::Quit);
+                        break;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => state.move_up(),
+                    KeyCode::Down | KeyCode::Char('j') => state.move_down(),
+                    KeyCode::Enter | KeyCode::Char('r') => {
+                        if let Some(s) = state.selected() {
+                            action = Some(BrowseAction::Replay(s.id));
+                            break;
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if let Some(s) = state.selected() {
+                            action = Some(BrowseAction::Delete(s.id));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(action)
+}
+
+fn draw_browser(frame: &mut Frame, state: &mut BrowserState) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(12), Constraint::Length(1)])
+        .split(area);
+
+    // Session list
+    let items: Vec<ListItem> = state.sessions.iter().map(|s| {
+        let label = s.name.clone().unwrap_or_else(|| s.id.to_string()[..8].to_string());
+        let tokens = s.total_input_tokens + s.total_output_tokens;
+        let _duration = s.ended_at
+            .map(|e| format_dur(e - s.started_at))
+            .unwrap_or_else(|| "running".to_string());
+        let line = format!(
+            " {:<20}  {:<10}  {}  ${:.4}  {:>5}tok  {:>4}ev",
+            truncate_str(&label, 20),
+            truncate_str(&s.agent, 10),
+            s.started_at.format("%Y-%m-%d %H:%M"),
+            s.total_cost_usd,
+            tokens,
+            s.event_count,
+        );
+        ListItem::new(Line::from(Span::raw(line)))
+    }).collect();
+
+    let header = format!(
+        " {:<20}  {:<10}  {:<16}  {:>7}  {:>8}  {:>6}",
+        "NAME / ID", "AGENT", "STARTED", "COST", "TOKENS", "EVENTS"
+    );
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    format!(" vigil sessions — {} total  |  header: {} ", state.sessions.len(), header),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, chunks[0], &mut state.list_state);
+
+    // Detail panel
+    let detail_text = if let Some(s) = state.selected() {
+        let name_line = s.name.as_deref().unwrap_or("(unlabelled)");
+        let duration = s.ended_at
+            .map(|e| format_dur(e - s.started_at))
+            .unwrap_or_else(|| "still running".to_string());
+        format!(
+            "Name:       {}\nID:         {}\nAgent:      {}\nStarted:    {}\nDuration:   {}\nCost:       ${:.6}\nTokens:     {} in / {} out\nEvents:     {}\nViolations: {}",
+            name_line,
+            s.id,
+            s.agent,
+            s.started_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            duration,
+            s.total_cost_usd,
+            s.total_input_tokens,
+            s.total_output_tokens,
+            s.event_count,
+            s.policy_violations,
+        )
+    } else {
+        "No session selected.".to_string()
+    };
+
+    let detail = Paragraph::new(detail_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" Session detail ", Style::default().fg(Color::Yellow))),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail, chunks[1]);
+
+    // Help bar
+    let help = Paragraph::new(Span::styled(
+        "  ↑/k ↓/j Navigate   Enter/r Replay   d Delete   q Quit",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(help, chunks[2]);
+}
+
+fn format_dur(d: chrono::Duration) -> String {
+    let s = d.num_seconds().abs();
+    if s >= 3600 { format!("{}h{:02}m", s / 3600, (s % 3600) / 60) }
+    else if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) }
+    else { format!("{}s", s) }
+}
+
+fn truncate_str(s: &str, n: usize) -> String {
+    if s.len() <= n { s.to_string() }
+    else { format!("{}…", &s[..n.saturating_sub(1)]) }
 }
