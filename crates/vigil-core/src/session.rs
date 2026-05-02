@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-use crate::event::TimestampedEvent;
+use crate::envelope::TimestampedEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -104,8 +104,10 @@ impl Session {
         for entry in std::fs::read_dir(&sessions_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json")
-                && !path.file_name().unwrap().to_str().unwrap().ends_with(".summary.json")
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if path.extension().and_then(|s| s.to_str()) == Some("json")
+                && !name.ends_with(".meta.json")
+                && !name.ends_with(".summary.json")
             {
                 if let Ok(json) = std::fs::read_to_string(&path) {
                     if let Ok(session) = serde_json::from_str::<Session>(&json) {

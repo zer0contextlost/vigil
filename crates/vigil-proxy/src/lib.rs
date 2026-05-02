@@ -8,8 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use vigil_core::event::{Event, TimestampedEvent};
-use vigil_core::{scan_pii, scan_watchlist};
+use vigil_core::{scan_pii, scan_watchlist, Event, TimestampedEvent};
 
 const MAX_HEADER_SIZE: usize = 65536;
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
@@ -1103,7 +1102,7 @@ mod integration {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{sleep, Duration};
-    use vigil_core::event::Event;
+    use vigil_core::Event;
 
     // Starts a mock HTTP server. Every accepted connection is handled in a spawned
     // task: the raw request bytes are captured, then `response` is written back.

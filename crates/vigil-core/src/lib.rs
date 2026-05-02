@@ -1,9 +1,17 @@
+pub mod config;
+pub mod envelope;
 pub mod event;
 pub mod pii;
 pub mod policy;
+pub mod scanner;
 pub mod session;
+pub mod store;
 
-pub use event::{Event, TimestampedEvent};
+pub use config::VigilConfig;
+pub use envelope::{Envelope, TimestampedEvent, SCHEMA_VERSION};
+pub use event::Event;
 pub use pii::{scan as scan_pii, scan_watchlist, PiiMatch};
-pub use policy::{PolicyConfig, Policy, PolicyAction, PolicyMatcher, PolicyEngine, PolicyDecision};
+pub use policy::{Policy, PolicyAction, PolicyConfig, PolicyDecision, PolicyEngine, PolicyMatcher};
+pub use scanner::{RegexScanner, Scanner, ScannerChain, WatchlistScanner};
 pub use session::{Session, SessionSummary};
+pub use store::{sessions_dir, SessionMeta, SessionStore};

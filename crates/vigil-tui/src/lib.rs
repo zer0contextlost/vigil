@@ -13,7 +13,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde_json;
-use vigil_core::event::TimestampedEvent;
+use vigil_core::TimestampedEvent;
 use vigil_core::session::{Session, SessionSummary};
 
 #[derive(Default)]
@@ -31,6 +31,7 @@ pub struct EventCounts {
 
 pub struct App {
     pub session: Session,
+    pub store: Option<vigil_core::store::SessionStore>,
     pub event_log: Vec<Line<'static>>,
     pub raw_events: Vec<TimestampedEvent>,
     pub selected: usize,
@@ -49,6 +50,7 @@ impl App {
     pub fn new(session: Session) -> Self {
         Self {
             session,
+            store: None,
             event_log: Vec::new(),
             raw_events: Vec::new(),
             selected: 0,
@@ -100,6 +102,9 @@ impl App {
             vigil_core::Event::PiiAlert { .. } => {
                 self.session.pii_detections += 1;
             }
+        }
+        if let Some(ref mut store) = self.store {
+            let _ = store.append(event);
         }
         self.session.record(event.clone());
         self.event_log.push(format_event_line(event));
@@ -260,14 +265,14 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
 fn event_summary(event: &TimestampedEvent) -> String {
     match &event.event {
         vigil_core::Event::LlmRequest { provider, model, last_user_message, .. } => {
-            let model_short = model.split('-').next().unwrap_or(model);
+            let model_short = model.split('-').next().unwrap_or(&model);
             match last_user_message.as_deref().map(|s| truncate(s, 45)) {
                 Some(p) if !p.is_empty() => format!("{}/{} \"{}\"", provider, model_short, p),
                 _ => format!("{}/{}", provider, model_short),
             }
         }
         vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, .. } => {
-            let model_short = model.split('-').next().unwrap_or(model);
+            let model_short = model.split('-').next().unwrap_or(&model);
             let base = format!("{}/{} {}in {}out ${:.4}", provider, model_short, input_tokens, output_tokens, cost_usd);
             match response_text.as_deref().map(|s| truncate(s, 30)) {
                 Some(p) if !p.is_empty() => format!("{} \"{}\"", base, p),
@@ -277,9 +282,9 @@ fn event_summary(event: &TimestampedEvent) -> String {
         vigil_core::Event::ToolCall { tool_name, .. } => tool_name.clone(),
         vigil_core::Event::ToolCallResult { tool_name, blocked, .. } =>
             format!("{} [{}]", tool_name, if *blocked { "DENIED" } else { "ok" }),
-        vigil_core::Event::FsRead { path, .. } => truncate(path, 60),
+        vigil_core::Event::FsRead { path, .. } => truncate(&path, 60),
         vigil_core::Event::FsWrite { path, bytes, .. } =>
-            format!("{} ({}B)", truncate(path, 50), bytes),
+            format!("{} ({}B)", truncate(&path, 50), bytes),
         vigil_core::Event::ProcessSpawn { command, .. } => command.clone(),
         vigil_core::Event::McpCall { server, method, .. } =>
             format!("{}/{}", server, method),
@@ -337,7 +342,7 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
         vigil_core::Event::ToolCall { agent, tool_name, input, .. } => {
             out.push(header_line(format!("TOOL CALL  {}  ->  {}", agent, tool_name), Color::Yellow));
             out.push(sep_line("input"));
-            let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
+            let pretty = serde_json::to_string_pretty(&input).unwrap_or_default();
             for l in pretty.lines() { out.push(body_line(l)); }
         }
         vigil_core::Event::ToolCallResult { agent, tool_name, blocked, .. } => {
@@ -349,7 +354,7 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
         }
         vigil_core::Event::FsRead { path, .. } => {
             out.push(header_line("FS READ".to_string(), Color::Gray));
-            out.push(body_line(path));
+            out.push(body_line(&path));
         }
         vigil_core::Event::FsWrite { path, bytes, .. } => {
             out.push(header_line("FS WRITE".to_string(), Color::Magenta));
@@ -362,7 +367,7 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
         vigil_core::Event::McpCall { server, method, params, .. } => {
             out.push(header_line(format!("MCP  {}/{}", server, method), Color::Cyan));
             out.push(sep_line("params"));
-            let pretty = serde_json::to_string_pretty(params).unwrap_or_default();
+            let pretty = serde_json::to_string_pretty(&params).unwrap_or_default();
             for l in pretty.lines() { out.push(body_line(l)); }
         }
         vigil_core::Event::PiiAlert { source, kinds, .. } => {
