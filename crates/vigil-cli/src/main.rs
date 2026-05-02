@@ -62,6 +62,12 @@ enum Commands {
         /// Session ID to replay
         session_id: String,
     },
+
+    /// Verify hash chain integrity of a recorded session
+    Audit {
+        /// Session ID (UUID) to audit
+        session_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +319,9 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Some(Commands::Audit { session_id }) => {
+            run_audit(&session_id)?;
+        }
         Some(Commands::Replay { session_id }) => {
             let uuid = uuid::Uuid::parse_str(&session_id)
                 .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
@@ -357,6 +366,92 @@ async fn main() -> Result<()> {
                 vigil_tui::run_tui(app, rx).await?;
             }
         }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil audit
+// ---------------------------------------------------------------------------
+
+fn run_audit(session_id: &str) -> Result<()> {
+    let uuid = uuid::Uuid::parse_str(session_id)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    let actual_count = envelopes.len();
+
+    println!("vigil audit: {}", session_id);
+    println!("Events:     {}", actual_count);
+
+    // --- Hash chain check ---
+    let mut chain_ok = true;
+    let mut chain_msg = String::from("OK");
+    let mut expected_prev = String::new();
+
+    for (i, env) in envelopes.iter().enumerate() {
+        if env.prev_hash != expected_prev {
+            chain_ok = false;
+            chain_msg = format!(
+                "BROKEN at event {}, expected {} got {}",
+                i,
+                expected_prev,
+                env.prev_hash
+            );
+            break;
+        }
+        expected_prev = env.compute_hash();
+    }
+    println!("Hash chain: {}", chain_msg);
+
+    // --- ULID monotonicity check ---
+    let mut ulid_ok = true;
+    let mut ulid_msg = String::from("OK");
+
+    if actual_count > 1 {
+        for i in 1..envelopes.len() {
+            let prev_str = envelopes[i - 1].event_id.to_string();
+            let curr_str = envelopes[i].event_id.to_string();
+            if curr_str < prev_str {
+                ulid_ok = false;
+                ulid_msg = format!("OUT OF ORDER at event {}", i);
+                break;
+            }
+        }
+    }
+    println!("ULID order: {}", ulid_msg);
+
+    // --- Meta count check ---
+    let (meta_ok, meta_msg) = match vigil_core::store::SessionStore::load_meta(&uuid) {
+        Ok(meta) => {
+            if meta.event_count == actual_count as u64 {
+                (true, String::from("OK"))
+            } else {
+                (
+                    false,
+                    format!(
+                        "MISMATCH meta={} actual={}",
+                        meta.event_count, actual_count
+                    ),
+                )
+            }
+        }
+        Err(e) => (false, format!("MISSING ({})", e)),
+    };
+    println!("Meta count: {}", meta_msg);
+    println!();
+
+    let issues = [!chain_ok, !ulid_ok, !meta_ok]
+        .iter()
+        .filter(|&&f| f)
+        .count();
+
+    if issues == 0 {
+        println!("PASS");
+    } else {
+        println!("FAIL -- {} issue(s) found", issues);
+        std::process::exit(1);
     }
 
     Ok(())
