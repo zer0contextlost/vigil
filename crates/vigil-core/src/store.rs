@@ -204,3 +204,117 @@ pub fn sessions_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Event;
+    use uuid::Uuid;
+
+    fn make_store() -> SessionStore {
+        let id = Uuid::new_v4();
+        SessionStore::create(id, "test-agent").expect("create store")
+    }
+
+    fn make_event(sid: Uuid) -> crate::envelope::Envelope {
+        crate::envelope::Envelope::new(Event::ProcessSpawn {
+            command: "test".into(),
+            args: vec![],
+            session_id: sid,
+        })
+    }
+
+    #[test]
+    fn test_signing_roundtrip() {
+        let mut store = make_store();
+        let env = make_event(store.session_id);
+        store.append(&env).unwrap();
+        store.finish().unwrap();
+
+        let meta = SessionStore::load_meta(&store.session_id).unwrap();
+        assert!(meta.chain_signature.is_some(), "signature should be written on finish");
+        assert!(meta.verifying_key.is_some());
+        assert!(!meta.chain_root_hash.is_empty());
+        // Verify must pass
+        SessionStore::verify_signature(&meta, &meta.chain_root_hash.clone()).unwrap();
+    }
+
+    #[test]
+    fn test_verify_signature_detects_tamper() {
+        let mut store = make_store();
+        let env = make_event(store.session_id);
+        store.append(&env).unwrap();
+        store.finish().unwrap();
+
+        let mut meta = SessionStore::load_meta(&store.session_id).unwrap();
+        // Corrupt the chain root hash — verify must fail
+        meta.chain_root_hash = "deadbeef".repeat(8);
+        let result = SessionStore::verify_signature(&meta, &meta.chain_root_hash.clone());
+        assert!(result.is_err(), "tampered hash should fail verification");
+    }
+
+    #[test]
+    fn test_verify_signature_skip_for_no_sig() {
+        let meta = SessionMeta {
+            session_id: Uuid::new_v4(),
+            agent: "x".into(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            total_cost_usd: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            event_count: 0,
+            pii_detections: 0,
+            policy_violations: 0,
+            chain_root_hash: String::new(),
+            chain_signature: None,
+            verifying_key: None,
+        };
+        // No signature stored → verify must succeed (backward compat)
+        SessionStore::verify_signature(&meta, "anyhash").unwrap();
+    }
+
+    #[test]
+    fn test_drop_flushes_meta_on_unclean_exit() {
+        let mut store = make_store();
+        let sid = store.session_id;
+        let env = make_event(sid);
+        store.append(&env).unwrap();
+        // Drop without calling finish() — simulates kill/panic
+        drop(store);
+
+        let meta = SessionStore::load_meta(&sid).unwrap();
+        assert_eq!(meta.event_count, 1, "meta should record the appended event");
+        assert!(meta.ended_at.is_none(), "ended_at should be None for unclean exit");
+    }
+
+    #[test]
+    fn test_append_ulid_monotonic() {
+        let mut store = make_store();
+        let sid = store.session_id;
+        for _ in 0..5 {
+            store.append(&make_event(sid)).unwrap();
+        }
+        let envelopes = SessionStore::load_envelopes(&sid).unwrap();
+        for i in 1..envelopes.len() {
+            let prev = envelopes[i - 1].event_id.to_string();
+            let curr = envelopes[i].event_id.to_string();
+            assert!(curr > prev, "ULIDs must be strictly increasing");
+        }
+    }
+
+    #[test]
+    fn test_hash_chain_integrity() {
+        let mut store = make_store();
+        let sid = store.session_id;
+        for _ in 0..3 {
+            store.append(&make_event(sid)).unwrap();
+        }
+        let envelopes = SessionStore::load_envelopes(&sid).unwrap();
+        let mut expected_prev = String::new();
+        for env in &envelopes {
+            assert_eq!(env.prev_hash, expected_prev, "hash chain broken");
+            expected_prev = env.compute_hash();
+        }
+    }
+}

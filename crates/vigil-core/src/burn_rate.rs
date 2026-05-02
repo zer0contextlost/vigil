@@ -100,3 +100,60 @@ impl LoopDetector {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_burn_rate_single_point_returns_sane_values() {
+        // rate_per_min() returns 0 when elapsed < 1s (intentional guard to avoid
+        // garbage rates in the opening burst). projected_total should still return
+        // at least the accumulated session cost.
+        let mut tracker = BurnRateTracker::new();
+        let (rate, projected) = tracker.record(1.0);
+        assert!(rate >= 0.0, "rate must be >= 0, got {}", rate);
+        assert!(projected >= 1.0, "projected must be >= session_cost (1.0), got {}", projected);
+    }
+
+    #[test]
+    fn test_burn_rate_accumulates_cost() {
+        let mut tracker = BurnRateTracker::new();
+        tracker.record(0.25);
+        tracker.record(0.25);
+        let (_, projected) = tracker.record(0.50);
+        // session_cost == 1.0; projected >= session_cost always
+        assert!(projected >= 1.0, "projected must be >= accumulated cost 1.0, got {}", projected);
+    }
+
+    #[test]
+    fn test_burn_rate_empty_is_zero() {
+        let tracker = BurnRateTracker::new();
+        assert_eq!(tracker.rate_per_min(), 0.0);
+    }
+
+    #[test]
+    fn test_projected_total_with_no_data_returns_session_cost() {
+        let mut tracker = BurnRateTracker::new();
+        let (_, projected) = tracker.record(0.5);
+        assert!(projected >= 0.5);
+    }
+
+    #[test]
+    fn test_loop_detector_fires_at_threshold() {
+        let mut det = LoopDetector::new(3);
+        assert!(det.check("bash", "ls -la").is_none());
+        assert!(det.check("bash", "ls -la").is_none());
+        let hit = det.check("bash", "ls -la");
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap(), 3);
+    }
+
+    #[test]
+    fn test_loop_detector_different_inputs_no_false_positive() {
+        let mut det = LoopDetector::new(2);
+        assert!(det.check("bash", "ls").is_none());
+        assert!(det.check("bash", "pwd").is_none()); // different input, no hit
+        assert!(det.check("read", "ls").is_none());  // different tool
+    }
+}
