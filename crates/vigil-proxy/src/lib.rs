@@ -4,14 +4,19 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 use vigil_core::{scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host};
 
 const MAX_HEADER_SIZE: usize = 65536;
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
+
+pub type PendingApprovals = Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -22,12 +27,15 @@ pub struct ProxyConfig {
     pub upstream_override: Option<String>,
     /// Personal watchlist terms (names, addresses, etc.) for PII detection.
     pub pii_watchlist: Vec<String>,
+    /// Gate writes at this risk level or above. None disables write approval gating.
+    pub write_approval_threshold: Option<vigil_core::RiskLevel>,
 }
 
 pub struct Proxy {
     config: ProxyConfig,
     event_tx: mpsc::Sender<TimestampedEvent>,
     http_client: reqwest::Client,
+    pub pending_approvals: PendingApprovals,
 }
 
 impl Proxy {
@@ -36,6 +44,7 @@ impl Proxy {
             config,
             event_tx,
             http_client: reqwest::Client::new(),
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -50,10 +59,11 @@ impl Proxy {
             let event_tx = self.event_tx.clone();
             let http_client = self.http_client.clone();
             let config = self.config.clone();
+            let pending_approvals = self.pending_approvals.clone();
 
             tokio::spawn(async move {
                 tracing::debug!(peer = %_peer_addr, "proxy: new connection");
-                if let Err(e) = handle_connection(stream, event_tx, http_client, config).await {
+                if let Err(e) = handle_connection(stream, event_tx, http_client, config, pending_approvals).await {
                     tracing::warn!(err = %e, "proxy: connection error");
                     eprintln!("Connection error: {}", e);
                 }
@@ -79,6 +89,7 @@ async fn handle_connection(
     event_tx: mpsc::Sender<TimestampedEvent>,
     http_client: reqwest::Client,
     config: ProxyConfig,
+    pending_approvals: PendingApprovals,
 ) -> Result<()> {
     let session_id = Uuid::new_v4();
 
@@ -115,7 +126,7 @@ async fn handle_connection(
         }
         handle_connect_tunnel(client_conn, parts[1]).await
     } else {
-        handle_http_request(client_conn, &header_buf, event_tx, session_id, http_client, &config).await
+        handle_http_request(client_conn, &header_buf, event_tx, session_id, http_client, &config, &pending_approvals).await
     }
 }
 
@@ -186,6 +197,7 @@ async fn handle_http_request(
     session_id: Uuid,
     http_client: reqwest::Client,
     config: &ProxyConfig,
+    pending_approvals: &PendingApprovals,
 ) -> Result<()> {
     let Some((method, path, host, headers, headers_end)) = parse_http_headers(initial_buf) else {
         return Ok(());
@@ -241,6 +253,7 @@ async fn handle_http_request(
             &event_tx,
             &http_client,
             config,
+            pending_approvals,
         )
         .await;
     }
@@ -294,6 +307,7 @@ async fn handle_reverse_proxy(
     event_tx: &mpsc::Sender<TimestampedEvent>,
     http_client: &reqwest::Client,
     config: &ProxyConfig,
+    pending_approvals: &PendingApprovals,
 ) -> Result<()> {
     // Determine upstream base URL and provider label.
     // upstream_override routes all requests to a test/custom server.
@@ -451,6 +465,8 @@ async fn handle_reverse_proxy(
             &model,
             event_tx,
             &config.pii_watchlist,
+            config.write_approval_threshold,
+            pending_approvals,
         )
         .await?;
     } else {
@@ -485,6 +501,12 @@ struct SseState {
     block_name: HashMap<usize, String>,
     block_input: HashMap<usize, String>,
     response_text: String,
+    /// True when we are buffering a Write/Edit block for potential approval.
+    holding: bool,
+    /// Which block index triggered the hold.
+    holding_tool_idx: Option<usize>,
+    /// Set at content_block_stop when the completed tool is a write tool.
+    pending_approval_data: Option<(String, Value)>,
 }
 
 async fn stream_sse_response(
@@ -495,6 +517,8 @@ async fn stream_sse_response(
     model: &str,
     event_tx: &mpsc::Sender<TimestampedEvent>,
     pii_watchlist: &[String],
+    write_approval_threshold: Option<vigil_core::RiskLevel>,
+    pending_approvals: &PendingApprovals,
 ) -> Result<()> {
     let mut state = SseState {
         model: model.to_string(),
@@ -506,6 +530,7 @@ async fn stream_sse_response(
     let mut pending: Vec<u8> = Vec::new();
     let mut event_data: Option<String> = None;
     let mut client_alive = true;
+    let mut hold_buffer: Vec<Vec<u8>> = Vec::new();
 
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result?;
@@ -514,21 +539,7 @@ async fn stream_sse_response(
             continue;
         }
 
-        if client_alive {
-            let frame_header = format!("{:x}\r\n", chunk.len());
-            let write_result = async {
-                client_conn.write_all(frame_header.as_bytes()).await?;
-                client_conn.write_all(&chunk).await?;
-                client_conn.write_all(b"\r\n").await?;
-                client_conn.flush().await
-            }
-            .await;
-            if let Err(e) = write_result {
-                tracing::warn!(err = %e, "client disconnected mid-stream; continuing for telemetry");
-                client_alive = false;
-            }
-        }
-
+        // Parse the chunk first, then decide whether to buffer or forward.
         pending.extend_from_slice(&chunk);
         loop {
             match pending.iter().position(|&b| b == b'\n') {
@@ -572,6 +583,126 @@ async fn stream_sse_response(
                         }
                     }
                 }
+            }
+        }
+
+        // After parsing, decide: buffer or forward.
+        if state.holding && write_approval_threshold.is_some() {
+            hold_buffer.push(chunk.to_vec());
+        } else if client_alive {
+            let frame_header = format!("{:x}\r\n", chunk.len());
+            let write_result = async {
+                client_conn.write_all(frame_header.as_bytes()).await?;
+                client_conn.write_all(&chunk).await?;
+                client_conn.write_all(b"\r\n").await?;
+                client_conn.flush().await
+            }
+            .await;
+            if let Err(e) = write_result {
+                tracing::warn!(err = %e, "client disconnected mid-stream; continuing for telemetry");
+                client_alive = false;
+            }
+        }
+
+        // Check if a Write/Edit block just completed.
+        if let Some((tool_name, input)) = state.pending_approval_data.take() {
+            let path_str = input.get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let before = std::fs::read_to_string(&path_str).unwrap_or_default();
+
+            let after = if tool_name.eq_ignore_ascii_case("Write") || tool_name.eq_ignore_ascii_case("NotebookEdit") {
+                input.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string()
+            } else if tool_name.eq_ignore_ascii_case("Edit") {
+                let old = input.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+                let new = input.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+                before.replacen(old, new, 1)
+            } else {
+                // MultiEdit or unknown — use new_string from first edit if available
+                input.get("edits")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|e| e.get("new_string"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+
+            let risk = vigil_core::score_write(&path_str, &before, &after);
+
+            let needs_approval = write_approval_threshold
+                .map(|t| risk.level >= t)
+                .unwrap_or(false);
+
+            if needs_approval {
+                let approval_id = Uuid::new_v4();
+                let (approval_tx, approval_rx) = oneshot::channel::<bool>();
+                {
+                    let mut map = pending_approvals.lock().unwrap();
+                    map.insert(approval_id, approval_tx);
+                }
+                let _ = event_tx.try_send(TimestampedEvent::new(Event::WriteApprovalRequired {
+                    path: path_str.clone(),
+                    before: before.clone(),
+                    after: after.clone(),
+                    risk_level: format!("{:?}", risk.level),
+                    reasons: risk.reasons.clone(),
+                    session_id,
+                    approval_id,
+                }));
+
+                // Wait for user decision (with 5-minute timeout).
+                let approved = tokio::time::timeout(
+                    tokio::time::Duration::from_secs(300),
+                    approval_rx,
+                )
+                .await
+                .unwrap_or(Ok(false))
+                .unwrap_or(false);
+
+                if approved {
+                    // Flush the hold buffer and resume.
+                    if client_alive {
+                        for buffered_chunk in &hold_buffer {
+                            let frame_header = format!("{:x}\r\n", buffered_chunk.len());
+                            let _ = client_conn.write_all(frame_header.as_bytes()).await;
+                            let _ = client_conn.write_all(buffered_chunk).await;
+                            let _ = client_conn.write_all(b"\r\n").await;
+                        }
+                        let _ = client_conn.flush().await;
+                    }
+                    hold_buffer.clear();
+                    state.holding = false;
+                    state.holding_tool_idx = None;
+                } else {
+                    // Rejected: send HTTP 403 and close.
+                    if client_alive {
+                        let body = b"Write rejected by vigil";
+                        let resp_str = format!(
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = client_conn.write_all(resp_str.as_bytes()).await;
+                        let _ = client_conn.write_all(body).await;
+                        let _ = client_conn.flush().await;
+                    }
+                    return Ok(());
+                }
+            } else {
+                // Below threshold — flush buffer immediately, continue streaming.
+                if client_alive {
+                    for buffered_chunk in &hold_buffer {
+                        let frame_header = format!("{:x}\r\n", buffered_chunk.len());
+                        let _ = client_conn.write_all(frame_header.as_bytes()).await;
+                        let _ = client_conn.write_all(buffered_chunk).await;
+                        let _ = client_conn.write_all(b"\r\n").await;
+                    }
+                    let _ = client_conn.flush().await;
+                }
+                hold_buffer.clear();
+                state.holding = false;
+                state.holding_tool_idx = None;
             }
         }
     }
@@ -664,6 +795,10 @@ fn process_sse_event(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    if WRITE_TOOLS.iter().any(|t| name.eq_ignore_ascii_case(t)) {
+                        state.holding = true;
+                        state.holding_tool_idx = Some(idx);
+                    }
                     state.block_name.insert(idx, name);
                     state.block_input.insert(idx, String::new());
                 }
@@ -703,6 +838,9 @@ fn process_sse_event(
                 tracing::info!(tool = %tool_name, "tool call detected in stream");
                 emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                 emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
+                if WRITE_TOOLS.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                    state.pending_approval_data = Some((tool_name.clone(), input.clone()));
+                }
                 let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
                     agent: "claude".to_string(),
                     tool_name,
@@ -1246,6 +1384,7 @@ mod integration {
             ca_cert_path: None,
             upstream_override,
             pii_watchlist: vec![],
+            write_approval_threshold: None,
         };
         let http_client = reqwest::Client::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1257,8 +1396,9 @@ mod integration {
                 let tx = event_tx.clone();
                 let client = http_client.clone();
                 let cfg = config.clone();
+                let approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, tx, client, cfg).await;
+                    let _ = handle_connection(stream, tx, client, cfg, approvals).await;
                 });
             }
         });
