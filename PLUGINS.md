@@ -1,11 +1,10 @@
 # vigil plugin system
 
-vigil exposes a stable Rust trait (`VigilPlugin`) that lets you receive every
-event and alert from a running session without forking vigil itself.
+vigil exposes a stable Rust trait (`VigilPlugin`) that lets you receive every event and alert from a running session without forking vigil itself.
 
 ## How it works
 
-`vigil-core` (a library crate) exports two types:
+`vigil-core` exports two types:
 
 ```rust
 pub trait VigilPlugin: Send + Sync {
@@ -16,51 +15,78 @@ pub trait VigilPlugin: Send + Sync {
 pub struct PluginHost { … }
 impl PluginHost {
     pub fn add(&mut self, plugin: Box<dyn VigilPlugin>);
+    pub fn load_from_file(&mut self, path: &Path) -> anyhow::Result<()>;
 }
 ```
 
-`PluginHost` fans out to all registered plugins. vigil-cli calls
-`dispatch_event` for every filtered event and `dispatch_alert` for every alert
-before forwarding them to the TUI.
+`PluginHost` fans out to all registered plugins. vigil-cli calls `dispatch_event` for every filtered event and `dispatch_alert` for every alert before forwarding them to the TUI.
 
 ## Alert labels
 
 | Label  | Trigger |
 |--------|---------|
-| BURN   | Burn-rate threshold exceeded |
-| LOOP   | Repeated identical tool call detected |
-| EXFL   | Credential exfiltration attempt |
-| DENY   | Policy blocked a tool call |
-| COST   | Soft cost alert threshold crossed |
-| DURA   | Session duration limit reached |
-| TOUT   | Tool call hung with no LLM response |
-| WAPPR  | Write approval required (manual approval gate) |
-| PII    | PII detected in traffic (from proxy scanner) |
+| `BURN` | Rolling $/min burn-rate exceeded threshold |
+| `LOOP` | Same tool+input repeated N times |
+| `EXFL` | Credential exfiltration attempt detected |
+| `DENY` | Policy blocked a tool call |
+| `COST` | Soft cost alert threshold crossed |
+| `DURA` | Session duration limit reached |
+| `TOUT` | Tool call hung with no LLM response |
+| `WAPPR`| Write approval required |
+| `PII`  | PII detected in traffic |
 
-## Writing a plugin
+## Loading plugins
 
-Add `vigil-core` to your `Cargo.toml`:
+### Auto-load (recommended)
 
-```toml
-[dependencies]
-vigil-core = { git = "https://github.com/zer0contextlost/vigil" }
+Drop your compiled shared library in `~/.vigil/plugins/`. vigil scans this directory on every `vigil run` and loads any `.dll` (Windows), `.so` (Linux), or `.dylib` (macOS) file it finds.
+
+```bash
+vigil plugins dir    # prints the auto-load directory
+vigil plugins list   # shows what's currently in it
 ```
 
-Implement the trait. Both methods have default no-op bodies; implement only
-what you need:
+### Explicit load
+
+```bash
+vigil run --plugin ./my-plugin.dll -- claude
+vigil run --plugin ./a.dll --plugin ./b.dll -- claude
+```
+
+### Compatibility note
+
+Plugin and host must be compiled with the same Rust toolchain and `vigil-core` version. The `dyn VigilPlugin` vtable layout is not stable across compiler versions. Pin both to the same `vigil-core` git revision.
+
+## Writing a dynamic plugin
+
+Compile your plugin as a `cdylib` crate and export `vigil_plugin_create`:
+
+**`Cargo.toml`**
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vigil-core = { git = "https://github.com/zer0contextlost/vigil" }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+```
+
+**`src/lib.rs`**
 
 ```rust
-use vigil_core::{VigilPlugin, Envelope};
+use vigil_core::{Envelope, VigilPlugin};
 use serde_json::Value;
 
-pub struct SlackNotifier {
+struct SlackNotifier {
     webhook_url: String,
 }
 
 impl VigilPlugin for SlackNotifier {
     fn on_alert(&self, label: &str, session_id: &str, detail: &Value) {
         let url = self.webhook_url.clone();
-        let text = format!("[vigil {}] session {} — {}", label, &session_id[..8], detail);
+        let text = format!("[vigil {}] {} — {}", label, &session_id[..8], detail);
         tokio::spawn(async move {
             let _ = reqwest::Client::new()
                 .post(&url)
@@ -70,12 +96,35 @@ impl VigilPlugin for SlackNotifier {
         });
     }
 }
+
+/// vigil calls this function to create your plugin.
+/// Return a heap-allocated Box<dyn VigilPlugin> wrapped in another Box.
+#[no_mangle]
+pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin> {
+    let plugin: Box<dyn VigilPlugin> = Box::new(SlackNotifier {
+        webhook_url: std::env::var("SLACK_WEBHOOK").unwrap_or_default(),
+    });
+    Box::into_raw(Box::new(plugin))
+}
 ```
 
-## Registering your plugin
+Build with `cargo build --release` and copy the resulting `.dll`/`.so`/`.dylib` to `~/.vigil/plugins/`.
 
-vigil-cli's internal `run_agent_with_plugins` function accepts a `PluginHost`.
-The simplest integration is a thin wrapper binary:
+## Writing an in-process plugin (wrapper binary)
+
+For tighter integration — custom CLI flags, combining with your own config — write a thin wrapper binary that calls vigil's `run_agent_with_plugins`:
+
+**`Cargo.toml`**
+
+```toml
+[dependencies]
+vigil-core = { git = "https://github.com/zer0contextlost/vigil" }
+vigil-cli  = { git = "https://github.com/zer0contextlost/vigil", package = "vigil" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+```
+
+**`src/main.rs`**
 
 ```rust
 use vigil_core::PluginHost;
@@ -83,41 +132,30 @@ use vigil_core::PluginHost;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut host = PluginHost::new();
-    host.add(Box::new(SlackNotifier {
-        webhook_url: std::env::var("SLACK_WEBHOOK")?,
-    }));
+    host.add(Box::new(MyPlugin::new()));
 
-    // parse your own args, then call vigil-cli's entry point
     vigil_cli::run_agent_with_plugins(
-        8877, None, None,
-        vec!["claude".into()],
-        vec![],
-        None, None,
+        8877,                    // port
+        None,                    // policy file
+        None,                    // log file
+        vec!["claude".into()],   // agent argv
+        vec![],                  // PII watchlist terms
+        None,                    // vigil.toml config
+        None,                    // config path string
         host,
+        None,                    // session name
     ).await
 }
 ```
 
-Add vigil-cli as a library dependency in your `Cargo.toml`:
-
-```toml
-[dependencies]
-vigil-cli = { git = "https://github.com/zer0contextlost/vigil", package = "vigil" }
-```
-
 ## Threading contract
 
-`on_event` and `on_alert` are called from within an async tokio task. Your
-implementation must not block. If you need to do I/O (HTTP calls, disk writes,
-database inserts), spawn a `tokio::task` or send to a channel you own.
+`on_event` and `on_alert` are called from within an async tokio task. Implementations must not block. Spawn a `tokio::task` or send to a channel you own for any I/O.
 
-## Example: structured logging plugin
+## Example: structured NDJSON logger
 
 ```rust
-use vigil_core::{VigilPlugin, Envelope};
-use serde_json::Value;
-use std::fs::OpenOptions;
-use std::io::Write;
+use vigil_core::{Envelope, VigilPlugin};
 use std::sync::Mutex;
 
 pub struct NdjsonLogger {
@@ -126,7 +164,8 @@ pub struct NdjsonLogger {
 
 impl NdjsonLogger {
     pub fn new(path: &str) -> Self {
-        let file = OpenOptions::new().create(true).append(true).open(path).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true).append(true).open(path).unwrap();
         Self { file: Mutex::new(file) }
     }
 }
@@ -135,9 +174,15 @@ impl VigilPlugin for NdjsonLogger {
     fn on_event(&self, envelope: &Envelope) {
         if let Ok(line) = serde_json::to_string(envelope) {
             if let Ok(mut f) = self.file.lock() {
-                let _ = writeln!(f, "{}", line);
+                let _ = std::io::Write::write_fmt(&mut *f, format_args!("{}\n", line));
             }
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin> {
+    let plugin: Box<dyn VigilPlugin> = Box::new(NdjsonLogger::new("/tmp/vigil-extra.ndjson"));
+    Box::into_raw(Box::new(plugin))
 }
 ```
