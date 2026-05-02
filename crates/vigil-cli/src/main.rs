@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus};
+use vigil_core::{session::Session, store::SessionStore, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector};
 use vigil_proxy::Proxy;
 use vigil_tui::App;
 use vigil_watch::{WatchConfig, Watcher};
@@ -548,6 +548,10 @@ async fn run_agent(
     let engine = Arc::new(engine);
 
     let budget_enforcer = config.as_ref().map(|c| BudgetEnforcer::new(c.budget.clone()));
+    let burn_rate_limit = config.as_ref().and_then(|c| c.budget.max_burn_rate_usd_per_min);
+    let loop_threshold = config.as_ref()
+        .and_then(|c| c.budget.loop_detect_threshold)
+        .unwrap_or(5);
 
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
@@ -627,9 +631,12 @@ async fn run_agent(
 
     // Policy filter: evaluate every raw event and forward allowed ones to the TUI.
     let engine_clone = engine.clone();
+    let session_id_for_alerts = session_id;
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
+        let mut burn_tracker = BurnRateTracker::new();
+        let mut loop_detector = LoopDetector::new(loop_threshold);
         while let Some(event) = raw_rx.recv().await {
             if let Event::LlmRequest { input_tokens, .. } = &event.event {
                 session_tokens += input_tokens;
@@ -638,6 +645,33 @@ async fn run_agent(
             if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {
                 session_tokens += input_tokens + output_tokens;
                 session_cost += cost_usd;
+            }
+
+            if let Event::LlmResponse { cost_usd, .. } = &event.event {
+                let (rate, projected) = burn_tracker.record(*cost_usd);
+                if let Some(limit) = burn_rate_limit {
+                    if rate > limit {
+                        let alert = TimestampedEvent::new(Event::BurnRateAlert {
+                            rate_per_min_usd: rate,
+                            projected_total_usd: projected,
+                            session_cost_usd: session_cost,
+                            session_id: session_id_for_alerts,
+                        });
+                        filtered_tx.send(alert).await.ok();
+                    }
+                }
+            }
+
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                if let Some(count) = loop_detector.check(tool_name, &input_str) {
+                    let alert = TimestampedEvent::new(Event::LoopAlert {
+                        tool_name: tool_name.clone(),
+                        repeat_count: count,
+                        session_id: *sid,
+                    });
+                    filtered_tx.send(alert).await.ok();
+                }
             }
 
             if let Some(ref enforcer) = budget_enforcer {

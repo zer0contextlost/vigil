@@ -48,6 +48,10 @@ pub struct BudgetSection {
     pub max_tokens: Option<u32>,
     /// Time window when agent is allowed to run, "HH:MM-HH:MM" local time.
     pub allowed_hours: Option<String>,
+    #[serde(default)]
+    pub max_burn_rate_usd_per_min: Option<f64>,
+    #[serde(default)]
+    pub loop_detect_threshold: Option<u32>,
 }
 
 /// A policy rule as it appears in vigil.toml.

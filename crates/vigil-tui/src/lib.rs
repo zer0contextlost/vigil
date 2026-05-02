@@ -27,6 +27,8 @@ pub struct EventCounts {
     pub fs_writes: usize,
     pub spawns: usize,
     pub mcp: usize,
+    pub burn_alerts: usize,
+    pub loop_alerts: usize,
 }
 
 pub struct App {
@@ -45,6 +47,8 @@ pub struct App {
     pub detail_focused: bool,
     pub detail_scroll: usize,
     pub counts: EventCounts,
+    /// Most recent burn rate ($/min) from the last BurnRateAlert, if any.
+    pub last_burn_rate: Option<f64>,
 }
 
 impl App {
@@ -65,6 +69,7 @@ impl App {
             detail_focused: false,
             detail_scroll: 0,
             counts: EventCounts::default(),
+            last_burn_rate: None,
         }
     }
 
@@ -103,6 +108,13 @@ impl App {
             }
             vigil_core::Event::PiiAlert { .. } => {
                 self.session.pii_detections += 1;
+            }
+            vigil_core::Event::BurnRateAlert { rate_per_min_usd, .. } => {
+                self.counts.burn_alerts += 1;
+                self.last_burn_rate = Some(*rate_per_min_usd);
+            }
+            vigil_core::Event::LoopAlert { .. } => {
+                self.counts.loop_alerts += 1;
             }
         }
         if let Some(ref mut store) = self.store {
@@ -244,12 +256,19 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("MCP ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)),
         vigil_core::Event::PiiAlert { .. } =>
             ("PII!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::BurnRateAlert { .. } =>
+            ("BURN", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::LoopAlert { .. } =>
+            ("LOOP", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
     let is_alert = matches!(
         &event.event,
-        vigil_core::Event::ToolCallResult { blocked: true, .. } | vigil_core::Event::PiiAlert { .. }
+        vigil_core::Event::ToolCallResult { blocked: true, .. }
+        | vigil_core::Event::PiiAlert { .. }
+        | vigil_core::Event::BurnRateAlert { .. }
+        | vigil_core::Event::LoopAlert { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -297,6 +316,10 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("{}/{}", server, method),
         vigil_core::Event::PiiAlert { source, kinds, .. } =>
             format!("in {} -- {}", source, kinds.join(", ")),
+        vigil_core::Event::BurnRateAlert { rate_per_min_usd, projected_total_usd, .. } =>
+            format!("${:.3}/min projected ${:.2}", rate_per_min_usd, projected_total_usd),
+        vigil_core::Event::LoopAlert { tool_name, repeat_count, .. } =>
+            format!("{} repeated {}x", tool_name, repeat_count),
     }
 }
 
@@ -386,6 +409,18 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(header_line(format!("PII ALERT  source: {}", source), Color::Red));
             out.push(body_line(&format!("Detected: {}", kinds.join(", "))));
         }
+        vigil_core::Event::BurnRateAlert { rate_per_min_usd, projected_total_usd, session_cost_usd, .. } => {
+            out.push(header_line("BURN RATE ALERT".to_string(), Color::Red));
+            out.push(body_line(&format!("Current rate:     ${:.4}/min", rate_per_min_usd)));
+            out.push(body_line(&format!("Session cost so far: ${:.4}", session_cost_usd)));
+            out.push(body_line(&format!("Projected total:  ${:.4}", projected_total_usd)));
+        }
+        vigil_core::Event::LoopAlert { tool_name, repeat_count, .. } => {
+            out.push(header_line("LOOP DETECTED".to_string(), Color::Red));
+            out.push(body_line(&format!("Tool:         {}", tool_name)));
+            out.push(body_line(&format!("Repeat count: {}", repeat_count)));
+            out.push(body_line("Same tool+input combination repeated too many times."));
+        }
     }
 
     out
@@ -450,6 +485,28 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
         pii.to_string(),
         if pii > 0 { Color::Red } else { Color::DarkGray },
     ));
+
+    if let Some(rate) = app.last_burn_rate {
+        out.push(stat_row(
+            "rate",
+            format!("${:.3}/min", rate),
+            Color::Red,
+        ));
+    }
+    if c.burn_alerts > 0 {
+        out.push(stat_row(
+            "burn alerts",
+            c.burn_alerts.to_string(),
+            Color::Red,
+        ));
+    }
+    if c.loop_alerts > 0 {
+        out.push(stat_row(
+            "loop alerts",
+            c.loop_alerts.to_string(),
+            Color::Red,
+        ));
+    }
 
     out
 }
