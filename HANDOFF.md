@@ -2,95 +2,136 @@
 
 ## What vigil does
 
-Vigil is a runtime observability tool for AI coding agents. It intercepts the agent's LLM API calls via an HTTP reverse proxy, shows a live ratatui TUI with every request/response and token count, and saves full session JSON files for later review.
-
-Run it like this:
+Vigil is a runtime observability tool for AI coding agents. It intercepts the agent's LLM API calls via an HTTP reverse proxy, shows a live ratatui TUI with every request/response and token count, and saves append-only NDJSON session files for audit and replay.
 
 ```
-vigil run --log-file session.log -- claude -p "your prompt"
+vigil run -- claude -p "your prompt"
+vigil run --config vigil.toml -- claude -p "your prompt"
+vigil sessions
+vigil replay <session-uuid>
 ```
 
-After the agent finishes, the TUI shows `[DONE -- q to exit]`. Press q to save the session and print the cost summary.
+After the agent finishes, the TUI shows `[DONE -- q to exit]`. Press q to exit.
 
 ## Crate layout
 
 | Crate | Purpose |
 |---|---|
-| vigil-cli | Binary entrypoint, CLI args, agent spawning, TUI orchestration |
-| vigil-proxy | HTTP reverse proxy, SSE parser, event emission |
-| vigil-core | Shared types: Event, Envelope (TimestampedEvent alias), Session, SessionStore, VigilConfig, Scanner trait, PolicyEngine |
-| vigil-tui | ratatui dashboard, App state |
+| vigil-cli | Binary entrypoint, CLI args, agent spawning, TUI orchestration, budget enforcement |
+| vigil-proxy | HTTP reverse proxy, SSE parser (Anthropic + OpenAI), event emission |
+| vigil-core | Event, Envelope, SessionStore, VigilConfig, BudgetEnforcer, ProviderKind, Scanner, PolicyEngine |
+| vigil-tui | ratatui dashboard, App state, replay |
 | vigil-watch | Filesystem/process watcher (no-op on Windows) |
-| vigil-mcp | MCP shim stub |
+| vigil-mcp | vigil-mcp-shim binary: intercepts stdio JSON-RPC MCP tool servers |
 
 ## How traffic interception works
 
-The proxy is a plain HTTP server on port 8877. The agent process is launched with `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in its environment. Claude Code sends unencrypted HTTP to the proxy. The proxy forwards to `https://api.anthropic.com` using reqwest (which handles TLS). The response is streamed back as chunked HTTP/1.1 to the agent.
+The proxy is a plain HTTP server on port 8877 (configurable). The agent is launched with `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in its environment. Claude Code sends plain HTTP to the proxy. The proxy forwards to `https://api.anthropic.com` (or `https://api.openai.com` etc.) via reqwest with TLS. The response is streamed back as chunked HTTP/1.1.
 
-Important: the proxy builds reqwest with `default-features = false` (no gzip/brotli). The upstream request always sets `accept-encoding: identity` to prevent Anthropic from compressing responses. If this header is ever missing, Anthropic will return gzip-compressed SSE and the parser will see binary garbage and emit zero tokens.
+The proxy always sets `accept-encoding: identity` on upstream requests. If this is missing, Anthropic returns gzip-compressed SSE and the parser sees binary garbage.
 
-## SSE parsing
+## Supported providers
 
-`stream_sse_response` in `vigil-proxy/src/lib.rs` accumulates raw bytes in a `Vec<u8>` buffer, finds newline boundaries byte-by-byte (handles both `\n` and `\r\n`), and dispatches JSON payloads on blank lines. It calls `process_sse_event` which updates an `SseState` struct, tracking `input_tokens` from `message_start` and `output_tokens` from `message_delta`. After the stream ends it emits one `LlmResponse` event with both counts.
+`vigil_core::provider::detect_provider_from_host()` returns a `ProviderKind` enum:
+Anthropic, OpenAI, Gemini, OpenRouter, XAI, Unknown.
 
-## Session lifecycle (Phase 1+)
+The proxy dispatches to `process_sse_event()` (Anthropic format) or `process_openai_sse_event()` (OpenAI `choices[0].delta` format) based on the detected provider. Non-streaming responses call `emit_anthropic_response()` or `emit_openai_response()`.
 
-Events flow: `proxy task → raw_tx channel → filter task (policy eval) → filtered_tx channel → TUI`. The TUI's `App::push_event` updates session stats and calls `store.append(event)` (if store is Some) to append each event as a JSON line to `~/.vigil/sessions/<uuid>.ndjson`. A sidecar `<uuid>.meta.json` is atomically rewritten on each flush. On exit, `store.finish()` sets `ended_at` and writes the final meta.
+## Session lifecycle
 
-The `Envelope` struct wraps every `Event` with: ULID event_id (sortable), session_id, schema_version, SHA-256 hash of the previous envelope (forming a tamper-evident chain), and a turn_id for grouping related events. `TimestampedEvent` is a type alias for `Envelope` for backward compatibility.
+Events flow: `proxy task → raw_tx → filter task (policy + budget eval) → filtered_tx → TUI`.
 
-`SessionStore` also generates a random 32-byte per-session key for future HMAC signing.
+The TUI's `App::push_event` calls `store.append(event)` to write each event as a JSON line to `~/.vigil/sessions/<uuid>.ndjson`. A sidecar `<uuid>.meta.json` is atomically updated on each flush.
 
-Old `.json` session files (pre-Phase 1) are still loadable by `vigil sessions` and `vigil replay`.
+The `Envelope` struct wraps every `Event` with: ULID event_id (sortable), session_id (Uuid), schema_version (u8), SHA-256 hash-chain over previous envelope, and turn_id.
 
-## Shutdown sequence
+`TimestampedEvent` is a type alias for `Envelope` (backward compat).
 
-When the agent process exits, vigil waits 1500ms (grace period for in-flight SSE streams to emit their final LlmResponse), then aborts the filter task. Aborting the filter closes `filtered_tx`, which causes the TUI's event receiver to return `None`. The TUI sets `agent_done = true` and stays open showing `[DONE — q to exit]`. The user presses q, the TUI exits, and the session is saved.
+## Configuration (vigil.toml)
+
+```toml
+[proxy]
+port = 8877
+
+[session]
+store_raw = true
+
+[pii]
+watchlist_file = "~/.vigil/watchlist.txt"
+
+[budget]
+max_cost_usd = 5.00
+max_tokens = 500000
+allowed_hours = "09:00-18:00"   # or "22:00-06:00" for overnight
+
+[[policies]]
+name = "block-bash"
+action = "Deny"
+[policies.matcher]
+type = "ToolCall"
+tool_name_pattern = "Bash"
+```
+
+Pass with `vigil run --config vigil.toml -- <agent>`.
+
+## Budget enforcement
+
+`vigil_core::budget::BudgetEnforcer` is created from `VigilConfig.budget` and checked after every `LlmResponse` event in the filter task. When any limit is exceeded the filter task breaks, printing `[BUDGET] ...` to stderr and letting the TUI drain.
+
+## MCP shim
+
+`vigil-mcp-shim` is a transparent stdio proxy for MCP servers:
+
+```
+vigil-mcp-shim --session-id <uuid> --ndjson ~/.vigil/sessions/<uuid>.ndjson <real-server-command> [args]
+```
+
+Configure your MCP client (Claude Desktop, etc.) to use `vigil-mcp-shim <real-server> [args]` as the server command. All `tools/call` requests are intercepted, PII-scanned, and logged as `McpCall` events to the NDJSON file. Falls back to stderr if `--ndjson` is not given.
 
 ## TUI layout
 
-The TUI (`vigil-tui/src/lib.rs`) uses a three-panel layout:
+Three-panel layout: header (3 lines) + horizontal split [event list 65% | stats sidebar 35%] (55%) + detail pane (44%) + help bar (1 line).
 
-The top 3 lines are a header bar with an inverted status badge (LIVE / DONE / REPLAY), session ID, agent name, and a tail/position indicator. Below that the screen splits 55% / 44% vertically between the main area and the detail pane, with a 1-line help bar at the bottom.
+Header shows: status badge (LIVE/DONE/REPLAY), session ID (first 8 chars), agent name, scroll position, config file path when `--config` is used.
 
-The main area splits 65% / 35% horizontally. The left panel is the scrollable event list; the right panel is the stats sidebar. The stats sidebar shows: session ID (first 8 chars), agent name, total cost in green, input/output token counts with thousands separators, then a per-type event breakdown that only shows non-zero rows (req, res, tool, result, blocked, fsread, fswrite, spawn, mcp), then violations and PII alert counts in red if non-zero.
+Event type labels: REQ, RES, TOOL, DENY, OK, READ, WRIT, PROC, MCP, PII! (4-char fixed-width).
 
-Event rows use 4-character fixed-width type labels: REQ (cyan dim), RES (cyan), TOOL (yellow), DENY (red bold), OK (green dim), READ (gray), WRIT (magenta), PROC (yellow dim), MCP (cyan dim), PII! (red bold).
+Tab toggles focus to the detail pane for scrolling. Up/Down/PgUp/PgDn/Home/End navigate. q or Esc quits.
 
-The detail pane shows full event content for the selected row. Tab toggles focus to the detail pane for scrolling; Tab again or Esc returns to the list.
+## Replay
 
-`App` now carries an `EventCounts` struct with per-type counts that are updated in `push_event` alongside the session stats. The `fmt_num` helper adds thousands separators to token counts.
+`vigil replay <uuid>` tries NDJSON format first (new sessions), replaying with timestamp-paced delays (each event delayed by its original elapsed time, capped at 500ms). Falls back to old JSON `Session.load()` for pre-Phase-1 sessions.
 
 ## PII detection
 
-Two mechanisms run independently on every LLM request, LLM response, and tool call input.
+Two mechanisms on every LLM request/response and tool call:
+- `scan_pii()`: regex patterns for email, US phone, SSN (Luhn-validated), credit card, AWS key, GitHub PAT, JWT, public IPv4, URLs with PII params.
+- `scan_watchlist()`: case-insensitive substring match against custom terms from `--pii-watchlist` file.
 
-`scan_pii` in `vigil-core/src/pii.rs` applies regex patterns for: email, US phone, SSN, credit card (with Luhn validation), AWS access key, GitHub PAT, JWT, public IPv4, and URLs containing PII parameter names. This runs automatically with no configuration.
-
-`scan_watchlist` does case-insensitive substring matching against a list of custom terms loaded from a file passed via `--pii-watchlist`. Use this for names, internal project codes, or any sensitive string that doesn't fit a standard pattern. The watchlist is optional; omitting it does not disable the regex patterns.
-
-Both emit `PiiAlert` events with a `source` field (tool name, `llm_request`, or `llm_response`) and a `kinds` list of what was found. Matched snippets are partially redacted (last N chars kept) before being stored.
+Both emit `PiiAlert` events with `source` (tool name or "llm_request"/"llm_response") and `kinds` list. Snippets are partially redacted before storage.
 
 ## Known gaps
 
-**Cache token accounting.** The Anthropic `message_start` event includes `cache_read_input_tokens` and `cache_creation_input_tokens` separately from `input_tokens`. Vigil currently only records `input_tokens` (the non-cached count). Cache read tokens are priced at ~10% of regular input tokens. For heavy Claude Code sessions where the system prompt is always cached, the recorded cost will be understated.
+**Cache token accounting.** `cache_read_input_tokens` and `cache_creation_input_tokens` are ignored. For heavy Claude Code sessions where the system prompt is cached, recorded cost is understated.
 
-**Hardcoded pricing.** `cost_usd()` in `vigil-proxy/src/lib.rs` uses hardcoded per-million-token prices. These will drift as Anthropic adjusts pricing.
+**Hardcoded pricing.** `cost_usd()` in vigil-proxy and vigil-core uses hardcoded per-million-token prices that will drift.
 
-**Windows-only proxy mode.** `vigil-watch` is a stub on Windows. File reads, file writes, and process spawns never appear in the event log. Full observability requires Linux or macOS.
-
-**Session replay.** The `vigil replay <session-id>` command exists and loads events, but replays them all at once with no timestamp pacing. It works for reviewing events but doesn't feel like a real replay.
+**Windows-only proxy mode.** `vigil-watch` is a stub on Windows; FsRead/FsWrite/ProcessSpawn events never appear for file-system activity.
 
 ## Running tests
 
 ```
-cargo test -p vigil-proxy
+cargo test --workspace
 ```
 
-20 integration tests cover: chunked header/body reads, SSE streaming, non-streaming round-trip, duplicate header joining, hop-by-hop header stripping, SSRF blocking, oversized request rejection, and event emission.
+20 integration tests in vigil-proxy cover: chunked reads, SSE streaming, non-streaming round-trips, header handling, SSRF blocking, oversized request rejection, event emission.
 
 ## Reinstalling after code changes
 
 ```
 cargo install --path F:\projects\vigil\crates\vigil-cli --force
 ```
+
+## GitHub
+
+Repo: `zer0contextlost/vigil` (private). Branches: `main` (stable), `dev` (working). Workflow: commit dev → PR to main → QA agent reviews → merge.
