@@ -32,6 +32,7 @@ pub struct EventCounts {
 pub struct App {
     pub session: Session,
     pub store: Option<vigil_core::store::SessionStore>,
+    pub config_path: Option<String>,
     pub event_log: Vec<Line<'static>>,
     pub raw_events: Vec<TimestampedEvent>,
     pub selected: usize,
@@ -51,6 +52,7 @@ impl App {
         Self {
             session,
             store: None,
+            config_path: None,
             event_log: Vec::new(),
             raw_events: Vec::new(),
             selected: 0,
@@ -526,6 +528,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("")
     };
 
+    let cfg_span = match &app.config_path {
+        Some(p) => Span::styled(format!("  cfg:{}", p), Style::default().fg(Color::DarkGray)),
+        None => Span::raw(""),
+    };
+
     let header = Paragraph::new(Line::from(vec![
         status,
         Span::raw("  "),
@@ -535,6 +542,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ),
         position,
+        cfg_span,
         quit_hint,
     ]))
     .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
