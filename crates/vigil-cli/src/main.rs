@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, Event, PolicyEngine, TimestampedEvent};
+use vigil_core::{session::Session, store::SessionStore, Event, PolicyEngine, TimestampedEvent};
 use vigil_proxy::Proxy;
 use vigil_tui::App;
 use vigil_watch::{WatchConfig, Watcher};
@@ -409,6 +409,7 @@ async fn run_agent(
     let agent_name = agent_and_args[0].clone();
     let session = Session::new(agent_name.clone());
     let session_id = session.id;
+    let store = SessionStore::create(session_id, &agent_name).ok();
 
     let engine = if let Some(policy_path) = &policy {
         PolicyEngine::from_file(policy_path)?
@@ -544,7 +545,8 @@ async fn run_agent(
         }
     });
 
-    let app = App::new(session);
+    let mut app = App::new(session);
+    app.store = store;
     let mut tui_handle = tokio::spawn(async move { vigil_tui::run_tui(app, filtered_rx).await });
 
     // Wait for TUI exit (user pressed q) or agent exit — whichever comes first.
@@ -582,14 +584,16 @@ async fn run_agent(
 
     if let Some(mut app) = final_app {
         app.session.finish();
-        match app.session.save() {
-            Ok(path) => {
-                tracing::info!(path = %path.display(), "session saved");
-                println!("Session saved: {}", path.display());
-            }
-            Err(e) => {
-                tracing::error!(err = %e, "failed to save session");
-                eprintln!("Failed to save session: {}", e);
+        if let Some(ref mut store) = app.store {
+            match store.finish() {
+                Ok(()) => {
+                    tracing::info!(path = %store.ndjson_path.display(), "session saved");
+                    println!("Session saved: {}", store.ndjson_path.display());
+                }
+                Err(e) => {
+                    tracing::error!(err = %e, "failed to save session");
+                    eprintln!("Failed to save session: {}", e);
+                }
             }
         }
 
