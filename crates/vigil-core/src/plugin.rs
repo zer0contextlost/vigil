@@ -3,6 +3,13 @@ use std::path::Path;
 
 use crate::envelope::Envelope;
 
+/// Must match `vigil_plugin::ABI_VERSION` in the plugin SDK.
+/// Bump this whenever `VigilPlugin`, `Envelope`, or the FFI contract changes.
+pub const ABI_VERSION: u32 = 1;
+
+/// rustc version vigil-core was compiled with, baked in by build.rs.
+pub const RUSTC_VERSION: &str = env!("VIGIL_RUSTC_VERSION");
+
 /// Implement this trait to receive vigil events and alerts.
 ///
 /// # Usage
@@ -65,24 +72,73 @@ impl PluginHost {
 
     /// Load a plugin from a shared library (.dll / .so / .dylib).
     ///
-    /// The library must export a C-ABI function with this exact signature:
-    /// ```c
-    /// // Rust: pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin>
-    /// ```
-    /// The returned pointer must be heap-allocated via `Box::into_raw(Box::new(plugin))`.
-    /// vigil takes ownership and will free it.
-    ///
-    /// **Compatibility note**: plugin and host must be compiled with the same Rust
-    /// toolchain and vigil-core version — `dyn VigilPlugin` vtable layout is not stable
-    /// across compiler versions.
+    /// Plugins built with `vigil-plugin` and [`declare_plugin!`] are loaded safely:
+    /// ABI version and rustc version are checked before instantiation, so a mismatch
+    /// fails with a clear error rather than undefined behavior.
     pub fn load_from_file(&mut self, path: &Path) -> anyhow::Result<()> {
         unsafe {
             let lib = libloading::Library::new(path)
                 .map_err(|e| anyhow::anyhow!("cannot load plugin {}: {}", path.display(), e))?;
+
+            // --- ABI version check ---
+            let abi_fn: std::result::Result<
+                libloading::Symbol<unsafe extern "C" fn() -> u32>,
+                _,
+            > = lib.get(b"vigil_plugin_abi_version\0");
+            if let Ok(abi_fn) = abi_fn {
+                let plugin_abi = abi_fn();
+                if plugin_abi != ABI_VERSION {
+                    anyhow::bail!(
+                        "ABI mismatch loading {}: plugin ABI v{}, host ABI v{}. \
+                         Rebuild your plugin against vigil-plugin v{}.",
+                        path.display(),
+                        plugin_abi,
+                        ABI_VERSION,
+                        env!("CARGO_PKG_VERSION"),
+                    );
+                }
+            }
+
+            // --- rustc version check ---
+            let rustc_fn: std::result::Result<
+                libloading::Symbol<unsafe extern "C" fn() -> *const std::os::raw::c_char>,
+                _,
+            > = lib.get(b"vigil_plugin_rustc_version\0");
+            if let Ok(rustc_fn) = rustc_fn {
+                let ptr = rustc_fn();
+                if !ptr.is_null() {
+                    let plugin_rustc = std::ffi::CStr::from_ptr(ptr).to_string_lossy();
+                    if plugin_rustc != RUSTC_VERSION {
+                        anyhow::bail!(
+                            "rustc mismatch loading {}: plugin built with {}, host built with {}. \
+                             dyn VigilPlugin vtable layout is unstable across rustc versions; \
+                             rebuild both with the same toolchain.",
+                            path.display(),
+                            plugin_rustc,
+                            RUSTC_VERSION,
+                        );
+                    }
+                }
+            }
+
+            // --- instantiate ---
             let create: libloading::Symbol<unsafe extern "C" fn() -> *mut Box<dyn VigilPlugin>> =
-                lib.get(b"vigil_plugin_create\0")
-                    .map_err(|e| anyhow::anyhow!("symbol vigil_plugin_create not found in {}: {}", path.display(), e))?;
-            let raw = create();
+                lib.get(b"vigil_plugin_create\0").map_err(|e| {
+                    anyhow::anyhow!(
+                        "vigil_plugin_create not found in {}: {}. \
+                         Did you use declare_plugin!() in your plugin?",
+                        path.display(),
+                        e
+                    )
+                })?;
+
+            let raw = std::panic::catch_unwind(|| create()).map_err(|_| {
+                anyhow::anyhow!(
+                    "plugin {} panicked during vigil_plugin_create",
+                    path.display()
+                )
+            })?;
+
             if raw.is_null() {
                 anyhow::bail!("plugin {} returned null from vigil_plugin_create", path.display());
             }

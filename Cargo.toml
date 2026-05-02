@@ -2,6 +2,7 @@
 members = [
     "crates/vigil-cli",
     "crates/vigil-core",
+    "crates/vigil-plugin",
     "crates/vigil-proxy",
     "crates/vigil-mcp",
     "crates/vigil-tui",

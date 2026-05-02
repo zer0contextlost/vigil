@@ -53,13 +53,13 @@ vigil run --plugin ./my-plugin.dll -- claude
 vigil run --plugin ./a.dll --plugin ./b.dll -- claude
 ```
 
-### Compatibility note
+### Compatibility
 
-Plugin and host must be compiled with the same Rust toolchain and `vigil-core` version. The `dyn VigilPlugin` vtable layout is not stable across compiler versions. Pin both to the same `vigil-core` git revision.
+Plugin and host must be compiled with the same Rust toolchain and `vigil-core` version. The `dyn VigilPlugin` vtable layout is not stable across compiler versions. Use `vigil-plugin` (the SDK crate) and the `declare_plugin!` macro — it embeds ABI and rustc version metadata so vigil can detect mismatches before instantiation and give you a clear error instead of undefined behavior.
 
 ## Writing a dynamic plugin
 
-Compile your plugin as a `cdylib` crate and export `vigil_plugin_create`:
+Add `vigil-plugin` as your only vigil dependency — it re-exports everything you need and provides the `declare_plugin!` macro that handles all C-ABI boilerplate.
 
 **`Cargo.toml`**
 
@@ -68,7 +68,7 @@ Compile your plugin as a `cdylib` crate and export `vigil_plugin_create`:
 crate-type = ["cdylib"]
 
 [dependencies]
-vigil-core = { git = "https://github.com/zer0contextlost/vigil" }
+vigil-plugin = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.0" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 ```
@@ -76,8 +76,7 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 **`src/lib.rs`**
 
 ```rust
-use vigil_core::{Envelope, VigilPlugin};
-use serde_json::Value;
+use vigil_plugin::{declare_plugin, Envelope, Value, VigilPlugin};
 
 struct SlackNotifier {
     webhook_url: String,
@@ -97,18 +96,32 @@ impl VigilPlugin for SlackNotifier {
     }
 }
 
-/// vigil calls this function to create your plugin.
-/// Return a heap-allocated Box<dyn VigilPlugin> wrapped in another Box.
-#[no_mangle]
-pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin> {
-    let plugin: Box<dyn VigilPlugin> = Box::new(SlackNotifier {
-        webhook_url: std::env::var("SLACK_WEBHOOK").unwrap_or_default(),
-    });
-    Box::into_raw(Box::new(plugin))
-}
+declare_plugin!(SlackNotifier {
+    webhook_url: std::env::var("SLACK_WEBHOOK").unwrap_or_default(),
+});
 ```
 
 Build with `cargo build --release` and copy the resulting `.dll`/`.so`/`.dylib` to `~/.vigil/plugins/`.
+
+`declare_plugin!` generates three C-ABI exports that vigil checks before instantiation:
+
+- `vigil_plugin_create` — constructs your plugin
+- `vigil_plugin_abi_version` — returns the ABI version the plugin was built against
+- `vigil_plugin_rustc_version` — returns the rustc version string baked in at compile time
+
+If the ABI or rustc version doesn't match the running vigil binary, load is refused with a message like:
+
+```
+ABI mismatch loading my-plugin.dll: plugin ABI v1, host ABI v2.
+Rebuild your plugin against vigil-plugin v0.3.0.
+```
+
+or:
+
+```
+rustc mismatch loading my-plugin.dll: plugin built with rustc 1.83.0, host built with rustc 1.84.0.
+Rebuild both with the same toolchain.
+```
 
 ## Writing an in-process plugin (wrapper binary)
 
@@ -118,8 +131,8 @@ For tighter integration — custom CLI flags, combining with your own config —
 
 ```toml
 [dependencies]
-vigil-core = { git = "https://github.com/zer0contextlost/vigil" }
-vigil-cli  = { git = "https://github.com/zer0contextlost/vigil", package = "vigil" }
+vigil-core = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.0" }
+vigil-cli  = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.0", package = "vigil" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -155,7 +168,7 @@ async fn main() -> anyhow::Result<()> {
 ## Example: structured NDJSON logger
 
 ```rust
-use vigil_core::{Envelope, VigilPlugin};
+use vigil_plugin::{declare_plugin, Envelope, VigilPlugin};
 use std::sync::Mutex;
 
 pub struct NdjsonLogger {
@@ -180,9 +193,29 @@ impl VigilPlugin for NdjsonLogger {
     }
 }
 
+declare_plugin!(NdjsonLogger::new("/tmp/vigil-extra.ndjson"));
+```
+
+## Low-level FFI (advanced)
+
+If you can't use `vigil-plugin` (e.g. you're writing bindings for another language), you must export these three C symbols manually:
+
+```rust
 #[no_mangle]
 pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin> {
-    let plugin: Box<dyn VigilPlugin> = Box::new(NdjsonLogger::new("/tmp/vigil-extra.ndjson"));
+    let plugin: Box<dyn VigilPlugin> = Box::new(MyPlugin::new());
     Box::into_raw(Box::new(plugin))
 }
+
+#[no_mangle]
+pub extern "C" fn vigil_plugin_abi_version() -> u32 {
+    1  // must match vigil_core::ABI_VERSION
+}
+
+#[no_mangle]
+pub extern "C" fn vigil_plugin_rustc_version() -> *const std::os::raw::c_char {
+    b"rustc 1.XX.0 (HASH DATE)\0".as_ptr() as *const _
+}
 ```
+
+If `vigil_plugin_abi_version` or `vigil_plugin_rustc_version` are absent, vigil skips those checks and attempts to load anyway (backward compatibility with plugins built before v0.2.0).
