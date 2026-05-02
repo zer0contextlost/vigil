@@ -65,9 +65,9 @@ impl BudgetEnforcer {
         };
 
         if start <= end {
-            current_minutes >= start && current_minutes < end
+            current_minutes >= start && current_minutes <= end
         } else {
-            current_minutes >= start || current_minutes < end
+            current_minutes >= start || current_minutes <= end
         }
     }
 }
