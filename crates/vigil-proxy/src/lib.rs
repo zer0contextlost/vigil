@@ -501,6 +501,7 @@ struct SseState {
     block_name: HashMap<usize, String>,
     block_input: HashMap<usize, String>,
     response_text: String,
+    response_text_bytes: usize,
     /// True when we are buffering a Write/Edit block for potential approval.
     holding: bool,
     /// Which block index triggered the hold.
@@ -833,7 +834,11 @@ fn process_sse_event(
                     }
                 } else if delta_type == "text_delta" {
                     if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                        state.response_text.push_str(text);
+                        const MAX_RESPONSE_TEXT: usize = 1024 * 1024; // 1 MB cap
+                        if state.response_text_bytes + text.len() <= MAX_RESPONSE_TEXT {
+                            state.response_text.push_str(text);
+                            state.response_text_bytes += text.len();
+                        }
                     }
                 }
             }
@@ -900,7 +905,11 @@ fn process_openai_sse_event(
         .and_then(|delta| delta.get("content"))
         .and_then(|c| c.as_str())
     {
-        state.response_text.push_str(content);
+        const MAX_RESPONSE_TEXT: usize = 1024 * 1024;
+        if state.response_text_bytes + content.len() <= MAX_RESPONSE_TEXT {
+            state.response_text.push_str(content);
+            state.response_text_bytes += content.len();
+        }
     }
 
     if let Some(choices) = event_json.get("choices").and_then(|c| c.as_array()) {
