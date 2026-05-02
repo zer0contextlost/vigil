@@ -31,5 +31,5 @@ pub use provider::{ProviderKind, cost_usd, detect_provider_from_host};
 pub use scanner::{RegexScanner, Scanner, ScannerChain, WatchlistScanner};
 pub use session::{Session, SessionSummary};
 pub use notify::WebhookNotifier;
-pub use plugin::{PluginHost, VigilPlugin};
+pub use plugin::{PluginContext, PluginDecision, PluginHost, VigilPlugin};
 pub use store::{sessions_dir, SessionMeta, SessionStore};

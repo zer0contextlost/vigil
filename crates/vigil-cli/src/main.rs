@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost};
+use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost, PluginContext, PluginDecision};
 use vigil_proxy::Proxy;
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
@@ -1070,8 +1070,9 @@ pub async fn run_agent_with_plugins(
                             session_id: sid,
                         });
                         let detail = serde_json::json!({"tool_name": tool_name, "elapsed_secs": secs});
-                        plugin_host_tout.dispatch_alert("TOUT", &sid.to_string(), &detail);
-                        plugin_host_tout.dispatch_event(&ev);
+                        let ctx = make_plugin_ctx(sid);
+                        plugin_host_tout.dispatch_alert(&ctx, "TOUT", &detail);
+                        plugin_host_tout.dispatch_event(&ctx, &ev);
                         tx.send(ev).await.ok();
                         eprintln!("[TIMEOUT] Tool '{}' has been running {}s with no response", tool_name, secs);
                     }
@@ -1108,8 +1109,9 @@ pub async fn run_agent_with_plugins(
             if let Some(ref n) = notifier {
                 n.send("DURA", &sid.to_string(), detail.clone());
             }
-            plugin_host_dura.dispatch_alert("DURA", &sid.to_string(), &detail);
-            plugin_host_dura.dispatch_event(&ev);
+            let ctx = make_plugin_ctx(sid);
+            plugin_host_dura.dispatch_alert(&ctx, "DURA", &detail);
+            plugin_host_dura.dispatch_event(&ctx, &ev);
             tx.send(ev).await.ok();
             eprintln!("[DURATION] Session has been running {}min", duration_mins);
         });
@@ -1176,8 +1178,9 @@ pub async fn run_agent_with_plugins(
                             if let Some(ref n) = notifier_filter {
                                 n.send("EXFL", &sid.to_string(), detail.clone());
                             }
-                            plugin_host_filter.dispatch_alert("EXFL", &sid.to_string(), &detail);
-                            plugin_host_filter.dispatch_event(&alert);
+                            let ctx = make_plugin_ctx(*sid);
+                            plugin_host_filter.dispatch_alert(&ctx, "EXFL", &detail);
+                            plugin_host_filter.dispatch_event(&ctx, &alert);
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -1201,8 +1204,9 @@ pub async fn run_agent_with_plugins(
                             if let Some(ref n) = notifier_filter {
                                 n.send("EXFL", &sid.to_string(), detail.clone());
                             }
-                            plugin_host_filter.dispatch_alert("EXFL", &sid.to_string(), &detail);
-                            plugin_host_filter.dispatch_event(&alert);
+                            let ctx = make_plugin_ctx(*sid);
+                            plugin_host_filter.dispatch_alert(&ctx, "EXFL", &detail);
+                            plugin_host_filter.dispatch_event(&ctx, &alert);
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -1235,8 +1239,9 @@ pub async fn run_agent_with_plugins(
                         if let Some(ref n) = notifier_filter {
                             n.send("COST", &session_id_for_alerts.to_string(), detail.clone());
                         }
-                        plugin_host_filter.dispatch_alert("COST", &session_id_for_alerts.to_string(), &detail);
-                        plugin_host_filter.dispatch_event(&alert);
+                        let ctx = make_plugin_ctx(session_id_for_alerts);
+                        plugin_host_filter.dispatch_alert(&ctx, "COST", &detail);
+                        plugin_host_filter.dispatch_event(&ctx, &alert);
                         filtered_tx.send(alert).await.ok();
                         eprintln!("[COST] Session cost ${:.4} crossed alert threshold ${:.4}", session_cost, threshold);
                     }
@@ -1257,8 +1262,9 @@ pub async fn run_agent_with_plugins(
                         if let Some(ref n) = notifier_filter {
                             n.send("BURN", &session_id_for_alerts.to_string(), detail.clone());
                         }
-                        plugin_host_filter.dispatch_alert("BURN", &session_id_for_alerts.to_string(), &detail);
-                        plugin_host_filter.dispatch_event(&alert);
+                        let ctx = make_plugin_ctx(session_id_for_alerts);
+                        plugin_host_filter.dispatch_alert(&ctx, "BURN", &detail);
+                        plugin_host_filter.dispatch_event(&ctx, &alert);
                         filtered_tx.send(alert).await.ok();
                         if let Some(ref path) = lock_path {
                             vigil_core::update_active(path, |s| {
@@ -1283,8 +1289,9 @@ pub async fn run_agent_with_plugins(
                     if let Some(ref n) = notifier_filter {
                         n.send("LOOP", &sid.to_string(), detail.clone());
                     }
-                    plugin_host_filter.dispatch_alert("LOOP", &sid.to_string(), &detail);
-                    plugin_host_filter.dispatch_event(&alert);
+                    let ctx = make_plugin_ctx(*sid);
+                    plugin_host_filter.dispatch_alert(&ctx, "LOOP", &detail);
+                    plugin_host_filter.dispatch_event(&ctx, &alert);
                     filtered_tx.send(alert).await.ok();
                     if let Some(ref path) = lock_path {
                         vigil_core::update_active(path, |s| {
@@ -1359,19 +1366,48 @@ pub async fn run_agent_with_plugins(
                         if let Some(ref n) = notifier_filter {
                             n.send("DENY", &session_id.to_string(), detail.clone());
                         }
-                        plugin_host_filter.dispatch_alert("DENY", &session_id.to_string(), &detail);
+                        let ctx = make_plugin_ctx(*session_id);
+                        plugin_host_filter.dispatch_alert(&ctx, "DENY", &detail);
                         let blocked = TimestampedEvent::new(Event::ToolCallResult {
                             agent: agent.clone(),
                             tool_name: tool_name.clone(),
                             blocked: true,
                             session_id: *session_id,
                         });
-                        plugin_host_filter.dispatch_event(&blocked);
+                        plugin_host_filter.dispatch_event(&ctx, &blocked);
                         filtered_tx.send(blocked).await.ok();
                     }
                 }
                 _ => {
-                    plugin_host_filter.dispatch_event(&event);
+                    // After policy allows, consult plugins for tool calls.
+                    if let Event::ToolCall { tool_name, input, agent, session_id, .. } = &event.event {
+                        let ctx = make_plugin_ctx(*session_id);
+                        if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input) {
+                            eprintln!("[PLUGIN DENY] {} — {}", tool_name, reason);
+                            let detail = serde_json::json!({
+                                "tool_name": tool_name,
+                                "policy": "plugin",
+                                "reason": reason,
+                            });
+                            if let Some(ref n) = notifier_filter {
+                                n.send("DENY", &session_id.to_string(), detail.clone());
+                            }
+                            plugin_host_filter.dispatch_alert(&ctx, "DENY", &detail);
+                            let blocked = TimestampedEvent::new(Event::ToolCallResult {
+                                agent: agent.clone(),
+                                tool_name: tool_name.clone(),
+                                blocked: true,
+                                session_id: *session_id,
+                            });
+                            plugin_host_filter.dispatch_event(&ctx, &blocked);
+                            filtered_tx.send(blocked).await.ok();
+                            continue;
+                        }
+                        plugin_host_filter.dispatch_event(&ctx, &event);
+                    } else {
+                        let ctx = make_plugin_ctx(session_id_for_alerts);
+                        plugin_host_filter.dispatch_event(&ctx, &event);
+                    }
                     filtered_tx.send(event).await.ok();
                 }
             }
@@ -1644,6 +1680,14 @@ fn plugins_dir() -> anyhow::Result<PathBuf> {
         std::env::var("HOME").ok()
     }.ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
     Ok(PathBuf::from(home).join(".vigil").join("plugins"))
+}
+
+fn make_plugin_ctx(session_id: uuid::Uuid) -> PluginContext {
+    PluginContext {
+        session_id,
+        config_dir: plugins_dir().unwrap_or_default(),
+        host_version: env!("CARGO_PKG_VERSION"),
+    }
 }
 
 fn load_plugins_from_dir(dir: &PathBuf, host: &mut PluginHost) {
