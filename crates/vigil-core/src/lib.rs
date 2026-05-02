@@ -1,3 +1,4 @@
+pub mod active;
 pub mod budget;
 pub mod burn_rate;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod scanner;
 pub mod session;
 pub mod store;
 
+pub use active::{ActiveSession, ActiveSessionHandle, create_handle, list_active, update_active};
 pub use budget::{BudgetEnforcer, BudgetStatus};
 pub use burn_rate::{BurnRateTracker, LoopDetector};
 pub use config::VigilConfig;
