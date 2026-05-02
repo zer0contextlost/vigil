@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
-use vigil_core::event::{Event, TimestampedEvent};
+use vigil_core::{Event, TimestampedEvent};
 
 pub struct WatchConfig {
     pub watch_path: PathBuf,
