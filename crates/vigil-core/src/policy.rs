@@ -129,8 +129,13 @@ impl PolicyEngine {
                     ))?);
                 }
                 PolicyMatcher::ToolCallInput {
+                    tool_name_pattern,
                     value_pattern, ..
                 } => {
+                    patterns.tool_name_regex = Some(Regex::new(&format!(
+                        "(?i){}",
+                        regex::escape(tool_name_pattern)
+                    ))?);
                     patterns.input_field_regex = Some(Regex::new(&format!(
                         "(?i){}",
                         regex::escape(value_pattern)
@@ -146,6 +151,10 @@ impl PolicyEngine {
             config,
             compiled_patterns,
         })
+    }
+
+    pub fn policy_count(&self) -> usize {
+        self.config.policies.len()
     }
 
     /// Load a policy engine from a YAML file.

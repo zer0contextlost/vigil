@@ -670,8 +670,9 @@ async fn run_agent(
     };
     let engine = Arc::new(engine);
 
-    let observational_only = config.is_none()
-        || config.as_ref().map(|c| c.proxy.blocked_commands.is_empty() && c.policies.is_empty()).unwrap_or(true);
+    // Warn when no enforcement is active. Check the compiled policy count rather
+    // than the raw config lists so defaults (blocked_commands) are counted too.
+    let observational_only = config.is_none() || engine.policy_count() == 0;
 
     let budget_enforcer = config.as_ref().map(|c| BudgetEnforcer::new(c.budget.clone()));
     let burn_rate_limit = config.as_ref().and_then(|c| c.budget.max_burn_rate_usd_per_min);
@@ -682,7 +683,7 @@ async fn run_agent(
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
 
-    println!("vigil v0.1.0");
+    println!("vigil v{}", env!("CARGO_PKG_VERSION"));
     println!("Session ID: {}", session_id);
     println!("Agent: {}", agent_name);
     if let Some(lf) = log_file {
