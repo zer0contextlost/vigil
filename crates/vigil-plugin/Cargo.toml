@@ -9,6 +9,7 @@ description = "Plugin SDK for vigil — implement VigilPlugin and export it with
 [dependencies]
 vigil-core = { path = "../vigil-core" }
 serde_json = "1.0"
+async-trait = "0.1"
 
 [build-dependencies]
 # nothing — build.rs just shells out to rustc

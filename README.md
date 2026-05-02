@@ -224,6 +224,32 @@ vigil plugins dir    # print the auto-load directory path
 vigil run --plugin ./extra.dll -- claude   # load a specific plugin once
 ```
 
+Plugins implement the `VigilPlugin` trait from the `vigil-plugin` SDK crate:
+
+```rust
+use vigil_plugin::{async_trait, declare_plugin, AlertLabel, Envelope, PluginContext, PluginDecision, Value, VigilPlugin};
+
+struct MyPlugin;
+
+#[async_trait]
+impl VigilPlugin for MyPlugin {
+    fn name(&self) -> &str { "my-plugin" }
+
+    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {
+        // fires on BURN, LOOP, EXFL, DENY, COST, DURA, TOUT, WAPPR, PII
+        // use label.code() to get the short string, e.g. "BURN"
+    }
+
+    async fn on_tool_call(&self, _ctx: &PluginContext, tool_name: &str, _input: &Value) -> PluginDecision {
+        // called after policy allows — return Deny to block
+        PluginDecision::Allow
+    }
+}
+declare_plugin!(MyPlugin);
+```
+
+A ready-to-use `alert-logger` plugin ships in `plugins/alert-logger/`. It writes every alert to `~/.vigil/alerts.ndjson` and can block tool calls by name via `VIGIL_BLOCK_TOOLS=Bash,WebSearch`.
+
 ## Session integrity
 
 Every envelope is SHA-256 chained. On clean exit the chain-root hash is signed with a per-session ed25519 key and stored in the `.meta.json` sidecar.

@@ -11,17 +11,19 @@
 ///
 /// Then implement [`VigilPlugin`] and export it with [`declare_plugin!`]:
 /// ```ignore
-/// use vigil_plugin::{declare_plugin, PluginContext, PluginDecision, VigilPlugin, Envelope, Value};
+/// use vigil_plugin::{async_trait, declare_plugin, AlertLabel, PluginContext, PluginDecision, VigilPlugin, Envelope, Value};
 ///
 /// struct MyPlugin;
+///
+/// #[async_trait]
 /// impl VigilPlugin for MyPlugin {
 ///     fn name(&self) -> &str { "my-plugin" }
 ///
-///     fn on_alert(&self, ctx: &PluginContext, label: &str, detail: &Value) {
+///     async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {
 ///         eprintln!("[{}] session={} {}", label, ctx.session_id, detail);
 ///     }
 ///
-///     fn on_tool_call(&self, _ctx: &PluginContext, tool_name: &str, _input: &Value) -> PluginDecision {
+///     async fn on_tool_call(&self, _ctx: &PluginContext, tool_name: &str, _input: &Value) -> PluginDecision {
 ///         if tool_name == "Bash" {
 ///             PluginDecision::Deny("blocked by my-plugin".into())
 ///         } else {
@@ -32,12 +34,13 @@
 /// declare_plugin!(MyPlugin);
 /// ```
 
-pub use vigil_core::{Envelope, PluginContext, PluginDecision, VigilPlugin};
+pub use vigil_core::{alert, AlertDetail, AlertLabel, Envelope, PluginContext, PluginDecision, VigilPlugin};
 pub use serde_json::Value;
+pub use async_trait::async_trait;
 
 /// ABI version. Bumped whenever `VigilPlugin`, `PluginContext`, `PluginDecision`,
-/// `Envelope`, or the FFI contract changes in a breaking way.
-pub const ABI_VERSION: u32 = 2;
+/// `AlertLabel`, `Envelope`, or the FFI contract changes in a breaking way.
+pub const ABI_VERSION: u32 = 3;
 
 /// The rustc version vigil-plugin was compiled with, baked in at build time.
 pub const RUSTC_VERSION: &str = env!("VIGIL_RUSTC_VERSION");

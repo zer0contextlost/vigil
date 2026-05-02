@@ -1,15 +1,35 @@
 # vigil plugin system
 
-vigil exposes a stable Rust trait (`VigilPlugin`) that lets you receive every event and alert from a running session without forking vigil itself.
+vigil exposes a stable Rust trait (`VigilPlugin`) that lets you observe every event, react to every alert, and block tool calls — all without forking vigil itself.
 
 ## How it works
 
-`vigil-core` exports two types:
+`vigil-core` exports the trait, context, and decision types:
 
 ```rust
+pub struct PluginContext {
+    pub session_id: uuid::Uuid,
+    pub config_dir: PathBuf,      // ~/.vigil/plugins/<plugin-name>/
+    pub host_version: &'static str,
+}
+
+pub enum PluginDecision {
+    Allow,
+    Deny(String),   // reason shown to the agent (HTTP 403) and logged as DENY
+}
+
+pub enum AlertLabel {
+    BurnRate, Loop, Exfil, Deny, Cost, Duration, Timeout, WriteApproval, Pii,
+    // label.code() returns the short string, e.g. BurnRate → "BURN"
+}
+
 pub trait VigilPlugin: Send + Sync {
-    fn on_event(&self, envelope: &Envelope) {}
-    fn on_alert(&self, label: &str, session_id: &str, detail: &serde_json::Value) {}
+    fn name(&self) -> &str { "unnamed" }
+    async fn on_event(&self, ctx: &PluginContext, envelope: &Envelope) {}
+    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &serde_json::Value) {}
+    async fn on_tool_call(&self, ctx: &PluginContext, tool_name: &str, input: &serde_json::Value) -> PluginDecision {
+        PluginDecision::Allow
+    }
 }
 
 pub struct PluginHost { … }
@@ -19,7 +39,7 @@ impl PluginHost {
 }
 ```
 
-`PluginHost` fans out to all registered plugins. vigil-cli calls `dispatch_event` for every filtered event and `dispatch_alert` for every alert before forwarding them to the TUI.
+`PluginHost` fans out to all registered plugins. `on_event` and `on_alert` are passive observers. `on_tool_call` is called after the built-in policy engine allows a tool call — the first plugin to return `Deny` blocks it, firing a DENY alert identical to a policy deny.
 
 ## Alert labels
 
@@ -44,6 +64,7 @@ Drop your compiled shared library in `~/.vigil/plugins/`. vigil scans this direc
 ```bash
 vigil plugins dir    # prints the auto-load directory
 vigil plugins list   # shows what's currently in it
+vigil plugins check ./my-plugin.dll  # validate ABI/rustc without loading
 ```
 
 ### Explicit load
@@ -68,7 +89,7 @@ Add `vigil-plugin` as your only vigil dependency — it re-exports everything yo
 crate-type = ["cdylib"]
 
 [dependencies]
-vigil-plugin = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.0" }
+vigil-plugin = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.1" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 ```
@@ -76,16 +97,20 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 **`src/lib.rs`**
 
 ```rust
-use vigil_plugin::{declare_plugin, Envelope, Value, VigilPlugin};
+use vigil_plugin::{async_trait, declare_plugin, AlertLabel, Envelope, PluginContext, PluginDecision, Value, VigilPlugin};
 
 struct SlackNotifier {
     webhook_url: String,
 }
 
+#[async_trait]
 impl VigilPlugin for SlackNotifier {
-    fn on_alert(&self, label: &str, session_id: &str, detail: &Value) {
+    fn name(&self) -> &str { "slack-notifier" }
+
+    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {
         let url = self.webhook_url.clone();
-        let text = format!("[vigil {}] {} — {}", label, &session_id[..8], detail);
+        let sid = ctx.session_id.to_string();
+        let text = format!("[vigil {}] {} — {}", label.code(), &sid[..8], detail);
         tokio::spawn(async move {
             let _ = reqwest::Client::new()
                 .post(&url)
@@ -103,7 +128,7 @@ declare_plugin!(SlackNotifier {
 
 Build with `cargo build --release` and copy the resulting `.dll`/`.so`/`.dylib` to `~/.vigil/plugins/`.
 
-`declare_plugin!` generates three C-ABI exports that vigil checks before instantiation:
+`declare_plugin!` generates three C-ABI exports (exporting ABI version 3) that vigil checks before instantiation:
 
 - `vigil_plugin_create` — constructs your plugin
 - `vigil_plugin_abi_version` — returns the ABI version the plugin was built against
@@ -163,12 +188,12 @@ async fn main() -> anyhow::Result<()> {
 
 ## Threading contract
 
-`on_event` and `on_alert` are called from within an async tokio task. Implementations must not block. Spawn a `tokio::task` or send to a channel you own for any I/O.
+All methods (`on_event`, `on_alert`, `on_tool_call`) are async. Do not block — spawn tasks or send to channels for any I/O.
 
 ## Example: structured NDJSON logger
 
 ```rust
-use vigil_plugin::{declare_plugin, Envelope, VigilPlugin};
+use vigil_plugin::{async_trait, declare_plugin, Envelope, PluginContext, VigilPlugin};
 use std::sync::Mutex;
 
 pub struct NdjsonLogger {
@@ -183,8 +208,11 @@ impl NdjsonLogger {
     }
 }
 
+#[async_trait]
 impl VigilPlugin for NdjsonLogger {
-    fn on_event(&self, envelope: &Envelope) {
+    fn name(&self) -> &str { "ndjson-logger" }
+
+    async fn on_event(&self, _ctx: &PluginContext, envelope: &Envelope) {
         if let Ok(line) = serde_json::to_string(envelope) {
             if let Ok(mut f) = self.file.lock() {
                 let _ = std::io::Write::write_fmt(&mut *f, format_args!("{}\n", line));
@@ -209,7 +237,7 @@ pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin> {
 
 #[no_mangle]
 pub extern "C" fn vigil_plugin_abi_version() -> u32 {
-    1  // must match vigil_core::ABI_VERSION
+    3  // must match vigil_core::ABI_VERSION
 }
 
 #[no_mangle]

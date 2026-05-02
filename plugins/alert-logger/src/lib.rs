@@ -1,14 +1,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::Mutex;
-use vigil_plugin::{declare_plugin, Envelope, PluginContext, PluginDecision, Value, VigilPlugin};
+use vigil_plugin::{async_trait, declare_plugin, AlertLabel, Envelope, PluginContext, PluginDecision, Value, VigilPlugin};
 
 /// Writes every alert to a NDJSON log file and optionally blocks tool calls
 /// whose names match patterns listed in VIGIL_BLOCK_TOOLS (comma-separated).
 ///
 /// Configuration via environment variables (read at startup):
-///   VIGIL_ALERT_LOG   — path to log file (default: ~/.vigil/alerts.ndjson)
-///   VIGIL_BLOCK_TOOLS — comma-separated tool name substrings to deny
+///   VIGIL_ALERT_LOG   - path to log file (default: ~/.vigil/alerts.ndjson)
+///   VIGIL_BLOCK_TOOLS - comma-separated tool name substrings to deny
 ///                       e.g. "Bash,WebSearch"
 pub struct AlertLogger {
     file: Mutex<File>,
@@ -52,26 +52,24 @@ impl AlertLogger {
     }
 }
 
+#[async_trait]
 impl VigilPlugin for AlertLogger {
     fn name(&self) -> &str { "alert-logger" }
 
-    fn on_alert(&self, ctx: &PluginContext, label: &str, detail: &Value) {
+    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {
         let record = serde_json::json!({
             "ts": chrono::Utc::now().to_rfc3339(),
             "type": "alert",
-            "label": label,
+            "label": label.code(),
             "session_id": ctx.session_id,
             "detail": detail,
         });
         self.write_line(&record);
     }
 
-    fn on_event(&self, _ctx: &PluginContext, _envelope: &Envelope) {
-        // Intentionally left as no-op — alerts are the interesting signal.
-        // Override this if you want every event logged.
-    }
+    async fn on_event(&self, _ctx: &PluginContext, _envelope: &Envelope) {}
 
-    fn on_tool_call(&self, _ctx: &PluginContext, tool_name: &str, _input: &Value) -> PluginDecision {
+    async fn on_tool_call(&self, _ctx: &PluginContext, tool_name: &str, _input: &Value) -> PluginDecision {
         if self.block_patterns.is_empty() {
             return PluginDecision::Allow;
         }
