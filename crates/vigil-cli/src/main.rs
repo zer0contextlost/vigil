@@ -164,6 +164,37 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         agent_and_args: Vec<String>,
     },
+
+    /// Start the proxy and TUI without spawning an agent (for Cursor, IDEs, etc.)
+    Proxy {
+        /// Port for the proxy
+        #[arg(long, default_value = "8877")]
+        port: u16,
+
+        /// Policy configuration file
+        #[arg(long)]
+        policy: Option<PathBuf>,
+
+        /// vigil.toml configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Write debug log to this file
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+
+        /// File containing personal watchlist terms for PII detection (one per line)
+        #[arg(long)]
+        pii_watchlist: Option<PathBuf>,
+
+        /// Shared library plugin(s) to load. May be repeated.
+        #[arg(long = "plugin")]
+        plugins: Vec<PathBuf>,
+
+        /// Human-readable label for this session
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -515,6 +546,23 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Fork { session_id, prefix_events, agent_and_args }) => {
             run_fork(&session_id, prefix_events, agent_and_args).await?;
+        }
+        Some(Commands::Proxy { port, policy, config, log_file, pii_watchlist, plugins, name }) => {
+            let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
+            let config_path_str = config.as_deref().map(|p| p.display().to_string());
+            let vigil_config = config.as_deref()
+                .and_then(|p| vigil_core::VigilConfig::load(p).ok());
+            let mut plugin_host = PluginHost::new();
+            if let Ok(dir) = plugins_dir() {
+                load_plugins_from_dir(&dir, &mut plugin_host);
+            }
+            for path in &plugins {
+                match plugin_host.load_from_file(path) {
+                    Ok(()) => println!("Loaded plugin: {}", path.display()),
+                    Err(e) => eprintln!("Warning: {}", e),
+                }
+            }
+            run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name).await?;
         }
         Some(Commands::Replay { session_id }) => {
             let uuid = uuid::Uuid::parse_str(&session_id)
@@ -926,6 +974,166 @@ async fn run_agent(
     config_path: Option<String>,
 ) -> Result<()> {
     run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None).await
+}
+
+/// Start the proxy and TUI without spawning an agent process.
+/// Use this with IDEs (Cursor, etc.) that connect to vigil via their own
+/// "Override Base URL" setting rather than being launched by vigil.
+pub async fn run_proxy_mode(
+    port: u16,
+    policy: Option<PathBuf>,
+    log_file: Option<&PathBuf>,
+    pii_watchlist: Vec<String>,
+    config: Option<vigil_core::VigilConfig>,
+    config_path: Option<String>,
+    plugins: PluginHost,
+    session_name: Option<String>,
+) -> Result<()> {
+    init_logging(log_file);
+
+    let label = session_name.clone().unwrap_or_else(|| "proxy".to_string());
+    let session = Session::new(label.clone());
+    let session_id = session.id;
+    let mut store = SessionStore::create(session_id, &label).ok();
+    if let Some(ref n) = session_name {
+        if let Some(ref mut s) = store { s.set_name(n.as_str()); }
+    }
+
+    let engine = if let Some(policy_path) = &policy {
+        PolicyEngine::from_file(policy_path)?
+    } else if let Some(cfg) = &config {
+        let policies = cfg.to_policies();
+        if policies.is_empty() { PolicyEngine::default() }
+        else { PolicyEngine::new(vigil_core::PolicyConfig { policies })? }
+    } else {
+        PolicyEngine::default()
+    };
+    let engine = Arc::new(engine);
+
+    let plugin_host = Arc::new(plugins);
+    let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
+    let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
+
+    let write_approval_threshold = config.as_ref()
+        .and_then(|c| c.proxy.write_approval_threshold.as_deref())
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "low" => Some(vigil_core::RiskLevel::Low),
+            "medium" => Some(vigil_core::RiskLevel::Medium),
+            "high" => Some(vigil_core::RiskLevel::High),
+            _ => None,
+        });
+
+    let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel::<(uuid::Uuid, bool)>(32);
+
+    let proxy_config = vigil_proxy::ProxyConfig {
+        port,
+        ca_cert_path: None,
+        upstream_override: None,
+        pii_watchlist,
+        write_approval_threshold,
+    };
+    let proxy = vigil_proxy::Proxy::new(proxy_config, raw_tx.clone());
+    let pending_approvals_for_resolver = proxy.pending_approvals.clone();
+    let proxy_handle = tokio::spawn(async move {
+        if let Err(e) = proxy.run().await {
+            tracing::error!(err = %e, "proxy error");
+        }
+    });
+
+    let resolver_handle = tokio::spawn(async move {
+        while let Some((approval_id, approved)) = decision_rx.recv().await {
+            let tx = { pending_approvals_for_resolver.lock().unwrap().remove(&approval_id) };
+            if let Some(tx) = tx { let _ = tx.send(approved); }
+        }
+    });
+
+    println!("vigil v{} — proxy mode", env!("CARGO_PKG_VERSION"));
+    println!("Session ID: {}", session_id);
+    println!("Proxy listening on http://127.0.0.1:{}", port);
+    println!();
+    println!("Point your agent or IDE at this proxy:");
+    println!("  Anthropic: ANTHROPIC_BASE_URL=http://127.0.0.1:{}", port);
+    println!("  OpenAI:    OPENAI_BASE_URL=http://127.0.0.1:{}", port);
+    println!("  Cursor:    Settings > Models > Override OpenAI Base URL = http://127.0.0.1:{}/v1", port);
+    println!();
+    println!("Press 'q' in the dashboard to stop.");
+    println!();
+
+    let loop_threshold = config.as_ref().and_then(|c| c.budget.loop_detect_threshold).unwrap_or(5);
+    let plugin_host_filter = plugin_host.clone();
+    let engine_clone = engine.clone();
+    let filter_handle = tokio::spawn(async move {
+        let mut loop_detector = LoopDetector::new(loop_threshold);
+        let mut cred_tracker = CredentialTracker::new();
+        while let Some(event) = raw_rx.recv().await {
+            if let Event::FsRead { path, .. } = &event.event {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    cred_tracker.ingest_file(&content, path);
+                }
+            }
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                if let Some(count) = loop_detector.check(tool_name, &input_str) {
+                    let detail = serde_json::json!({"tool_name": tool_name, "repeat_count": count});
+                    let alert = TimestampedEvent::new(Event::LoopAlert {
+                        tool_name: tool_name.clone(), repeat_count: count, session_id: *sid,
+                    });
+                    let ctx = make_plugin_ctx(*sid);
+                    plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Loop, &detail).await;
+                    plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                    filtered_tx.send(alert).await.ok();
+                }
+            }
+            let decision = engine_clone.evaluate(&event.event, 0);
+            match decision.action {
+                vigil_core::PolicyAction::Deny => {
+                    if let Event::ToolCall { agent, tool_name, session_id, .. } = &event.event {
+                        let detail = serde_json::json!({"tool_name": tool_name, "policy": decision.policy_name, "reason": decision.reason});
+                        let ctx = make_plugin_ctx(*session_id);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
+                        let blocked = TimestampedEvent::new(Event::ToolCallResult {
+                            agent: agent.clone(), tool_name: tool_name.clone(),
+                            blocked: true, session_id: *session_id,
+                        });
+                        plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        filtered_tx.send(blocked).await.ok();
+                    }
+                }
+                _ => {
+                    if let Event::ToolCall { tool_name, input, agent, session_id, .. } = &event.event {
+                        let ctx = make_plugin_ctx(*session_id);
+                        if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input).await {
+                            let detail = serde_json::json!({"tool_name": tool_name, "policy": "plugin", "reason": reason});
+                            plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
+                            let blocked = TimestampedEvent::new(Event::ToolCallResult {
+                                agent: agent.clone(), tool_name: tool_name.clone(),
+                                blocked: true, session_id: *session_id,
+                            });
+                            plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                            filtered_tx.send(blocked).await.ok();
+                            continue;
+                        }
+                        plugin_host_filter.dispatch_event(&ctx, &event).await;
+                    } else {
+                        let ctx = make_plugin_ctx(session_id);
+                        plugin_host_filter.dispatch_event(&ctx, &event).await;
+                    }
+                    filtered_tx.send(event).await.ok();
+                }
+            }
+        }
+    });
+
+    let mut app = App::new(session);
+    app.store = store;
+    app.config_path = config_path;
+    app.decision_tx = Some(decision_tx);
+    vigil_tui::run_tui(app, filtered_rx).await?;
+
+    proxy_handle.abort();
+    filter_handle.abort();
+    resolver_handle.abort();
+    Ok(())
 }
 
 pub async fn run_agent_with_plugins(
