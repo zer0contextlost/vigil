@@ -27,3 +27,7 @@ test_output/
 # Generated / runtime files
 *.log
 .agent-sentinel.yaml
+
+# Local Claude Code config and session handoff docs
+.claude/
+HANDOFF.md
