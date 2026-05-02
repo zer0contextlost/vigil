@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod config;
 pub mod envelope;
 pub mod event;
@@ -8,6 +9,7 @@ pub mod scanner;
 pub mod session;
 pub mod store;
 
+pub use budget::{BudgetEnforcer, BudgetStatus};
 pub use config::VigilConfig;
 pub use envelope::{Envelope, TimestampedEvent, SCHEMA_VERSION};
 pub use event::Event;

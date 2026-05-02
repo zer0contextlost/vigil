@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, Event, PolicyEngine, TimestampedEvent};
+use vigil_core::{session::Session, store::SessionStore, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus};
 use vigil_proxy::Proxy;
 use vigil_tui::App;
 use vigil_watch::{WatchConfig, Watcher};
@@ -26,6 +26,10 @@ enum Commands {
         /// Policy configuration file
         #[arg(long)]
         policy: Option<PathBuf>,
+
+        /// vigil.toml configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
 
         /// Write debug log to this file (tail -f <file> to watch in another terminal)
         #[arg(long)]
@@ -268,12 +272,15 @@ async fn main() -> Result<()> {
         Some(Commands::Run {
             port,
             policy,
+            config,
             log_file,
             pii_watchlist,
             agent_and_args,
         }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
-            run_agent(port, policy, log_file.as_ref(), agent_and_args, watchlist).await?;
+            let vigil_config = config.as_deref()
+                .and_then(|p| vigil_core::VigilConfig::load(p).ok());
+            run_agent(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config).await?;
         }
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
@@ -340,7 +347,7 @@ async fn run_interactive() -> Result<()> {
         return Ok(());
     }
     let watchlist = load_pii_watchlist(None);
-    run_agent(8877, None, None, args, watchlist).await
+    run_agent(8877, None, None, args, watchlist, None).await
 }
 
 /// Load PII watchlist terms: explicit file path first, then auto-load ~/.vigil/watchlist.txt.
@@ -399,6 +406,7 @@ async fn run_agent(
     log_file: Option<&PathBuf>,
     agent_and_args: Vec<String>,
     pii_watchlist: Vec<String>,
+    config: Option<vigil_core::VigilConfig>,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -417,6 +425,8 @@ async fn run_agent(
         PolicyEngine::default()
     };
     let engine = Arc::new(engine);
+
+    let budget_enforcer = config.as_ref().map(|c| BudgetEnforcer::new(c.budget.clone()));
 
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
@@ -498,9 +508,36 @@ async fn run_agent(
     let engine_clone = engine.clone();
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
+        let mut session_cost = 0f64;
         while let Some(event) = raw_rx.recv().await {
             if let Event::LlmRequest { input_tokens, .. } = &event.event {
                 session_tokens += input_tokens;
+            }
+
+            if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {
+                session_tokens += input_tokens + output_tokens;
+                session_cost += cost_usd;
+            }
+
+            if let Some(ref enforcer) = budget_enforcer {
+                match enforcer.check(session_cost, session_tokens) {
+                    BudgetStatus::Ok => {}
+                    BudgetStatus::CostExceeded { limit, actual } => {
+                        tracing::warn!(limit, actual, "budget: cost limit exceeded");
+                        eprintln!("[BUDGET] Cost limit ${:.4} exceeded (actual ${:.4}) — stopping", limit, actual);
+                        break;
+                    }
+                    BudgetStatus::TokensExceeded { limit, actual } => {
+                        tracing::warn!(limit, actual, "budget: token limit exceeded");
+                        eprintln!("[BUDGET] Token limit {} exceeded (actual {}) — stopping", limit, actual);
+                        break;
+                    }
+                    BudgetStatus::OutsideAllowedHours { window } => {
+                        tracing::warn!(%window, "budget: outside allowed hours");
+                        eprintln!("[BUDGET] Outside allowed hours {} — stopping", window);
+                        break;
+                    }
+                }
             }
 
             let decision = engine_clone.evaluate(&event.event, session_tokens);
