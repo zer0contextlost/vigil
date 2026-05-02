@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector};
+use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector};
 use vigil_proxy::Proxy;
 use vigil_tui::App;
 use vigil_watch::{WatchConfig, Watcher};
@@ -684,9 +684,56 @@ async fn run_agent(
         let mut session_cost = 0f64;
         let mut burn_tracker = BurnRateTracker::new();
         let mut loop_detector = LoopDetector::new(loop_threshold);
+        let mut cred_tracker = CredentialTracker::new();
         while let Some(event) = raw_rx.recv().await {
             if let Event::LlmRequest { input_tokens, .. } = &event.event {
                 session_tokens += input_tokens;
+            }
+
+            // Credential exfiltration detection — ingest file reads
+            if let Event::FsRead { path, .. } = &event.event {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    cred_tracker.ingest_file(&content, path);
+                }
+            }
+
+            // Credential exfiltration detection — check LLM prompts
+            if let Event::LlmRequest { last_user_message, system_prompt, session_id: sid, .. } = &event.event {
+                if !cred_tracker.is_empty() {
+                    let mut combined = String::new();
+                    if let Some(msg) = last_user_message { combined.push_str(msg); combined.push('\n'); }
+                    if let Some(sys) = system_prompt { combined.push_str(sys); combined.push('\n'); }
+                    if !combined.is_empty() {
+                        let hits = cred_tracker.check_outbound(&combined);
+                        if !hits.is_empty() {
+                            let alert = TimestampedEvent::new(Event::ExfilAlert {
+                                matches: hits,
+                                source: "llm_request".to_string(),
+                                session_id: *sid,
+                            });
+                            filtered_tx.send(alert).await.ok();
+                        }
+                    }
+                }
+            }
+
+            // Credential exfiltration detection — check shell tool call inputs
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let shell_tools = ["Bash", "bash", "shell", "run_command", "execute"];
+                if shell_tools.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                    if !cred_tracker.is_empty() {
+                        let cmd = input.to_string();
+                        let hits = cred_tracker.check_outbound(&cmd);
+                        if !hits.is_empty() {
+                            let alert = TimestampedEvent::new(Event::ExfilAlert {
+                                matches: hits,
+                                source: tool_name.clone(),
+                                session_id: *sid,
+                            });
+                            filtered_tx.send(alert).await.ok();
+                        }
+                    }
+                }
             }
 
             if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {

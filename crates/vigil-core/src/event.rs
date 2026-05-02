@@ -108,4 +108,13 @@ pub enum Event {
         approved: bool,
         session_id: Uuid,
     },
+    /// Emitted when a credential fingerprinted from a file read is detected in an
+    /// outbound LLM request or shell tool call.
+    ExfilAlert {
+        /// Partially-redacted matched credential snippets (e.g. "sk-a***")
+        matches: Vec<String>,
+        /// "llm_request" or the tool name (e.g. "Bash")
+        source: String,
+        session_id: Uuid,
+    },
 }
