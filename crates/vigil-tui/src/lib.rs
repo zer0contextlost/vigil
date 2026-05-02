@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use serde_json;
@@ -1093,4 +1093,195 @@ async fn run_app<B: Backend>(
     }
 
     Ok(())
+}
+
+// ─── Session browser ─────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum BrowseAction {
+    Replay(uuid::Uuid),
+    Delete(uuid::Uuid),
+    Quit,
+}
+
+struct BrowserState {
+    sessions: Vec<vigil_core::session::SessionSummary>,
+    list_state: ListState,
+}
+
+impl BrowserState {
+    fn new(sessions: Vec<vigil_core::session::SessionSummary>) -> Self {
+        let mut list_state = ListState::default();
+        if !sessions.is_empty() {
+            list_state.select(Some(0));
+        }
+        Self { sessions, list_state }
+    }
+
+    fn selected(&self) -> Option<&vigil_core::session::SessionSummary> {
+        self.list_state.selected().and_then(|i| self.sessions.get(i))
+    }
+
+    fn move_up(&mut self) {
+        if self.sessions.is_empty() { return; }
+        let i = self.list_state.selected().unwrap_or(0);
+        self.list_state.select(Some(if i == 0 { self.sessions.len() - 1 } else { i - 1 }));
+    }
+
+    fn move_down(&mut self) {
+        if self.sessions.is_empty() { return; }
+        let i = self.list_state.selected().unwrap_or(0);
+        self.list_state.select(Some((i + 1) % self.sessions.len()));
+    }
+}
+
+pub async fn run_session_browser(
+    sessions: Vec<vigil_core::session::SessionSummary>,
+) -> Result<Option<BrowseAction>> {
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut state = BrowserState::new(sessions);
+    let mut action: Option<BrowseAction> = None;
+
+    loop {
+        terminal.draw(|f| draw_browser(f, &mut state))?;
+
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press { continue; }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        action = Some(BrowseAction::Quit);
+                        break;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => state.move_up(),
+                    KeyCode::Down | KeyCode::Char('j') => state.move_down(),
+                    KeyCode::Enter | KeyCode::Char('r') => {
+                        if let Some(s) = state.selected() {
+                            action = Some(BrowseAction::Replay(s.id));
+                            break;
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if let Some(s) = state.selected() {
+                            action = Some(BrowseAction::Delete(s.id));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(action)
+}
+
+fn draw_browser(frame: &mut Frame, state: &mut BrowserState) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(12), Constraint::Length(1)])
+        .split(area);
+
+    // Session list
+    let items: Vec<ListItem> = state.sessions.iter().map(|s| {
+        let label = s.name.clone().unwrap_or_else(|| s.id.to_string()[..8].to_string());
+        let tokens = s.total_input_tokens + s.total_output_tokens;
+        let _duration = s.ended_at
+            .map(|e| format_dur(e - s.started_at))
+            .unwrap_or_else(|| "running".to_string());
+        let line = format!(
+            " {:<20}  {:<10}  {}  ${:.4}  {:>5}tok  {:>4}ev",
+            truncate_str(&label, 20),
+            truncate_str(&s.agent, 10),
+            s.started_at.format("%Y-%m-%d %H:%M"),
+            s.total_cost_usd,
+            tokens,
+            s.event_count,
+        );
+        ListItem::new(Line::from(Span::raw(line)))
+    }).collect();
+
+    let header = format!(
+        " {:<20}  {:<10}  {:<16}  {:>7}  {:>8}  {:>6}",
+        "NAME / ID", "AGENT", "STARTED", "COST", "TOKENS", "EVENTS"
+    );
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(
+                    format!(" vigil sessions — {} total  |  header: {} ", state.sessions.len(), header),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )),
+        )
+        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .highlight_symbol("▶ ");
+
+    frame.render_stateful_widget(list, chunks[0], &mut state.list_state);
+
+    // Detail panel
+    let detail_text = if let Some(s) = state.selected() {
+        let name_line = s.name.as_deref().unwrap_or("(unlabelled)");
+        let duration = s.ended_at
+            .map(|e| format_dur(e - s.started_at))
+            .unwrap_or_else(|| "still running".to_string());
+        format!(
+            "Name:       {}\nID:         {}\nAgent:      {}\nStarted:    {}\nDuration:   {}\nCost:       ${:.6}\nTokens:     {} in / {} out\nEvents:     {}\nViolations: {}",
+            name_line,
+            s.id,
+            s.agent,
+            s.started_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            duration,
+            s.total_cost_usd,
+            s.total_input_tokens,
+            s.total_output_tokens,
+            s.event_count,
+            s.policy_violations,
+        )
+    } else {
+        "No session selected.".to_string()
+    };
+
+    let detail = Paragraph::new(detail_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(" Session detail ", Style::default().fg(Color::Yellow))),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail, chunks[1]);
+
+    // Help bar
+    let help = Paragraph::new(Span::styled(
+        "  ↑/k ↓/j Navigate   Enter/r Replay   d Delete   q Quit",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(help, chunks[2]);
+}
+
+fn format_dur(d: chrono::Duration) -> String {
+    let s = d.num_seconds().abs();
+    if s >= 3600 { format!("{}h{:02}m", s / 3600, (s % 3600) / 60) }
+    else if s >= 60 { format!("{}m{:02}s", s / 60, s % 60) }
+    else { format!("{}s", s) }
+}
+
+fn truncate_str(s: &str, n: usize) -> String {
+    if s.len() <= n { s.to_string() }
+    else { format!("{}…", &s[..n.saturating_sub(1)]) }
 }

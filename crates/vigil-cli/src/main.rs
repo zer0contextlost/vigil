@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost};
 use vigil_proxy::Proxy;
-use vigil_tui::App;
+use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
 
 #[derive(Parser)]
@@ -13,6 +13,14 @@ use vigil_watch::{WatchConfig, Watcher};
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// List plugins in ~/.vigil/plugins/ and any loaded via --plugin
+    List,
+    /// Show the plugins directory path
+    Dir,
 }
 
 #[derive(Subcommand)]
@@ -43,6 +51,10 @@ enum Commands {
         #[arg(long = "plugin")]
         plugins: Vec<PathBuf>,
 
+        /// Human-readable label for this session (shown in vigil sessions / browse)
+        #[arg(long)]
+        name: Option<String>,
+
         /// Agent command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         agent_and_args: Vec<String>,
@@ -58,8 +70,25 @@ enum Commands {
         force: bool,
     },
 
-    /// List past sessions
+    /// List past sessions (text table)
     Sessions,
+
+    /// Browse past sessions in an interactive TUI
+    Browse,
+
+    /// Tag a session with a human-readable name
+    Tag {
+        /// Session ID (UUID) or existing name
+        session_id: String,
+        /// Label to assign
+        name: String,
+    },
+
+    /// Manage vigil plugins
+    Plugins {
+        #[command(subcommand)]
+        action: PluginCommands,
+    },
 
     /// Replay a recorded session
     Replay {
@@ -316,6 +345,7 @@ async fn main() -> Result<()> {
             log_file,
             pii_watchlist,
             plugins,
+            name,
             agent_and_args,
         }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
@@ -323,16 +353,60 @@ async fn main() -> Result<()> {
             let vigil_config = config.as_deref()
                 .and_then(|p| vigil_core::VigilConfig::load(p).ok());
             let mut plugin_host = PluginHost::new();
+            // Auto-load plugins from ~/.vigil/plugins/
+            if let Ok(dir) = plugins_dir() {
+                load_plugins_from_dir(&dir, &mut plugin_host);
+            }
             for path in &plugins {
                 match plugin_host.load_from_file(path) {
                     Ok(()) => println!("Loaded plugin: {}", path.display()),
                     Err(e) => eprintln!("Warning: {}", e),
                 }
             }
-            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host).await?;
+            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host, name).await?;
         }
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
+        }
+        Some(Commands::Browse) => {
+            let summaries = Session::list_all()?;
+            match vigil_tui::run_session_browser(summaries).await? {
+                Some(BrowseAction::Replay(id)) => {
+                    let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
+                    let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                    let envelopes_clone = envelopes.clone();
+                    tokio::spawn(async move {
+                        for (i, env) in envelopes_clone.iter().enumerate() {
+                            if i > 0 {
+                                let prev_ts = envelopes_clone[i - 1].timestamp;
+                                let delta = env.timestamp.signed_duration_since(prev_ts);
+                                let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                                if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
+                            }
+                            if tx.send(env.clone()).await.is_err() { break; }
+                        }
+                    });
+                    let meta = vigil_core::store::SessionStore::load_meta(&id).ok();
+                    let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
+                    let mut session = vigil_core::session::Session::new(agent);
+                    session.id = id;
+                    let mut app = App::new(session);
+                    app.is_replay = true;
+                    vigil_tui::run_tui(app, rx).await?;
+                }
+                Some(BrowseAction::Delete(id)) => {
+                    confirm_delete_session(&id)?;
+                }
+                Some(BrowseAction::Quit) | None => {}
+            }
+        }
+        Some(Commands::Tag { session_id, name }) => {
+            let uuid = resolve_session_id(&session_id)?;
+            SessionStore::tag(&uuid, &name)?;
+            println!("Tagged session {} as {:?}", uuid, name);
+        }
+        Some(Commands::Plugins { action }) => {
+            run_plugins_command(action)?;
         }
         Some(Commands::Sessions) => {
             let summaries = Session::list_all()?;
@@ -785,7 +859,7 @@ async fn run_agent(
     config: Option<vigil_core::VigilConfig>,
     config_path: Option<String>,
 ) -> Result<()> {
-    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new()).await
+    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None).await
 }
 
 pub async fn run_agent_with_plugins(
@@ -797,6 +871,7 @@ pub async fn run_agent_with_plugins(
     config: Option<vigil_core::VigilConfig>,
     config_path: Option<String>,
     plugins: PluginHost,
+    session_name: Option<String>,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -807,7 +882,11 @@ pub async fn run_agent_with_plugins(
     let agent_name = agent_and_args[0].clone();
     let session = Session::new(agent_name.clone());
     let session_id = session.id;
-    let store = SessionStore::create(session_id, &agent_name).ok();
+    let mut store = SessionStore::create(session_id, &agent_name).ok();
+
+    if let Some(ref n) = session_name {
+        if let Some(ref mut s) = store { s.set_name(n.as_str()); }
+    }
 
     let active_handle = vigil_core::create_handle(&session_id).ok();
     if let Some(ref handle) = active_handle {
@@ -1551,6 +1630,111 @@ async fn vigil_init(output: PathBuf, force: bool) -> Result<()> {
         output.display()
     );
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plugin helpers
+// ---------------------------------------------------------------------------
+
+fn plugins_dir() -> anyhow::Result<PathBuf> {
+    let home = if cfg!(target_os = "windows") {
+        std::env::var("USERPROFILE").ok()
+    } else {
+        std::env::var("HOME").ok()
+    }.ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    Ok(PathBuf::from(home).join(".vigil").join("plugins"))
+}
+
+fn load_plugins_from_dir(dir: &PathBuf, host: &mut PluginHost) {
+    if !dir.exists() { return; }
+    let dylib_exts = if cfg!(target_os = "windows") { vec!["dll"] }
+        else if cfg!(target_os = "macos") { vec!["dylib"] }
+        else { vec!["so"] };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if dylib_exts.contains(&ext) {
+                    match host.load_from_file(&path) {
+                        Ok(()) => println!("Auto-loaded plugin: {}", path.display()),
+                        Err(e) => eprintln!("Warning: {}", e),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn run_plugins_command(action: PluginCommands) -> anyhow::Result<()> {
+    match action {
+        PluginCommands::Dir => {
+            let dir = plugins_dir()?;
+            println!("{}", dir.display());
+            println!("Place .dll / .so / .dylib files here to auto-load on vigil run.");
+        }
+        PluginCommands::List => {
+            let dir = plugins_dir()?;
+            if !dir.exists() {
+                println!("Plugin directory {} does not exist yet.", dir.display());
+                println!("Create it and drop plugin libraries there to auto-load.");
+                return Ok(());
+            }
+            let dylib_exts = if cfg!(target_os = "windows") { vec!["dll"] }
+                else if cfg!(target_os = "macos") { vec!["dylib"] }
+                else { vec!["so"] };
+            let mut found = false;
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if dylib_exts.contains(&ext) {
+                            println!("  {}", path.display());
+                            found = true;
+                        }
+                    }
+                }
+            }
+            if !found {
+                println!("No plugins found in {}.", dir.display());
+                println!("See PLUGINS.md for how to author a plugin.");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve a session ID string — accepts full UUID or a human-readable name label.
+fn resolve_session_id(s: &str) -> anyhow::Result<uuid::Uuid> {
+    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+        return Ok(uuid);
+    }
+    // Try name lookup
+    match Session::find_by_name(s)? {
+        Some(summary) => Ok(summary.id),
+        None => anyhow::bail!("No session found with ID or name {:?}", s),
+    }
+}
+
+/// Delete all files for a session after confirmation.
+fn confirm_delete_session(id: &uuid::Uuid) -> anyhow::Result<()> {
+    println!("Delete session {}? This cannot be undone. [y/N] ", id);
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    if line.trim().eq_ignore_ascii_case("y") {
+        let dir = vigil_core::store::sessions_dir()?;
+        for ext in &["ndjson", "meta.json"] {
+            let path = dir.join(format!("{}.{}", id, ext));
+            if path.exists() { std::fs::remove_file(&path)?; }
+        }
+        println!("Session {} deleted.", id);
+    } else {
+        println!("Cancelled.");
+    }
     Ok(())
 }
 

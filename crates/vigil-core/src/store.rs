@@ -24,6 +24,9 @@ pub struct SessionMeta {
     pub event_count: u64,
     pub pii_detections: u32,
     pub policy_violations: u32,
+    /// Optional human-readable label set via `vigil tag` or `vigil run --name`.
+    #[serde(default)]
+    pub name: Option<String>,
     /// SHA-256 hash of the last envelope in the chain (hex).
     #[serde(default)]
     pub chain_root_hash: String,
@@ -74,6 +77,7 @@ impl SessionStore {
             event_count: 0,
             pii_detections: 0,
             policy_violations: 0,
+            name: None,
             chain_root_hash: String::new(),
             chain_signature: None,
             verifying_key: None,
@@ -180,6 +184,22 @@ impl SessionStore {
         let json = std::fs::read_to_string(&path)?;
         Ok(serde_json::from_str(&json)?)
     }
+
+    /// Set or update the human-readable name for a session, persisting to meta.json.
+    pub fn tag(session_id: &Uuid, name: &str) -> Result<()> {
+        let mut meta = Self::load_meta(session_id)?;
+        meta.name = Some(name.to_string());
+        let path = sessions_dir()?.join(format!("{}.meta.json", session_id));
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Set the name on this store's in-memory meta (written on finish/drop).
+    pub fn set_name(&mut self, name: &str) {
+        self.meta.name = Some(name.to_string());
+    }
 }
 
 impl Drop for SessionStore {
@@ -266,6 +286,7 @@ mod tests {
             event_count: 0,
             pii_detections: 0,
             policy_violations: 0,
+            name: None,
             chain_root_hash: String::new(),
             chain_signature: None,
             verifying_key: None,
