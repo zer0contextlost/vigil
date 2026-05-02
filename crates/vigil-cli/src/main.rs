@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector};
+use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyConfig, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector};
 use vigil_proxy::Proxy;
 use vigil_tui::App;
 use vigil_watch::{WatchConfig, Watcher};
@@ -658,6 +658,13 @@ async fn run_agent(
 
     let engine = if let Some(policy_path) = &policy {
         PolicyEngine::from_file(policy_path)?
+    } else if let Some(cfg) = &config {
+        let policies = cfg.to_policies();
+        if policies.is_empty() {
+            PolicyEngine::default()
+        } else {
+            PolicyEngine::new(vigil_core::PolicyConfig { policies })?
+        }
     } else {
         PolicyEngine::default()
     };
