@@ -68,6 +68,9 @@ enum Commands {
         /// Session ID (UUID) to audit
         session_id: String,
     },
+
+    /// Show all currently active vigil sessions
+    Ps,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +325,9 @@ async fn main() -> Result<()> {
         Some(Commands::Audit { session_id }) => {
             run_audit(&session_id)?;
         }
+        Some(Commands::Ps) => {
+            run_ps()?;
+        }
         Some(Commands::Replay { session_id }) => {
             let uuid = uuid::Uuid::parse_str(&session_id)
                 .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
@@ -540,6 +546,21 @@ async fn run_agent(
     let session_id = session.id;
     let store = SessionStore::create(session_id, &agent_name).ok();
 
+    let active_handle = vigil_core::create_handle(&session_id).ok();
+    if let Some(ref handle) = active_handle {
+        let _ = handle.write(&vigil_core::ActiveSession {
+            session_id,
+            agent: agent_name.clone(),
+            started_at: chrono::Utc::now(),
+            session_cost_usd: 0.0,
+            session_tokens: 0,
+            burn_rate_per_min: 0.0,
+            last_event: "starting".to_string(),
+            needs_attention: false,
+            pid: std::process::id(),
+        });
+    }
+
     let engine = if let Some(policy_path) = &policy {
         PolicyEngine::from_file(policy_path)?
     } else {
@@ -655,6 +676,7 @@ async fn run_agent(
     });
 
     // Policy filter: evaluate every raw event and forward allowed ones to the TUI.
+    let lock_path = active_handle.as_ref().map(|h| h.path.clone());
     let engine_clone = engine.clone();
     let session_id_for_alerts = session_id;
     let filter_handle = tokio::spawn(async move {
@@ -670,6 +692,13 @@ async fn run_agent(
             if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {
                 session_tokens += input_tokens + output_tokens;
                 session_cost += cost_usd;
+                if let Some(ref path) = lock_path {
+                    vigil_core::update_active(path, |s| {
+                        s.session_cost_usd = session_cost;
+                        s.session_tokens = session_tokens;
+                        s.last_event = "RES".to_string();
+                    });
+                }
             }
 
             if let Event::LlmResponse { cost_usd, .. } = &event.event {
@@ -683,6 +712,13 @@ async fn run_agent(
                             session_id: session_id_for_alerts,
                         });
                         filtered_tx.send(alert).await.ok();
+                        if let Some(ref path) = lock_path {
+                            vigil_core::update_active(path, |s| {
+                                s.burn_rate_per_min = rate;
+                                s.needs_attention = true;
+                                s.last_event = "BURN".to_string();
+                            });
+                        }
                     }
                 }
             }
@@ -696,6 +732,12 @@ async fn run_agent(
                         session_id: *sid,
                     });
                     filtered_tx.send(alert).await.ok();
+                    if let Some(ref path) = lock_path {
+                        vigil_core::update_active(path, |s| {
+                            s.needs_attention = true;
+                            s.last_event = "LOOP".to_string();
+                        });
+                    }
                 }
             }
 
@@ -717,6 +759,15 @@ async fn run_agent(
                         eprintln!("[BUDGET] Outside allowed hours {} — stopping", window);
                         break;
                     }
+                }
+            }
+
+            if let Event::WriteApprovalRequired { .. } = &event.event {
+                if let Some(ref path) = lock_path {
+                    vigil_core::update_active(path, |s| {
+                        s.needs_attention = true;
+                        s.last_event = "WAPPR".to_string();
+                    });
                 }
             }
 
@@ -828,6 +879,40 @@ async fn run_agent(
         println!("Agent: {}", agent_name);
     }
 
+    if let Some(ref handle) = active_handle {
+        handle.remove();
+    }
+
+    Ok(())
+}
+
+fn run_ps() -> anyhow::Result<()> {
+    let sessions = vigil_core::list_active();
+    if sessions.is_empty() {
+        println!("No active vigil sessions.");
+        return Ok(());
+    }
+    println!(
+        "{:<36}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
+        "SESSION ID", "AGENT", "TOKENS", "COST", "$/MIN", "STATUS"
+    );
+    println!("{}", "-".repeat(85));
+    for s in &sessions {
+        let status = if s.needs_attention {
+            "! ATTENTION".to_string()
+        } else {
+            s.last_event.clone()
+        };
+        println!(
+            "{:<36}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
+            s.session_id,
+            truncate(&s.agent, 12),
+            s.session_tokens,
+            format!("${:.4}", s.session_cost_usd),
+            format!("${:.3}/m", s.burn_rate_per_min),
+            status,
+        );
+    }
     Ok(())
 }
 
