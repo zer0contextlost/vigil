@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -70,19 +69,4 @@ pub enum Event {
         kinds: Vec<String>,
         session_id: Uuid,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimestampedEvent {
-    pub event: Event,
-    pub timestamp: DateTime<Utc>,
-}
-
-impl TimestampedEvent {
-    pub fn new(event: Event) -> Self {
-        Self {
-            event,
-            timestamp: Utc::now(),
-        }
-    }
 }

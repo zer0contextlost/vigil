@@ -5,7 +5,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
-use vigil_core::event::{Event, TimestampedEvent};
+use vigil_core::{Event, TimestampedEvent};
 
 /// MCP runs over stdio JSON-RPC. The shim spawns the real MCP server as a child process
 /// and pipes stdin/stdout through, intercepting tools/call requests and logging them as
