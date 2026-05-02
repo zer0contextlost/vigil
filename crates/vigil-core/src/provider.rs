@@ -34,7 +34,7 @@ pub fn detect_provider_from_host(host: &str) -> ProviderKind {
     }
 }
 
-pub fn cost_usd(_provider: ProviderKind, model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+pub fn cost_usd(_provider: ProviderKind, model: &str, input_tokens: u32, output_tokens: u32, cache_read_tokens: u32, cache_creation_tokens: u32) -> f64 {
     let m = model.to_lowercase();
     let (input_cost, output_cost) = if m.contains("claude-opus-4") {
         (15.0, 75.0)
@@ -53,4 +53,6 @@ pub fn cost_usd(_provider: ProviderKind, model: &str, input_tokens: u32, output_
     };
     (input_tokens as f64 / 1_000_000.0) * input_cost
         + (output_tokens as f64 / 1_000_000.0) * output_cost
+        + (cache_read_tokens as f64 / 1_000_000.0) * input_cost * 0.1
+        + (cache_creation_tokens as f64 / 1_000_000.0) * input_cost * 1.25
 }

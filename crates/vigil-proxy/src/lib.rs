@@ -479,6 +479,8 @@ struct SseState {
     model: String,
     input_tokens: u32,
     output_tokens: u32,
+    cache_read_input_tokens: u32,
+    cache_creation_input_tokens: u32,
     block_type: HashMap<usize, String>,
     block_name: HashMap<usize, String>,
     block_input: HashMap<usize, String>,
@@ -581,7 +583,7 @@ async fn stream_sse_response(
     }
 
     if state.output_tokens > 0 || state.input_tokens > 0 {
-        let cost = cost_usd(&state.model, state.input_tokens, state.output_tokens);
+        let cost = cost_usd_with_cache(&state.model, state.input_tokens, state.output_tokens, state.cache_read_input_tokens, state.cache_creation_input_tokens);
         tracing::info!(
             model = %state.model,
             input_tokens = state.input_tokens,
@@ -605,6 +607,8 @@ async fn stream_sse_response(
             cost_usd: cost,
             session_id,
             response_text,
+            cache_read_input_tokens: state.cache_read_input_tokens,
+            cache_creation_input_tokens: state.cache_creation_input_tokens,
         }));
     }
 
@@ -630,6 +634,14 @@ fn process_sse_event(
                 if let Some(usage) = msg.get("usage") {
                     state.input_tokens = usage
                         .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    state.cache_read_input_tokens = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
+                    state.cache_creation_input_tokens = usage
+                        .get("cache_creation_input_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32;
                 }
@@ -974,7 +986,19 @@ fn emit_anthropic_response(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
-    let cost = cost_usd(&model, input_tokens, output_tokens);
+    let cache_read_input_tokens = json
+        .get("usage")
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let cache_creation_input_tokens = json
+        .get("usage")
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let cost = cost_usd_with_cache(&model, input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens);
     tracing::info!(model = %model, input_tokens, output_tokens, "non-streaming LLM response parsed");
 
     let response_text = json
@@ -1006,6 +1030,8 @@ fn emit_anthropic_response(
         cost_usd: cost,
         session_id,
         response_text,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
     }));
 
     if let Some(content) = json.get("content").and_then(|v| v.as_array()) {
@@ -1070,6 +1096,8 @@ fn emit_openai_response(
         cost_usd: cost,
         session_id,
         response_text,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
     }));
 
     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
@@ -1119,6 +1147,30 @@ pub fn cost_usd(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
 
     (input_tokens as f64 / 1_000_000.0) * input_cost
         + (output_tokens as f64 / 1_000_000.0) * output_cost
+}
+
+pub fn cost_usd_with_cache(model: &str, input_tokens: u32, output_tokens: u32, cache_read: u32, cache_creation: u32) -> f64 {
+    let m = model.to_lowercase();
+    let (input_cost, output_cost) = if m.contains("claude-opus-4") {
+        (15.0, 75.0)
+    } else if m.contains("claude-sonnet-4") || m.contains("claude-3-5-sonnet") {
+        (3.0, 15.0)
+    } else if m.contains("claude-haiku-4") || m.contains("claude-3-7-haiku") {
+        (0.80, 4.0)
+    } else if m.contains("gpt-4o") && m.contains("mini") {
+        (0.15, 0.60)
+    } else if m.contains("gpt-4o") {
+        (2.50, 10.0)
+    } else if m.contains("o3") || m.contains("o4") {
+        (10.0, 40.0)
+    } else {
+        (3.0, 15.0)
+    };
+
+    (input_tokens as f64 / 1_000_000.0) * input_cost
+        + (output_tokens as f64 / 1_000_000.0) * output_cost
+        + (cache_read as f64 / 1_000_000.0) * input_cost * 0.1
+        + (cache_creation as f64 / 1_000_000.0) * input_cost * 1.25
 }
 
 #[cfg(test)]

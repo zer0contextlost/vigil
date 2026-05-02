@@ -29,6 +29,10 @@ pub enum Event {
         /// Full assistant text accumulated from SSE text_delta events.
         #[serde(default)]
         response_text: Option<String>,
+        #[serde(default)]
+        cache_read_input_tokens: u32,
+        #[serde(default)]
+        cache_creation_input_tokens: u32,
     },
     ToolCall {
         agent: String,

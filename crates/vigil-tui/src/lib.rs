@@ -273,9 +273,14 @@ fn event_summary(event: &TimestampedEvent) -> String {
                 _ => format!("{}/{}", provider, model_short),
             }
         }
-        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, .. } => {
+        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, cache_read_input_tokens, cache_creation_input_tokens, .. } => {
             let model_short = model.split('-').next().unwrap_or(&model);
-            let base = format!("{}/{} {}in {}out ${:.4}", provider, model_short, input_tokens, output_tokens, cost_usd);
+            let cache_str = if *cache_read_input_tokens > 0 || *cache_creation_input_tokens > 0 {
+                format!(" c_r:{} c_w:{}", cache_read_input_tokens, cache_creation_input_tokens)
+            } else {
+                String::new()
+            };
+            let base = format!("{}/{} {}in {}out{} ${:.4}", provider, model_short, input_tokens, output_tokens, cache_str, cost_usd);
             match response_text.as_deref().map(|s| truncate(s, 30)) {
                 Some(p) if !p.is_empty() => format!("{} \"{}\"", base, p),
                 _ => base,
@@ -323,9 +328,14 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
                 for l in msg.lines() { out.push(body_line(l)); }
             }
         }
-        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, .. } => {
+        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, cache_read_input_tokens, cache_creation_input_tokens, .. } => {
+            let cache_detail = if *cache_read_input_tokens > 0 || *cache_creation_input_tokens > 0 {
+                format!("  cache_r:{} cache_w:{}", cache_read_input_tokens, cache_creation_input_tokens)
+            } else {
+                String::new()
+            };
             out.push(header_line(
-                format!("RESPONSE  {}/{}  {}in {}out  ${:.4}", provider, model, input_tokens, output_tokens, cost_usd),
+                format!("RESPONSE  {}/{}  {}in {}out{}  ${:.4}", provider, model, input_tokens, output_tokens, cache_detail, cost_usd),
                 Color::Cyan,
             ));
             match response_text {
