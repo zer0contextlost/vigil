@@ -1,6 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -22,6 +24,15 @@ pub struct SessionMeta {
     pub event_count: u64,
     pub pii_detections: u32,
     pub policy_violations: u32,
+    /// SHA-256 hash of the last envelope in the chain (hex).
+    #[serde(default)]
+    pub chain_root_hash: String,
+    /// ed25519 signature over chain_root_hash bytes, hex-encoded.
+    #[serde(default)]
+    pub chain_signature: Option<String>,
+    /// ed25519 verifying (public) key, hex-encoded.
+    #[serde(default)]
+    pub verifying_key: Option<String>,
 }
 
 pub struct SessionStore {
@@ -34,6 +45,8 @@ pub struct SessionStore {
     session_key: [u8; 32],
     pub meta: SessionMeta,
     ulid_gen: Generator,
+    signing_key: SigningKey,
+    finished: bool,
 }
 
 impl SessionStore {
@@ -61,6 +74,9 @@ impl SessionStore {
             event_count: 0,
             pii_detections: 0,
             policy_violations: 0,
+            chain_root_hash: String::new(),
+            chain_signature: None,
+            verifying_key: None,
         };
 
         Ok(Self {
@@ -73,6 +89,8 @@ impl SessionStore {
             session_key,
             meta,
             ulid_gen: Generator::new(),
+            signing_key: SigningKey::generate(&mut OsRng),
+            finished: false,
         })
     }
 
@@ -104,7 +122,33 @@ impl SessionStore {
 
     pub fn finish(&mut self) -> Result<()> {
         self.meta.ended_at = Some(Utc::now());
+        // Sign the chain root hash so `vigil verify` can detect tampering.
+        if !self.last_hash.is_empty() {
+            let sig: Signature = self.signing_key.sign(self.last_hash.as_bytes());
+            self.meta.chain_root_hash = self.last_hash.clone();
+            self.meta.chain_signature = Some(hex::encode(sig.to_bytes()));
+            self.meta.verifying_key = Some(hex::encode(self.signing_key.verifying_key().to_bytes()));
+        }
+        self.finished = true;
         self.flush_meta()
+    }
+
+    /// Verify the stored ed25519 chain-root signature against the provided hash.
+    /// Returns Ok(()) if valid or if no signature is stored (pre-signing sessions).
+    pub fn verify_signature(meta: &SessionMeta, chain_root: &str) -> Result<()> {
+        let (Some(sig_hex), Some(vk_hex)) = (&meta.chain_signature, &meta.verifying_key) else {
+            return Ok(());
+        };
+        let vk_bytes: [u8; 32] = hex::decode(vk_hex)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid verifying key length"))?;
+        let sig_bytes: [u8; 64] = hex::decode(sig_hex)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid signature length"))?;
+        let vk = VerifyingKey::from_bytes(&vk_bytes)?;
+        let sig = Signature::from_bytes(&sig_bytes);
+        vk.verify(chain_root.as_bytes(), &sig)
+            .map_err(|e| anyhow::anyhow!("signature invalid: {}", e))
     }
 
     pub fn session_key(&self) -> &[u8; 32] {
@@ -135,6 +179,16 @@ impl SessionStore {
         let path = sessions_dir()?.join(format!("{}.meta.json", session_id));
         let json = std::fs::read_to_string(&path)?;
         Ok(serde_json::from_str(&json)?)
+    }
+}
+
+impl Drop for SessionStore {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Process was killed or panicked without calling finish() — flush
+            // whatever meta we have so `vigil audit` shows events not MISSING.
+            let _ = self.flush_meta();
+        }
     }
 }
 
