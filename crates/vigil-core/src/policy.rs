@@ -167,50 +167,6 @@ impl PolicyEngine {
     /// Evaluate an event against the policy set.
     /// Returns the first matching policy's decision, or Allow if none match.
     pub fn evaluate(&self, event: &Event, session_total_tokens: u32) -> PolicyDecision {
-        // Hardcoded safety floor: check for destructive shell patterns
-        if let Event::ToolCall {
-            tool_name,
-            input,
-            ..
-        } = event
-        {
-            if tool_name.eq_ignore_ascii_case("Bash")
-                || tool_name.eq_ignore_ascii_case("bash")
-            {
-                if let Some(cmd_value) = input.get("command") {
-                    if let Some(cmd_str) = cmd_value.as_str() {
-                        let destructive_patterns = vec![
-                            "rm -rf",
-                            "dd if=",
-                            "mkfs",
-                            ":(){ :|:& };:",
-                        ];
-                        for pattern in &destructive_patterns {
-                            if cmd_str.contains(pattern) {
-                                return PolicyDecision {
-                                    action: PolicyAction::Deny,
-                                    policy_name: Some("hardcoded-destructive-floor".to_string()),
-                                    reason: Some(
-                                        "destructive shell pattern blocked".to_string(),
-                                    ),
-                                };
-                            }
-                        }
-                        // Check for pipe-to-shell patterns
-                        if (cmd_str.contains("curl") && cmd_str.contains("|") && cmd_str.contains("sh"))
-                            || (cmd_str.contains("wget") && cmd_str.contains("|") && cmd_str.contains("sh"))
-                        {
-                            return PolicyDecision {
-                                action: PolicyAction::Deny,
-                                policy_name: Some("hardcoded-destructive-floor".to_string()),
-                                reason: Some("pipe-to-shell pattern blocked".to_string()),
-                            };
-                        }
-                    }
-                }
-            }
-        }
-
         // Check each policy in order; first match wins
         for (idx, policy) in self.config.policies.iter().enumerate() {
             if self.matches(&policy.matcher, event, session_total_tokens, idx) {

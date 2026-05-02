@@ -58,6 +58,14 @@ vigil audit <session-uuid>
 ```toml
 [proxy]
 port = 8877
+# Shell command substrings to block. Matched case-sensitively against
+# Bash tool inputs. Default list shown below — set to [] to disable all blocking.
+blocked_commands = [
+  "rm -rf",
+  "dd if=",
+  "mkfs",
+  ":(){ :|:& };:",
+]
 
 [session]
 store_raw = true

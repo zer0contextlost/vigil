@@ -21,6 +21,15 @@ pub struct VigilConfig {
     pub budget: BudgetSection,
 }
 
+fn default_blocked_commands() -> Vec<String> {
+    vec![
+        "rm -rf".to_string(),
+        "dd if=".to_string(),
+        "mkfs".to_string(),
+        ":(){ :|:& };:".to_string(),
+    ]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ProxySection {
@@ -30,6 +39,11 @@ pub struct ProxySection {
     /// None (the default) disables write approval gating.
     #[serde(default)]
     pub write_approval_threshold: Option<String>,
+    /// Shell command substrings to block. Each entry is matched as a
+    /// case-sensitive substring against Bash/shell tool call inputs.
+    /// Defaults to a short list of destructive patterns; set to [] to disable.
+    #[serde(default = "default_blocked_commands")]
+    pub blocked_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -81,8 +95,8 @@ impl VigilConfig {
 
     pub fn validate(&self) -> anyhow::Result<Vec<String>> {
         let mut warnings = Vec::new();
-        if self.policies.is_empty() {
-            warnings.push("No policies defined — all events will be allowed".to_string());
+        if self.policies.is_empty() && self.proxy.blocked_commands.is_empty() {
+            warnings.push("No policies or blocked commands defined — all events will be allowed".to_string());
         }
         if let Some(hours) = &self.budget.allowed_hours {
             if !hours.contains('-') || hours.len() != 11 {
@@ -116,7 +130,18 @@ impl VigilConfig {
     }
 
     /// Convert the policies in this config to the format PolicyEngine expects.
+    /// Blocked commands are prepended as synthetic ToolCallInput deny policies.
     pub fn to_policies(&self) -> Vec<Policy> {
-        self.policies.iter().cloned().map(Into::into).collect()
+        let mut policies: Vec<Policy> = self.proxy.blocked_commands.iter().map(|pattern| Policy {
+            name: format!("block-cmd:{}", pattern),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::ToolCallInput {
+                tool_name_pattern: "Bash".to_string(),
+                input_field: "command".to_string(),
+                value_pattern: pattern.clone(),
+            },
+        }).collect();
+        policies.extend(self.policies.iter().cloned().map(Into::into));
+        policies
     }
 }
