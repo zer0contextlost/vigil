@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyConfig, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector};
+use vigil_core::{session::Session, store::SessionStore, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost};
 use vigil_proxy::Proxy;
 use vigil_tui::App;
 use vigil_watch::{WatchConfig, Watcher};
@@ -630,6 +630,19 @@ async fn run_agent(
     config: Option<vigil_core::VigilConfig>,
     config_path: Option<String>,
 ) -> Result<()> {
+    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new()).await
+}
+
+pub async fn run_agent_with_plugins(
+    port: u16,
+    policy: Option<PathBuf>,
+    log_file: Option<&PathBuf>,
+    agent_and_args: Vec<String>,
+    pii_watchlist: Vec<String>,
+    config: Option<vigil_core::VigilConfig>,
+    config_path: Option<String>,
+    plugins: PluginHost,
+) -> Result<()> {
     init_logging(log_file);
 
     if agent_and_args.is_empty() {
@@ -687,6 +700,8 @@ async fn run_agent(
         .and_then(|c| c.notify.webhook.clone())
         .map(|url| vigil_core::WebhookNotifier::new(url,
             config.as_ref().map(|c| c.notify.webhook_events.clone()).unwrap_or_default()));
+
+    let plugin_host = Arc::new(plugins);
 
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
@@ -802,6 +817,7 @@ async fn run_agent(
         let sid = session_id;
         let kill_secs = tool_timeout_kill_secs;
         let kill_pid = child_pid;
+        let plugin_host_tout = plugin_host.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(5));
             loop {
@@ -819,6 +835,9 @@ async fn run_agent(
                             elapsed_secs: secs,
                             session_id: sid,
                         });
+                        let detail = serde_json::json!({"tool_name": tool_name, "elapsed_secs": secs});
+                        plugin_host_tout.dispatch_alert("TOUT", &sid.to_string(), &detail);
+                        plugin_host_tout.dispatch_event(&ev);
                         tx.send(ev).await.ok();
                         eprintln!("[TIMEOUT] Tool '{}' has been running {}s with no response", tool_name, secs);
                     }
@@ -844,17 +863,19 @@ async fn run_agent(
         let tx = filtered_tx.clone();
         let sid = session_id;
         let notifier = webhook_notifier.clone();
+        let plugin_host_dura = plugin_host.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(duration_mins * 60)).await;
             let ev = TimestampedEvent::new(Event::SessionDurationAlert {
                 elapsed_mins: duration_mins,
                 session_id: sid,
             });
+            let detail = serde_json::json!({"elapsed_mins": duration_mins});
             if let Some(ref n) = notifier {
-                n.send("DURA", &sid.to_string(), serde_json::json!({
-                    "elapsed_mins": duration_mins,
-                }));
+                n.send("DURA", &sid.to_string(), detail.clone());
             }
+            plugin_host_dura.dispatch_alert("DURA", &sid.to_string(), &detail);
+            plugin_host_dura.dispatch_event(&ev);
             tx.send(ev).await.ok();
             eprintln!("[DURATION] Session has been running {}min", duration_mins);
         });
@@ -866,6 +887,7 @@ async fn run_agent(
     let session_id_for_alerts = session_id;
     let last_tool_call_filter = last_tool_call.clone();
     let notifier_filter = webhook_notifier.clone();
+    let plugin_host_filter = plugin_host.clone();
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
@@ -906,16 +928,17 @@ async fn run_agent(
                     if !combined.is_empty() {
                         let hits = cred_tracker.check_outbound(&combined);
                         if !hits.is_empty() {
+                            let detail = serde_json::json!({"source": "llm_request", "matches": hits});
                             let alert = TimestampedEvent::new(Event::ExfilAlert {
                                 matches: hits.clone(),
                                 source: "llm_request".to_string(),
                                 session_id: *sid,
                             });
                             if let Some(ref n) = notifier_filter {
-                                n.send("EXFL", &sid.to_string(), serde_json::json!({
-                                    "source": "llm_request", "matches": hits,
-                                }));
+                                n.send("EXFL", &sid.to_string(), detail.clone());
                             }
+                            plugin_host_filter.dispatch_alert("EXFL", &sid.to_string(), &detail);
+                            plugin_host_filter.dispatch_event(&alert);
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -930,16 +953,17 @@ async fn run_agent(
                         let cmd = input.to_string();
                         let hits = cred_tracker.check_outbound(&cmd);
                         if !hits.is_empty() {
+                            let detail = serde_json::json!({"source": tool_name, "matches": hits});
                             let alert = TimestampedEvent::new(Event::ExfilAlert {
                                 matches: hits.clone(),
                                 source: tool_name.clone(),
                                 session_id: *sid,
                             });
                             if let Some(ref n) = notifier_filter {
-                                n.send("EXFL", &sid.to_string(), serde_json::json!({
-                                    "source": tool_name, "matches": hits,
-                                }));
+                                n.send("EXFL", &sid.to_string(), detail.clone());
                             }
+                            plugin_host_filter.dispatch_alert("EXFL", &sid.to_string(), &detail);
+                            plugin_host_filter.dispatch_event(&alert);
                             filtered_tx.send(alert).await.ok();
                         }
                     }
@@ -963,16 +987,17 @@ async fn run_agent(
                 if let Some(threshold) = cost_alert_usd {
                     if session_cost >= threshold {
                         cost_alerted = true;
+                        let detail = serde_json::json!({"threshold_usd": threshold, "session_cost_usd": session_cost});
                         let alert = TimestampedEvent::new(Event::CostAlert {
                             threshold_usd: threshold,
                             session_cost_usd: session_cost,
                             session_id: session_id_for_alerts,
                         });
                         if let Some(ref n) = notifier_filter {
-                            n.send("COST", &session_id_for_alerts.to_string(), serde_json::json!({
-                                "threshold_usd": threshold, "session_cost_usd": session_cost,
-                            }));
+                            n.send("COST", &session_id_for_alerts.to_string(), detail.clone());
                         }
+                        plugin_host_filter.dispatch_alert("COST", &session_id_for_alerts.to_string(), &detail);
+                        plugin_host_filter.dispatch_event(&alert);
                         filtered_tx.send(alert).await.ok();
                         eprintln!("[COST] Session cost ${:.4} crossed alert threshold ${:.4}", session_cost, threshold);
                     }
@@ -983,6 +1008,7 @@ async fn run_agent(
                 let (rate, projected) = burn_tracker.record(*cost_usd);
                 if let Some(limit) = burn_rate_limit {
                     if rate > limit {
+                        let detail = serde_json::json!({"rate_per_min_usd": rate, "projected_total_usd": projected});
                         let alert = TimestampedEvent::new(Event::BurnRateAlert {
                             rate_per_min_usd: rate,
                             projected_total_usd: projected,
@@ -990,10 +1016,10 @@ async fn run_agent(
                             session_id: session_id_for_alerts,
                         });
                         if let Some(ref n) = notifier_filter {
-                            n.send("BURN", &session_id_for_alerts.to_string(), serde_json::json!({
-                                "rate_per_min_usd": rate, "projected_total_usd": projected,
-                            }));
+                            n.send("BURN", &session_id_for_alerts.to_string(), detail.clone());
                         }
+                        plugin_host_filter.dispatch_alert("BURN", &session_id_for_alerts.to_string(), &detail);
+                        plugin_host_filter.dispatch_event(&alert);
                         filtered_tx.send(alert).await.ok();
                         if let Some(ref path) = lock_path {
                             vigil_core::update_active(path, |s| {
@@ -1009,16 +1035,17 @@ async fn run_agent(
             if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
                 let input_str = serde_json::to_string(input).unwrap_or_default();
                 if let Some(count) = loop_detector.check(tool_name, &input_str) {
+                    let detail = serde_json::json!({"tool_name": tool_name, "repeat_count": count});
                     let alert = TimestampedEvent::new(Event::LoopAlert {
                         tool_name: tool_name.clone(),
                         repeat_count: count,
                         session_id: *sid,
                     });
                     if let Some(ref n) = notifier_filter {
-                        n.send("LOOP", &sid.to_string(), serde_json::json!({
-                            "tool_name": tool_name, "repeat_count": count,
-                        }));
+                        n.send("LOOP", &sid.to_string(), detail.clone());
                     }
+                    plugin_host_filter.dispatch_alert("LOOP", &sid.to_string(), &detail);
+                    plugin_host_filter.dispatch_event(&alert);
                     filtered_tx.send(alert).await.ok();
                     if let Some(ref path) = lock_path {
                         vigil_core::update_active(path, |s| {
@@ -1085,23 +1112,27 @@ async fn run_agent(
                         ..
                     } = &event.event
                     {
+                        let detail = serde_json::json!({
+                            "tool_name": tool_name,
+                            "policy": decision.policy_name,
+                            "reason": decision.reason,
+                        });
                         if let Some(ref n) = notifier_filter {
-                            n.send("DENY", &session_id.to_string(), serde_json::json!({
-                                "tool_name": tool_name,
-                                "policy": decision.policy_name,
-                                "reason": decision.reason,
-                            }));
+                            n.send("DENY", &session_id.to_string(), detail.clone());
                         }
+                        plugin_host_filter.dispatch_alert("DENY", &session_id.to_string(), &detail);
                         let blocked = TimestampedEvent::new(Event::ToolCallResult {
                             agent: agent.clone(),
                             tool_name: tool_name.clone(),
                             blocked: true,
                             session_id: *session_id,
                         });
+                        plugin_host_filter.dispatch_event(&blocked);
                         filtered_tx.send(blocked).await.ok();
                     }
                 }
                 _ => {
+                    plugin_host_filter.dispatch_event(&event);
                     filtered_tx.send(event).await.ok();
                 }
             }
