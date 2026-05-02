@@ -1,6 +1,0 @@
-policies:
-  - name: block-bash
-    matcher:
-      type: ToolCall
-      tool_name_pattern: "Bash"
-    action: Deny

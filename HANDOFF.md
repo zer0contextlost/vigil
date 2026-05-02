@@ -110,11 +110,39 @@ Two mechanisms on every LLM request/response and tool call:
 
 Both emit `PiiAlert` events with `source` (tool name or "llm_request"/"llm_response") and `kinds` list. Snippets are partially redacted before storage.
 
+## Audit
+
+`vigil audit <session-uuid>` verifies the integrity of a recorded NDJSON session:
+
+Hash chain: re-computes each envelope's SHA-256 hash and checks the next envelope's `prev_hash` field matches. Reports first break position if any.
+
+ULID order: checks that ULID strings are non-decreasing (lexicographic order = time order for Crockford base32).
+
+Meta count: loads the `.meta.json` sidecar and checks `event_count` matches actual envelope count.
+
+Exits with code 0 (PASS) or 1 (FAIL). Suitable for CI use.
+
+## Pricing
+
+`vigil_core::PricingTable` is the single authoritative source of per-model pricing. On startup it tries to load `~/.vigil/pricing.toml`. If the file is missing or unparseable it falls back to built-in defaults.
+
+To override pricing, create `~/.vigil/pricing.toml`:
+
+```toml
+[[model]]
+pattern = "claude-opus-4"
+input_per_million = 15.0
+output_per_million = 75.0
+
+[[model]]
+pattern = "claude-sonnet-4"
+input_per_million = 3.0
+output_per_million = 15.0
+```
+
+Entries are matched by case-insensitive substring. Put more-specific patterns first (e.g. `gpt-4o-mini` before `gpt-4o`).
+
 ## Known gaps
-
-**Cache token accounting.** `cache_read_input_tokens` and `cache_creation_input_tokens` are ignored. For heavy Claude Code sessions where the system prompt is cached, recorded cost is understated.
-
-**Hardcoded pricing.** `cost_usd()` in vigil-proxy and vigil-core uses hardcoded per-million-token prices that will drift.
 
 **Windows-only proxy mode.** `vigil-watch` is a stub on Windows; FsRead/FsWrite/ProcessSpawn events never appear for file-system activity.
 
