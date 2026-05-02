@@ -572,17 +572,42 @@ async fn run_agent(
     let proxy_url = format!("http://127.0.0.1:{}", port);
     tracing::info!(port, "starting vigil proxy");
 
+    let write_approval_threshold = config.as_ref()
+        .and_then(|c| c.proxy.write_approval_threshold.as_deref())
+        .and_then(|s| match s.to_lowercase().as_str() {
+            "low" => Some(vigil_core::RiskLevel::Low),
+            "medium" => Some(vigil_core::RiskLevel::Medium),
+            "high" => Some(vigil_core::RiskLevel::High),
+            _ => None,
+        });
+
+    let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel::<(uuid::Uuid, bool)>(32);
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
         upstream_override: None,
         pii_watchlist,
+        write_approval_threshold,
     };
     let proxy = Proxy::new(proxy_config, raw_tx.clone());
+    let pending_approvals_for_resolver = proxy.pending_approvals.clone();
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = proxy.run().await {
             tracing::error!(err = %e, "proxy error");
             eprintln!("Proxy error: {}", e);
+        }
+    });
+
+    let resolver_handle = tokio::spawn(async move {
+        while let Some((approval_id, approved)) = decision_rx.recv().await {
+            let tx = {
+                let mut map = pending_approvals_for_resolver.lock().unwrap();
+                map.remove(&approval_id)
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(approved);
+            }
         }
     });
 
@@ -740,6 +765,7 @@ async fn run_agent(
     let mut app = App::new(session);
     app.store = store;
     app.config_path = config_path;
+    app.decision_tx = Some(decision_tx);
     let mut tui_handle = tokio::spawn(async move { vigil_tui::run_tui(app, filtered_rx).await });
 
     // Wait for TUI exit (user pressed q) or agent exit — whichever comes first.
@@ -774,6 +800,7 @@ async fn run_agent(
     proxy_handle.abort();
     watcher_handle.abort();
     filter_handle.abort();
+    resolver_handle.abort();
 
     if let Some(mut app) = final_app {
         app.session.finish();

@@ -31,6 +31,16 @@ pub struct EventCounts {
     pub loop_alerts: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingApprovalInfo {
+    pub approval_id: uuid::Uuid,
+    pub path: String,
+    pub risk_level: String,
+    pub reasons: Vec<String>,
+    pub before: String,
+    pub after: String,
+}
+
 pub struct App {
     pub session: Session,
     pub store: Option<vigil_core::store::SessionStore>,
@@ -49,6 +59,10 @@ pub struct App {
     pub counts: EventCounts,
     /// Most recent burn rate ($/min) from the last BurnRateAlert, if any.
     pub last_burn_rate: Option<f64>,
+    /// Channel to send approval decisions back to the resolver task.
+    pub decision_tx: Option<tokio::sync::mpsc::Sender<(uuid::Uuid, bool)>>,
+    /// Pending write approval waiting for user input.
+    pub pending_approval: Option<PendingApprovalInfo>,
 }
 
 impl App {
@@ -70,6 +84,8 @@ impl App {
             detail_scroll: 0,
             counts: EventCounts::default(),
             last_burn_rate: None,
+            decision_tx: None,
+            pending_approval: None,
         }
     }
 
@@ -116,8 +132,21 @@ impl App {
             vigil_core::Event::LoopAlert { .. } => {
                 self.counts.loop_alerts += 1;
             }
-            vigil_core::Event::WriteApprovalRequired { .. } => {}
-            vigil_core::Event::WriteApprovalDecision { .. } => {}
+            vigil_core::Event::WriteApprovalRequired { approval_id, path, risk_level, reasons, before, after, .. } => {
+                self.pending_approval = Some(PendingApprovalInfo {
+                    approval_id: *approval_id,
+                    path: path.clone(),
+                    risk_level: risk_level.clone(),
+                    reasons: reasons.clone(),
+                    before: before.clone(),
+                    after: after.clone(),
+                });
+            }
+            vigil_core::Event::WriteApprovalDecision { approval_id, .. } => {
+                if self.pending_approval.as_ref().map(|p| p.approval_id == *approval_id).unwrap_or(false) {
+                    self.pending_approval = None;
+                }
+            }
         }
         if let Some(ref mut store) = self.store {
             let _ = store.append(event);
@@ -225,6 +254,26 @@ impl App {
                     self.selected = self.event_log.len().saturating_sub(1);
                     self.scroll_offset = self.max_scroll();
                     self.detail_scroll = 0;
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(ref info) = self.pending_approval {
+                    let id = info.approval_id;
+                    if let Some(ref tx) = self.decision_tx {
+                        let tx = tx.clone();
+                        tokio::spawn(async move { let _ = tx.send((id, true)).await; });
+                    }
+                    self.pending_approval = None;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(ref info) = self.pending_approval {
+                    let id = info.approval_id;
+                    if let Some(ref tx) = self.decision_tx {
+                        let tx = tx.clone();
+                        tokio::spawn(async move { let _ = tx.send((id, false)).await; });
+                    }
+                    self.pending_approval = None;
                 }
             }
             _ => {}
@@ -688,6 +737,60 @@ fn draw_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_detail_pane(frame: &mut Frame, app: &App, area: Rect) {
+    // If there is a pending approval, render the approval overlay instead.
+    if let Some(ref info) = app.pending_approval {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "  WRITE APPROVAL REQUIRED",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  -----------------------",
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  Path:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.path.clone(), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Risk:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.risk_level.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Reasons: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.reasons.join(", "), Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  --- BEFORE ---", Style::default().fg(Color::DarkGray))));
+        for l in info.before.lines().take(20) {
+            lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Gray))));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("  --- AFTER ---", Style::default().fg(Color::DarkGray))));
+        for l in info.after.lines().take(20) {
+            lines.push(Line::from(Span::styled(format!("  {}", l), Style::default().fg(Color::Green))));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  [y] Approve   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("[n] Reject", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let approval_pane = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(
+                        "WRITE APPROVAL REQUIRED  y=approve  n=reject",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ))
+                    .border_style(Style::default().fg(Color::Yellow)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(approval_pane, area);
+        return;
+    }
+
     let content = if app.raw_events.is_empty() {
         vec![Line::from(Span::styled(
             "  Select an event with up/down to inspect it here",
@@ -723,7 +826,9 @@ fn draw_detail_pane(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = if app.detail_focused {
+    let text = if app.pending_approval.is_some() {
+        "y=approve write  n=reject write"
+    } else if app.detail_focused {
         "TAB=back  up/dn PgUp/PgDn Home=scroll detail  Esc=list"
     } else {
         "q=quit  up/dn=select  PgUp/PgDn  End=tail  TAB=detail"

@@ -12,3 +12,4 @@ tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
 vigil-core = { path = "../vigil-core" }
 serde_json = "1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
