@@ -18,7 +18,7 @@ After the agent finishes, the TUI shows `[DONE -- q to exit]`. Press q to save t
 |---|---|
 | vigil-cli | Binary entrypoint, CLI args, agent spawning, TUI orchestration |
 | vigil-proxy | HTTP reverse proxy, SSE parser, event emission |
-| vigil-core | Shared types: Event, TimestampedEvent, Session, PolicyEngine |
+| vigil-core | Shared types: Event, Envelope (TimestampedEvent alias), Session, SessionStore, VigilConfig, Scanner trait, PolicyEngine |
 | vigil-tui | ratatui dashboard, App state |
 | vigil-watch | Filesystem/process watcher (no-op on Windows) |
 | vigil-mcp | MCP shim stub |
@@ -33,9 +33,15 @@ Important: the proxy builds reqwest with `default-features = false` (no gzip/bro
 
 `stream_sse_response` in `vigil-proxy/src/lib.rs` accumulates raw bytes in a `Vec<u8>` buffer, finds newline boundaries byte-by-byte (handles both `\n` and `\r\n`), and dispatches JSON payloads on blank lines. It calls `process_sse_event` which updates an `SseState` struct, tracking `input_tokens` from `message_start` and `output_tokens` from `message_delta`. After the stream ends it emits one `LlmResponse` event with both counts.
 
-## Session lifecycle
+## Session lifecycle (Phase 1+)
 
-Events flow: `proxy task → raw_tx channel → filter task (policy eval) → filtered_tx channel → TUI`. The TUI's `App::push_event` updates session stats (input/output tokens, cost, violations) and calls `session.record(event)` so every event is persisted. On exit, `app.session.save()` writes the JSON to `~/.vigil/sessions/<uuid>.json`.
+Events flow: `proxy task → raw_tx channel → filter task (policy eval) → filtered_tx channel → TUI`. The TUI's `App::push_event` updates session stats and calls `store.append(event)` (if store is Some) to append each event as a JSON line to `~/.vigil/sessions/<uuid>.ndjson`. A sidecar `<uuid>.meta.json` is atomically rewritten on each flush. On exit, `store.finish()` sets `ended_at` and writes the final meta.
+
+The `Envelope` struct wraps every `Event` with: ULID event_id (sortable), session_id, schema_version, SHA-256 hash of the previous envelope (forming a tamper-evident chain), and a turn_id for grouping related events. `TimestampedEvent` is a type alias for `Envelope` for backward compatibility.
+
+`SessionStore` also generates a random 32-byte per-session key for future HMAC signing.
+
+Old `.json` session files (pre-Phase 1) are still loadable by `vigil sessions` and `vigil replay`.
 
 ## Shutdown sequence
 
