@@ -124,4 +124,15 @@ pub enum Event {
         elapsed_secs: u64,
         session_id: Uuid,
     },
+    /// Soft cost warning fired once when session cost crosses cost_alert_usd.
+    CostAlert {
+        threshold_usd: f64,
+        session_cost_usd: f64,
+        session_id: Uuid,
+    },
+    /// Fired once when session wall-clock duration exceeds max_session_duration_mins.
+    SessionDurationAlert {
+        elapsed_mins: u64,
+        session_id: Uuid,
+    },
 }
