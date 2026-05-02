@@ -1,0 +1,830 @@
+use anyhow::Result;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    Frame, Terminal,
+};
+use serde_json;
+use vigil_core::event::TimestampedEvent;
+use vigil_core::session::{Session, SessionSummary};
+
+#[derive(Default)]
+pub struct EventCounts {
+    pub requests: usize,
+    pub responses: usize,
+    pub tools: usize,
+    pub results: usize,
+    pub blocked: usize,
+    pub fs_reads: usize,
+    pub fs_writes: usize,
+    pub spawns: usize,
+    pub mcp: usize,
+}
+
+pub struct App {
+    pub session: Session,
+    pub event_log: Vec<Line<'static>>,
+    pub raw_events: Vec<TimestampedEvent>,
+    pub selected: usize,
+    pub should_quit: bool,
+    pub is_replay: bool,
+    pub agent_done: bool,
+    pub auto_scroll: bool,
+    pub visible_height: usize,
+    pub scroll_offset: usize,
+    pub detail_focused: bool,
+    pub detail_scroll: usize,
+    pub counts: EventCounts,
+}
+
+impl App {
+    pub fn new(session: Session) -> Self {
+        Self {
+            session,
+            event_log: Vec::new(),
+            raw_events: Vec::new(),
+            selected: 0,
+            should_quit: false,
+            is_replay: false,
+            agent_done: false,
+            auto_scroll: true,
+            visible_height: 20,
+            scroll_offset: 0,
+            detail_focused: false,
+            detail_scroll: 0,
+            counts: EventCounts::default(),
+        }
+    }
+
+    pub fn push_event(&mut self, event: &TimestampedEvent) {
+        match &event.event {
+            vigil_core::Event::LlmRequest { .. } => {
+                self.counts.requests += 1;
+            }
+            vigil_core::Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } => {
+                self.session.total_input_tokens += input_tokens;
+                self.session.total_output_tokens += output_tokens;
+                self.session.total_cost_usd += cost_usd;
+                self.counts.responses += 1;
+            }
+            vigil_core::Event::ToolCall { .. } => {
+                self.counts.tools += 1;
+            }
+            vigil_core::Event::ToolCallResult { blocked, .. } => {
+                if *blocked {
+                    self.session.policy_violations += 1;
+                    self.counts.blocked += 1;
+                }
+                self.counts.results += 1;
+            }
+            vigil_core::Event::FsRead { .. } => {
+                self.counts.fs_reads += 1;
+            }
+            vigil_core::Event::FsWrite { .. } => {
+                self.counts.fs_writes += 1;
+            }
+            vigil_core::Event::ProcessSpawn { .. } => {
+                self.counts.spawns += 1;
+            }
+            vigil_core::Event::McpCall { .. } => {
+                self.counts.mcp += 1;
+            }
+            vigil_core::Event::PiiAlert { .. } => {
+                self.session.pii_detections += 1;
+            }
+        }
+        self.session.record(event.clone());
+        self.event_log.push(format_event_line(event));
+        self.raw_events.push(event.clone());
+
+        if self.auto_scroll {
+            self.selected = self.event_log.len().saturating_sub(1);
+            self.scroll_to_selected();
+        }
+    }
+
+    fn scroll_to_selected(&mut self) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + self.visible_height {
+            self.scroll_offset = self.selected + 1 - self.visible_height;
+        }
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.event_log.len().saturating_sub(self.visible_height)
+    }
+
+    fn at_bottom(&self) -> bool {
+        self.selected + 1 >= self.event_log.len()
+    }
+
+    pub fn on_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if self.detail_focused {
+                    self.detail_focused = false;
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            KeyCode::Tab => {
+                self.detail_focused = !self.detail_focused;
+            }
+            KeyCode::Up => {
+                if self.detail_focused {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                } else {
+                    self.auto_scroll = false;
+                    if self.selected > 0 {
+                        self.selected -= 1;
+                        self.detail_scroll = 0;
+                        self.scroll_to_selected();
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if self.detail_focused {
+                    self.detail_scroll += 1;
+                } else {
+                    if self.selected + 1 < self.event_log.len() {
+                        self.selected += 1;
+                        self.detail_scroll = 0;
+                        self.scroll_to_selected();
+                    }
+                    if self.at_bottom() {
+                        self.auto_scroll = true;
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                if self.detail_focused {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(10);
+                } else {
+                    self.auto_scroll = false;
+                    self.selected = self.selected.saturating_sub(self.visible_height);
+                    self.detail_scroll = 0;
+                    self.scroll_to_selected();
+                }
+            }
+            KeyCode::PageDown => {
+                if self.detail_focused {
+                    self.detail_scroll += 10;
+                } else {
+                    let last = self.event_log.len().saturating_sub(1);
+                    self.selected = (self.selected + self.visible_height).min(last);
+                    self.detail_scroll = 0;
+                    self.scroll_to_selected();
+                    if self.at_bottom() {
+                        self.auto_scroll = true;
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if self.detail_focused {
+                    self.detail_scroll = 0;
+                } else {
+                    self.auto_scroll = false;
+                    self.selected = 0;
+                    self.scroll_offset = 0;
+                    self.detail_scroll = 0;
+                }
+            }
+            KeyCode::End => {
+                if !self.detail_focused {
+                    self.auto_scroll = true;
+                    self.selected = self.event_log.len().saturating_sub(1);
+                    self.scroll_offset = self.max_scroll();
+                    self.detail_scroll = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ─── event list row ──────────────────────────────────────────────────────────
+
+fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
+    let time = event.timestamp.format("%H:%M:%S").to_string();
+
+    let (label, label_style) = match &event.event {
+        vigil_core::Event::LlmRequest { .. } =>
+            ("REQ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)),
+        vigil_core::Event::LlmResponse { .. } =>
+            ("RES ", Style::default().fg(Color::Cyan)),
+        vigil_core::Event::ToolCall { .. } =>
+            ("TOOL", Style::default().fg(Color::Yellow)),
+        vigil_core::Event::ToolCallResult { blocked: true, .. } =>
+            ("DENY", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::ToolCallResult { .. } =>
+            ("OK  ", Style::default().fg(Color::Green).add_modifier(Modifier::DIM)),
+        vigil_core::Event::FsRead { .. } =>
+            ("READ", Style::default().fg(Color::Gray)),
+        vigil_core::Event::FsWrite { .. } =>
+            ("WRIT", Style::default().fg(Color::Magenta)),
+        vigil_core::Event::ProcessSpawn { .. } =>
+            ("PROC", Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)),
+        vigil_core::Event::McpCall { .. } =>
+            ("MCP ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)),
+        vigil_core::Event::PiiAlert { .. } =>
+            ("PII!", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+    };
+
+    let summary = event_summary(event);
+    let is_alert = matches!(
+        &event.event,
+        vigil_core::Event::ToolCallResult { blocked: true, .. } | vigil_core::Event::PiiAlert { .. }
+    );
+    let summary_style = if is_alert {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    Line::from(vec![
+        Span::styled(format!("{} ", time), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{} ", label), label_style),
+        Span::styled(summary, summary_style),
+    ])
+}
+
+fn event_summary(event: &TimestampedEvent) -> String {
+    match &event.event {
+        vigil_core::Event::LlmRequest { provider, model, last_user_message, .. } => {
+            let model_short = model.split('-').next().unwrap_or(model);
+            match last_user_message.as_deref().map(|s| truncate(s, 45)) {
+                Some(p) if !p.is_empty() => format!("{}/{} \"{}\"", provider, model_short, p),
+                _ => format!("{}/{}", provider, model_short),
+            }
+        }
+        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, .. } => {
+            let model_short = model.split('-').next().unwrap_or(model);
+            let base = format!("{}/{} {}in {}out ${:.4}", provider, model_short, input_tokens, output_tokens, cost_usd);
+            match response_text.as_deref().map(|s| truncate(s, 30)) {
+                Some(p) if !p.is_empty() => format!("{} \"{}\"", base, p),
+                _ => base,
+            }
+        }
+        vigil_core::Event::ToolCall { tool_name, .. } => tool_name.clone(),
+        vigil_core::Event::ToolCallResult { tool_name, blocked, .. } =>
+            format!("{} [{}]", tool_name, if *blocked { "DENIED" } else { "ok" }),
+        vigil_core::Event::FsRead { path, .. } => truncate(path, 60),
+        vigil_core::Event::FsWrite { path, bytes, .. } =>
+            format!("{} ({}B)", truncate(path, 50), bytes),
+        vigil_core::Event::ProcessSpawn { command, .. } => command.clone(),
+        vigil_core::Event::McpCall { server, method, .. } =>
+            format!("{}/{}", server, method),
+        vigil_core::Event::PiiAlert { source, kinds, .. } =>
+            format!("in {} -- {}", source, kinds.join(", ")),
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.trim();
+    let flat: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+    if flat.chars().count() > max {
+        let end = flat.char_indices().nth(max).map(|(i, _)| i).unwrap_or(flat.len());
+        format!("{}...", &flat[..end])
+    } else {
+        flat
+    }
+}
+
+// ─── detail pane ─────────────────────────────────────────────────────────────
+
+fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    match &event.event {
+        vigil_core::Event::LlmRequest { provider, model, last_user_message, system_prompt, .. } => {
+            out.push(header_line(format!("REQUEST  {}/{}", provider, model), Color::Cyan));
+            if let Some(sys) = system_prompt {
+                out.push(sep_line("system prompt"));
+                for l in sys.lines() { out.push(body_line(l)); }
+            }
+            if let Some(msg) = last_user_message {
+                out.push(sep_line("user message"));
+                for l in msg.lines() { out.push(body_line(l)); }
+            }
+        }
+        vigil_core::Event::LlmResponse { provider, model, input_tokens, output_tokens, cost_usd, response_text, .. } => {
+            out.push(header_line(
+                format!("RESPONSE  {}/{}  {}in {}out  ${:.4}", provider, model, input_tokens, output_tokens, cost_usd),
+                Color::Cyan,
+            ));
+            match response_text {
+                Some(text) => {
+                    out.push(sep_line("assistant"));
+                    for l in text.lines() { out.push(body_line(l)); }
+                }
+                None => {
+                    out.push(Line::from(Span::styled(
+                        "  (tool-use only -- no text content)",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
+        vigil_core::Event::ToolCall { agent, tool_name, input, .. } => {
+            out.push(header_line(format!("TOOL CALL  {}  ->  {}", agent, tool_name), Color::Yellow));
+            out.push(sep_line("input"));
+            let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
+            for l in pretty.lines() { out.push(body_line(l)); }
+        }
+        vigil_core::Event::ToolCallResult { agent, tool_name, blocked, .. } => {
+            let (label, color) = if *blocked { ("DENIED", Color::Red) } else { ("ALLOWED", Color::Green) };
+            out.push(header_line(
+                format!("TOOL RESULT  {}  {}  [{}]", agent, tool_name, label),
+                color,
+            ));
+        }
+        vigil_core::Event::FsRead { path, .. } => {
+            out.push(header_line("FS READ".to_string(), Color::Gray));
+            out.push(body_line(path));
+        }
+        vigil_core::Event::FsWrite { path, bytes, .. } => {
+            out.push(header_line("FS WRITE".to_string(), Color::Magenta));
+            out.push(body_line(&format!("{} ({} bytes)", path, bytes)));
+        }
+        vigil_core::Event::ProcessSpawn { command, args, .. } => {
+            out.push(header_line("PROCESS SPAWN".to_string(), Color::Yellow));
+            out.push(body_line(&format!("{} {}", command, args.join(" "))));
+        }
+        vigil_core::Event::McpCall { server, method, params, .. } => {
+            out.push(header_line(format!("MCP  {}/{}", server, method), Color::Cyan));
+            out.push(sep_line("params"));
+            let pretty = serde_json::to_string_pretty(params).unwrap_or_default();
+            for l in pretty.lines() { out.push(body_line(l)); }
+        }
+        vigil_core::Event::PiiAlert { source, kinds, .. } => {
+            out.push(header_line(format!("PII ALERT  source: {}", source), Color::Red));
+            out.push(body_line(&format!("Detected: {}", kinds.join(", "))));
+        }
+    }
+
+    out
+}
+
+fn header_line(s: String, color: Color) -> Line<'static> {
+    Line::from(Span::styled(s, Style::default().fg(color).add_modifier(Modifier::BOLD)))
+}
+
+fn sep_line(label: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  -- {} --", label),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn body_line(s: &str) -> Line<'static> {
+    Line::from(Span::raw(format!("  {}", s)))
+}
+
+// ─── stats sidebar ────────────────────────────────────────────────────────────
+
+fn stats_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    let sid = app.session.id.to_string();
+    let sid_short = sid[..8.min(sid.len())].to_string();
+
+    out.push(stat_row("session", sid_short, Color::White));
+    out.push(stat_row("agent", truncate(&app.session.agent, 14), Color::White));
+    out.push(Line::from(""));
+
+    let cost_color = if app.session.total_cost_usd > 0.0 { Color::Green } else { Color::DarkGray };
+    out.push(stat_row("cost", format!("${:.4}", app.session.total_cost_usd), cost_color));
+    out.push(stat_row("in", fmt_num(app.session.total_input_tokens) + " tok", Color::White));
+    out.push(stat_row("out", fmt_num(app.session.total_output_tokens) + " tok", Color::White));
+    out.push(Line::from(""));
+    out.push(Line::from(Span::styled("--------------------", Style::default().fg(Color::DarkGray))));
+
+    let c = &app.counts;
+    if c.requests > 0  { out.push(count_row("req",     c.requests,  Color::Cyan)); }
+    if c.responses > 0 { out.push(count_row("res",     c.responses, Color::Cyan)); }
+    if c.tools > 0     { out.push(count_row("tool",    c.tools,     Color::Yellow)); }
+    if c.results > 0   { out.push(count_row("result",  c.results,   Color::Green)); }
+    if c.blocked > 0   { out.push(count_row("blocked", c.blocked,   Color::Red)); }
+    if c.fs_reads > 0  { out.push(count_row("fsread",  c.fs_reads,  Color::Gray)); }
+    if c.fs_writes > 0 { out.push(count_row("fswrite", c.fs_writes, Color::Magenta)); }
+    if c.spawns > 0    { out.push(count_row("spawn",   c.spawns,    Color::Yellow)); }
+    if c.mcp > 0       { out.push(count_row("mcp",     c.mcp,       Color::Cyan)); }
+
+    out.push(Line::from(Span::styled("--------------------", Style::default().fg(Color::DarkGray))));
+
+    let viols = app.session.policy_violations;
+    let pii = app.session.pii_detections;
+    out.push(stat_row(
+        "violations",
+        viols.to_string(),
+        if viols > 0 { Color::Red } else { Color::DarkGray },
+    ));
+    out.push(stat_row(
+        "pii",
+        pii.to_string(),
+        if pii > 0 { Color::Red } else { Color::DarkGray },
+    ));
+
+    out
+}
+
+fn stat_row(key: &'static str, val: String, val_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{:<11}", key), Style::default().fg(Color::DarkGray)),
+        Span::styled(val, Style::default().fg(val_color)),
+    ])
+}
+
+fn count_row(key: &'static str, n: usize, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{:<8}", key), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:>5}", n), Style::default().fg(color)),
+    ])
+}
+
+fn fmt_num(n: u32) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 { out.push(','); }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+// ─── layout ──────────────────────────────────────────────────────────────────
+
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Percentage(55),
+            Constraint::Percentage(44),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(65),
+            Constraint::Percentage(35),
+        ])
+        .split(root[1]);
+
+    let panel_height = main[0].height.saturating_sub(2) as usize;
+    if panel_height > 0 {
+        app.visible_height = panel_height;
+    }
+
+    draw_header(frame, app, root[0]);
+    draw_event_list(frame, app, main[0]);
+    draw_stats_panel(frame, app, main[1]);
+    draw_detail_pane(frame, app, root[2]);
+    draw_help_bar(frame, app, root[3]);
+}
+
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    let sid = app.session.id.to_string();
+    let sid_short = &sid[..8.min(sid.len())];
+
+    let status = if app.is_replay {
+        Span::styled(" REPLAY ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else if app.agent_done {
+        Span::styled(" DONE ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" LIVE ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+    };
+
+    let position = if app.auto_scroll {
+        Span::styled("  tail", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled(
+            format!("  {}/{}", app.selected + 1, app.event_log.len()),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+
+    let quit_hint = if app.agent_done {
+        Span::styled("  (q to exit)", Style::default().fg(Color::Green))
+    } else {
+        Span::raw("")
+    };
+
+    let header = Paragraph::new(Line::from(vec![
+        status,
+        Span::raw("  "),
+        Span::styled("vigil", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("  session {}  agent {}", sid_short, app.session.agent),
+            Style::default().fg(Color::DarkGray),
+        ),
+        position,
+        quit_hint,
+    ]))
+    .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+
+    frame.render_widget(header, area);
+}
+
+fn draw_event_list(frame: &mut Frame, app: &mut App, area: Rect) {
+    let total = app.event_log.len();
+    let start = app.scroll_offset.min(total);
+    let end = (start + app.visible_height).min(total);
+
+    let items: Vec<ListItem> = app.event_log[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let abs = start + i;
+            if abs == app.selected {
+                ListItem::new(line.clone())
+                    .style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            } else {
+                ListItem::new(line.clone())
+            }
+        })
+        .collect();
+
+    let title = if total > app.visible_height {
+        format!("Events  {}-{} of {}", start + 1, end, total)
+    } else {
+        format!("Events  {}", total)
+    };
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(title, Style::default().fg(Color::White)))
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(list, area);
+}
+
+fn draw_stats_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let lines = stats_lines(app);
+    let stats = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled("Stats", Style::default().fg(Color::White)))
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(stats, area);
+}
+
+fn draw_detail_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let content = if app.raw_events.is_empty() {
+        vec![Line::from(Span::styled(
+            "  Select an event with up/down to inspect it here",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let idx = app.selected.min(app.raw_events.len().saturating_sub(1));
+        detail_lines(&app.raw_events[idx])
+    };
+
+    let (title, border_style) = if app.detail_focused {
+        (
+            "Detail  TAB=back to list  up/dn PgUp/PgDn Home=scroll",
+            Style::default().fg(Color::Cyan),
+        )
+    } else {
+        (
+            "Detail  TAB=focus/scroll",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let detail = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled(title, Style::default().fg(Color::White)))
+                .border_style(border_style),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.detail_scroll as u16, 0));
+    frame.render_widget(detail, area);
+}
+
+fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let text = if app.detail_focused {
+        "TAB=back  up/dn PgUp/PgDn Home=scroll detail  Esc=list"
+    } else {
+        "q=quit  up/dn=select  PgUp/PgDn  End=tail  TAB=detail"
+    };
+    let help = Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray)));
+    frame.render_widget(help, area);
+}
+
+// ─── launcher ────────────────────────────────────────────────────────────────
+
+pub async fn run_launcher(recent: Vec<SessionSummary>) -> Result<Option<String>> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut input = String::new();
+    let mut result: Option<String> = None;
+
+    loop {
+        terminal.draw(|f| draw_launcher(f, &input, &recent))?;
+
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') if input.is_empty() => break,
+                    KeyCode::Esc => break,
+                    KeyCode::Enter => {
+                        let trimmed = input.trim().to_string();
+                        if !trimmed.is_empty() {
+                            result = Some(trimmed);
+                            break;
+                        }
+                    }
+                    KeyCode::Backspace => { input.pop(); }
+                    KeyCode::Char(c) => input.push(c),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(result)
+}
+
+fn draw_launcher(frame: &mut Frame, input: &str, recent: &[SessionSummary]) {
+    let area = frame.area();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Title bar
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled("vigil", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("  AI agent observability", Style::default().fg(Color::DarkGray)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(title, chunks[0]);
+
+    // Recent sessions
+    let session_items: Vec<ListItem> = if recent.is_empty() {
+        vec![ListItem::new(Span::styled(
+            "  No previous sessions",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        recent.iter().take(8).map(|s| {
+            let started = s.started_at.format("%Y-%m-%d %H:%M").to_string();
+            let cost = format!("${:.4}", s.total_cost_usd);
+            let tokens = s.total_input_tokens + s.total_output_tokens;
+            ListItem::new(Line::from(vec![
+                Span::styled(started, Style::default().fg(Color::DarkGray)),
+                Span::raw("  "),
+                Span::styled(format!("{:<14}", &s.agent), Style::default().fg(Color::White)),
+                Span::styled(format!("{:>8}", cost), Style::default().fg(Color::Green)),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} tok", fmt_num(tokens)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} events", s.event_count),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        }).collect()
+    };
+
+    let sessions_list = List::new(session_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::styled("Recent Sessions", Style::default().fg(Color::White)))
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(sessions_list, chunks[1]);
+
+    // Input box
+    let cursor = if (input.len() / 2) % 2 == 0 { "_" } else { "_" };
+    let input_display = format!("{}{}", input, cursor);
+    let input_widget = Paragraph::new(Span::styled(
+        input_display,
+        Style::default().fg(Color::White),
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                "Agent command",
+                Style::default().fg(Color::White),
+            ))
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: false });
+    frame.render_widget(input_widget, chunks[2]);
+
+    // Help
+    let help = Paragraph::new(Span::styled(
+        "Enter=launch  Esc/q=quit  (agent runs in a new window, vigil monitors here)",
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(help, chunks[3]);
+}
+
+// ─── runtime ─────────────────────────────────────────────────────────────────
+
+pub async fn run_tui(
+    mut app: App,
+    mut event_rx: tokio::sync::mpsc::Receiver<TimestampedEvent>,
+) -> Result<App> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = run_app(&mut terminal, &mut app, &mut event_rx).await;
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result?;
+    Ok(app)
+}
+
+async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    event_rx: &mut tokio::sync::mpsc::Receiver<TimestampedEvent>,
+) -> Result<()> {
+    loop {
+        terminal.draw(|f| draw(f, app))?;
+
+        tokio::select! {
+            event_result = event_rx.recv() => {
+                match event_result {
+                    Some(ts_event) => {
+                        app.push_event(&ts_event);
+                    }
+                    None => {
+                        if app.is_replay {
+                            app.should_quit = true;
+                        } else {
+                            app.agent_done = true;
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                if event::poll(std::time::Duration::from_millis(10))? {
+                    if let Event::Key(key_event) = event::read()? {
+                        if key_event.kind == KeyEventKind::Press {
+                            app.on_key(key_event.code);
+                            if app.should_quit { break; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if app.should_quit { break; }
+    }
+
+    Ok(())
+}

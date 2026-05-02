@@ -1,0 +1,13 @@
+[package]
+name = "vigil-watch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+vigil-core = { path = "../vigil-core" }
+chrono = { version = "0.4", features = ["serde"] }
+sysinfo = "0.30"
+tracing = "0.1"

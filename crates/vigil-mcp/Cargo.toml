@@ -1,0 +1,19 @@
+[package]
+name = "vigil-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1.0"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+vigil-core = { path = "../vigil-core" }
+
+[[bin]]
+name = "vigil-mcp-shim"
+path = "src/main.rs"
