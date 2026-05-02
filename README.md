@@ -24,8 +24,14 @@ vigil run --config vigil.toml -- claude
 # List recorded sessions
 vigil sessions
 
+# Show all currently running vigil sessions
+vigil ps
+
 # Replay a session in the TUI
 vigil replay <session-uuid>
+
+# Fork a session: replay N events as context, then go live
+vigil fork <session-uuid> --prefix-events 10 -- claude
 
 # Verify a session's hash chain integrity
 vigil audit <session-uuid>
@@ -42,6 +48,10 @@ vigil audit <session-uuid>
 | `PROC` | Child processes spawned by the agent |
 | `MCP` | MCP server tool calls via vigil-mcp-shim |
 | `PII!` | PII detections (regex + custom watchlist) |
+| `BURN` | Burn-rate alarm: $/min exceeded threshold |
+| `LOOP` | Loop detection: same tool+input repeated N times |
+| `WAPPR` | Write approval required: agent wants to write a risky file |
+| `EXFL` | Credential exfiltration: secret from a file read appeared in outbound LLM request |
 
 ## Configuration (vigil.toml)
 
@@ -154,6 +164,41 @@ PASS
 ```
 
 Exits with code 0 (PASS) or 1 (FAIL). Suitable for CI use.
+
+## Burn-rate alarms and loop detection
+
+```toml
+[budget]
+max_burn_rate_usd_per_min = 0.50   # alert when spending exceeds this rate
+loop_detect_threshold = 5          # alert when same tool+input repeats N times
+```
+
+A `BURN` event fires with a projected session total whenever the rolling $/min rate exceeds the limit. A `LOOP` event fires when the same tool+input hash is seen N times in a session.
+
+## Diff-gated write approval
+
+```toml
+[proxy]
+write_approval_threshold = "High"   # Low / Medium / High
+```
+
+When set, vigil buffers the SSE stream at any Write/Edit/MultiEdit/NotebookEdit tool call, scores the diff, and if risk meets the threshold shows a full-screen TUI overlay with before/after diff. Press `y` to approve or `n` to reject (agent receives HTTP 403). 5-minute timeout auto-rejects.
+
+Risk scoring: crown jewels paths (`.env`, `auth`, `migration`, `payment`, private keys) → High; >40% lines deleted → High; >10 lines deleted → Medium; file >500 lines → Medium.
+
+## Credential exfiltration detection
+
+vigil fingerprints secrets (API keys, tokens, `.env` values) from files the agent reads. If a fingerprint later appears in an outbound LLM request or shell command, an `EXFL` event fires with a redacted match.
+
+No credentials are stored — only SHA-256 hashes. Redacted matches show the first 4 characters followed by `***`.
+
+## Multi-session dashboard
+
+```bash
+vigil ps
+```
+
+Shows all currently running vigil sessions on this machine with per-session burn rate, token count, cost, and attention flags. Uses `~/.vigil/active/` lock files with PID verification to detect stale entries.
 
 ## Architecture
 
