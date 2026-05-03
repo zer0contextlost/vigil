@@ -155,8 +155,10 @@ impl App {
             vigil_core::Event::CostAlert { .. } => {}
             vigil_core::Event::SessionDurationAlert { .. } => {}
         }
-        if let Some(ref mut store) = self.store {
-            let _ = store.append(event);
+        if !self.is_replay {
+            if let Some(ref mut store) = self.store {
+                let _ = store.append(event);
+            }
         }
         self.session.record(event.clone());
         self.event_log.push(format_event_line(event));

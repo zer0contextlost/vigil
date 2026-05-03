@@ -1173,7 +1173,7 @@ pub async fn run_proxy_mode(
                         }
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     } else {
-                        let ctx = make_plugin_ctx(session_id);
+                        let ctx = make_plugin_ctx(event.session_id);
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     }
                     filtered_tx.send(event).await.ok();
@@ -1783,7 +1783,7 @@ pub async fn run_agent_with_plugins(
                         }
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     } else {
-                        let ctx = make_plugin_ctx(session_id_for_alerts);
+                        let ctx = make_plugin_ctx(event.session_id);
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     }
                     filtered_tx.send(event).await.ok();

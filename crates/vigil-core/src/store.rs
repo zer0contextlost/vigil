@@ -217,14 +217,28 @@ impl SessionStore {
         }
         let content = std::fs::read_to_string(&path)?;
         let mut envelopes = Vec::new();
-        for line in content.lines() {
+        let mut malformed = 0usize;
+        for (i, line) in content.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            if let Ok(env) = serde_json::from_str::<Envelope>(line) {
-                envelopes.push(env);
+            match serde_json::from_str::<Envelope>(line) {
+                Ok(env) => envelopes.push(env),
+                Err(e) => {
+                    malformed += 1;
+                    tracing::warn!(
+                        %session_id, line = i + 1, error = %e,
+                        "skipping malformed NDJSON line in session file"
+                    );
+                }
             }
+        }
+        if malformed > 0 {
+            tracing::warn!(
+                %session_id, malformed, loaded = envelopes.len(),
+                "session file has malformed lines — some events may be missing"
+            );
         }
         Ok(envelopes)
     }
