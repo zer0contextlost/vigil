@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.7] - 2026-05-03
+
+### Fixed
+- `vigil report`, `vigil audit`, `vigil verify`, and `vigil replay` now accept a UUID prefix or session name in addition to a full UUID, matching the behavior of `vigil diff`; help text updated to say "UUID, prefix, or session name"
+- Proxy turn counter is now keyed per session using a `Mutex<HashMap<Uuid, u32>>`; previously the two process-global `AtomicU32` counters accumulated turns across sessions, causing inflated turn numbers after the first session
+- Removed unused `format_duration` function from `vigil-cli` that caused a dead-code warning
+- Web dashboard detail info strip now shows a Model field when the session's model is known (populated from `LlmRequest`/`LlmResponse` SSE events); the field is omitted when no model has been seen
+- `vigil status --recent` argument type changed from `usize` to `u32`; passing `-1` now produces a clear "invalid value" error from clap instead of a confusing "unexpected argument" message
+
 ## [0.7.6] - 2026-05-03
 
 ### Added

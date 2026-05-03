@@ -384,6 +384,18 @@ async fn handle_http_request(
     Ok(())
 }
 
+/// Per-session turn counter — returns the next turn number (starting at 1) for a given session.
+/// Each session maintains its own counter so turns don't accumulate across sessions.
+fn next_turn_for_session(session_id: Uuid) -> u32 {
+    use std::sync::OnceLock;
+    static COUNTERS: OnceLock<Mutex<HashMap<Uuid, u32>>> = OnceLock::new();
+    let map = COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    let count = guard.entry(session_id).or_insert(0);
+    *count += 1;
+    *count
+}
+
 /// Extract the model name from a Gemini request path.
 /// e.g. "/v1beta/models/gemini-3-flash:streamGenerateContent" → "gemini-3-flash"
 fn extract_gemini_model_from_path(path: &str) -> Option<String> {
@@ -576,9 +588,8 @@ async fn handle_reverse_proxy(
         Some(base64::engine::general_purpose::STANDARD.encode(&effective_body))
     };
 
-    // Increment turn counter and capture it
-    static TURN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let turn_number = TURN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // Increment per-session turn counter and capture it
+    let turn_number = next_turn_for_session(session_id);
 
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
         provider: provider.to_string(),
@@ -1716,9 +1727,8 @@ fn emit_llm_request(
                 Some(base64::engine::general_purpose::STANDARD.encode(json.to_string()))
             };
 
-            // Increment turn counter for non-streaming responses
-            static TURN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let turn_number = TURN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            // Increment per-session turn counter for non-streaming responses
+            let turn_number = next_turn_for_session(session_id);
 
             let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
                 provider: provider.to_string(),

@@ -130,7 +130,7 @@ enum Commands {
 
     /// Replay a recorded session
     Replay {
-        /// Session ID to replay
+        /// UUID, prefix, or session name to replay
         session_id: String,
         /// Run as a mock proxy: serve recorded responses to a live agent instead of showing TUI.
         /// Point Claude Code at the proxy with ANTHROPIC_BASE_URL=http://127.0.0.1:<port>
@@ -143,13 +143,13 @@ enum Commands {
 
     /// Verify hash chain integrity of a recorded session
     Audit {
-        /// Session ID (UUID) to audit
+        /// UUID, prefix, or session name to audit
         session_id: String,
     },
 
     /// Verify hash chain and ed25519 signature of a recorded session
     Verify {
-        /// Session ID (UUID) to verify
+        /// UUID, prefix, or session name to verify
         session_id: String,
     },
 
@@ -175,7 +175,7 @@ enum Commands {
     Status {
         /// Include this many recently completed sessions (default: 5)
         #[arg(long, default_value = "5")]
-        recent: usize,
+        recent: u32,
     },
 
     /// Replay a session prefix and continue with a live agent
@@ -261,7 +261,7 @@ enum Commands {
 
     /// Generate a session audit report with hygiene scorecard
     Report {
-        /// Session ID (UUID prefix or full)
+        /// UUID, prefix, or session name
         session_id: String,
         /// Output as JSON
         #[arg(long)]
@@ -778,7 +778,7 @@ async fn main() -> Result<()> {
             run_ps()?;
         }
         Some(Commands::Status { recent }) => {
-            run_status(recent)?;
+            run_status(recent as usize)?;
         }
         Some(Commands::Fork { session_id, prefix_events, agent_and_args }) => {
             run_fork(&session_id, prefix_events, agent_and_args).await?;
@@ -809,8 +809,7 @@ async fn main() -> Result<()> {
                 run_replay_mock(&session_id, on_miss_mode).await?;
                 return Ok(());
             }
-            let uuid = uuid::Uuid::parse_str(&session_id)
-                .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+            let uuid = resolve_session_id_or_prefix(&session_id)?;
 
             let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
             if !envelopes.is_empty() {
@@ -867,8 +866,7 @@ async fn main() -> Result<()> {
             run_diff(&session_a, &session_b, brief)?;
         }
         Some(Commands::Report { session_id, json, html, html_fragment, include_payloads, config }) => {
-            let uuid = uuid::Uuid::parse_str(&session_id)
-                .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+            let uuid = resolve_session_id_or_prefix(&session_id)?;
             let envelopes = SessionStore::load_envelopes(&uuid)?;
             let meta = SessionStore::load_meta(&uuid).with_context(|| {
                 format!("Session meta not found for {}. The session may be incomplete (agent exited unexpectedly). Try 'vigil audit {}' to inspect the event log.", uuid, uuid)
@@ -911,8 +909,7 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_audit(session_id: &str) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(session_id)
-        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+    let uuid = resolve_session_id_or_prefix(session_id)?;
 
     let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
     let actual_count = envelopes.len();
@@ -1001,8 +998,7 @@ fn run_audit(session_id: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_verify(session_id: &str) -> Result<()> {
-    let uuid = uuid::Uuid::parse_str(session_id)
-        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+    let uuid = resolve_session_id_or_prefix(session_id)?;
 
     let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
     let actual_count = envelopes.len();
@@ -3902,21 +3898,6 @@ fn find_available_port(start: u16) -> anyhow::Result<u16> {
         }
     }
     anyhow::bail!("no available port found in range {}–{}", start, start.saturating_add(20))
-}
-
-fn format_duration(d: chrono::Duration) -> String {
-    let total_secs = d.num_seconds();
-    let hours = total_secs / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let secs = total_secs % 60;
-
-    if hours > 0 {
-        format!("{}h{:02}m", hours, minutes)
-    } else if minutes > 0 {
-        format!("{}m{:02}s", minutes, secs)
-    } else {
-        format!("{}s", secs)
-    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

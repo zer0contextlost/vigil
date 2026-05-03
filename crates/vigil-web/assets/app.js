@@ -505,6 +505,14 @@ async function loadAllSessionDetail(id, total) {
   }
 }
 
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function renderDetailInfo(s) {
   const el = document.getElementById('detail-info');
   const duration = s.ended_at
@@ -512,12 +520,16 @@ function renderDetailInfo(s) {
     : formatDuration(new Date(s.started_at), new Date());
 
   const sid = s.id;
+  const modelSpan = s.model
+    ? `<span>Model: <strong>${escHtml(s.model)}</strong></span>`
+    : '';
   el.innerHTML = `
     <span>Started: <strong>${new Date(s.started_at).toLocaleString()}</strong></span>
     <span>Duration: <strong>${duration}</strong></span>
     <span>Cost: <strong>$${(s.cost_usd || 0).toFixed(4)}</strong></span>
     <span>Tokens: <strong>${(s.tokens || 0).toLocaleString()}</strong></span>
     <span>Status: <strong>${s.status === 'live' ? '🟢 LIVE' : '⚫ COMPLETED'}</strong></span>
+    ${modelSpan}
     <div class="export-menu">
       <button class="btn btn-export" onclick="toggleExportMenu(event)">↓ Download</button>
       <div class="export-dropdown" id="export-dropdown">
