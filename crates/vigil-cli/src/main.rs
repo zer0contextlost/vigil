@@ -283,7 +283,6 @@ enum Commands {
 // Calling CreateProcessW with bInheritHandles=FALSE lets Windows assign the
 // new console's own stdin/stdout/stderr to the child automatically.
 // ---------------------------------------------------------------------------
-#[cfg(windows)]
 mod fake_upstream;
 
 #[cfg(windows)]
