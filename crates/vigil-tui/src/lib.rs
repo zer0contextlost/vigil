@@ -702,7 +702,9 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let sid = app.session.id.to_string();
     let sid_short = &sid[..8.min(sid.len())];
 
-    let status = if app.is_replay {
+    let status = if app.is_replay && app.agent_done {
+        Span::styled(" REPLAY DONE ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
+    } else if app.is_replay {
         Span::styled(" REPLAY ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else if app.agent_done {
         Span::styled(" DONE ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
@@ -1069,11 +1071,10 @@ async fn run_app<B: Backend>(
                         app.push_event(&ts_event);
                     }
                     None => {
-                        if app.is_replay {
-                            app.should_quit = true;
-                        } else {
-                            app.agent_done = true;
-                        }
+                        // Channel closed: replay finished or agent exited.
+                        // In both cases mark done and let the user press 'q' —
+                        // auto-quitting would close the TUI before they can read it.
+                        app.agent_done = true;
                     }
                 }
             }
