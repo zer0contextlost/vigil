@@ -28,6 +28,7 @@ vigil-mcp = { path = "../vigil-mcp" }
 vigil-proxy = { path = "../vigil-proxy" }
 vigil-tui = { path = "../vigil-tui" }
 vigil-watch = { path = "../vigil-watch" }
+vigil-web = { path = "../vigil-web" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sha2 = "0.10"

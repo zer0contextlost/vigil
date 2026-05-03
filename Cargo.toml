@@ -7,6 +7,7 @@ members = [
     "crates/vigil-mcp",
     "crates/vigil-tui",
     "crates/vigil-watch",
+    "crates/vigil-web",
     "plugins/alert-logger",
     "plugins/slack-notifier",
     "plugins/otel-exporter",

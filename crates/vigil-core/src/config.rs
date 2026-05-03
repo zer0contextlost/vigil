@@ -42,7 +42,10 @@ fn default_blocked_commands() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 pub struct ProxySection {
     pub port: Option<u16>,
-    pub metrics_port: Option<u16>,
+    /// Port to bind the web dashboard on 127.0.0.1. Default off (None).
+    /// Set to a port (e.g. 8878) to enable the browser dashboard.
+    #[serde(default)]
+    pub dashboard_port: Option<u16>,
     /// Gate writes at this risk level or above. "Low", "Medium", or "High".
     /// None (the default) disables write approval gating.
     #[serde(default)]

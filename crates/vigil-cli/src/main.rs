@@ -7,6 +7,7 @@ use vigil_mcp::run_mcp_server;
 use vigil_proxy::{Proxy, DenialRecord, PendingDenials};
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
+use vigil_web;
 
 mod report;
 
@@ -1589,6 +1590,18 @@ pub async fn run_proxy_mode(
     let engine_clone = engine.clone();
     let pending_denials_filter = pending_denials.clone();
     let tui_rx = filtered_tx.subscribe();
+
+    if let Some(dashboard_port) = config.as_ref().and_then(|c| c.proxy.dashboard_port) {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], dashboard_port));
+        let tx = filtered_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = vigil_web::run_dashboard(addr, tx).await {
+                tracing::warn!(err = %e, "dashboard error");
+            }
+        });
+        println!("Dashboard: http://127.0.0.1:{}", dashboard_port);
+    }
+
     let filter_handle = tokio::spawn(async move {
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
@@ -2115,6 +2128,18 @@ pub async fn run_agent_with_plugins(
     let plugin_host_filter = plugin_host.clone();
     let pending_denials_filter = pending_denials.clone();
     let tui_rx = filtered_tx.subscribe();
+
+    if let Some(dashboard_port) = config.as_ref().and_then(|c| c.proxy.dashboard_port) {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], dashboard_port));
+        let tx = filtered_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = vigil_web::run_dashboard(addr, tx).await {
+                tracing::warn!(err = %e, "dashboard error");
+            }
+        });
+        println!("Dashboard: http://127.0.0.1:{}", dashboard_port);
+    }
+
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
