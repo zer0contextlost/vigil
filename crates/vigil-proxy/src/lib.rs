@@ -352,6 +352,14 @@ async fn handle_http_request(
     Ok(())
 }
 
+/// Extract the model name from a Gemini request path.
+/// e.g. "/v1beta/models/gemini-3-flash:streamGenerateContent" → "gemini-3-flash"
+fn extract_gemini_model_from_path(path: &str) -> Option<String> {
+    let after = path.split("/models/").nth(1)?;
+    let model = after.split(':').next()?;
+    if model.is_empty() { None } else { Some(model.to_string()) }
+}
+
 /// Reverse proxy: forward request to upstream Anthropic/OpenAI over HTTPS,
 /// stream the response back to the client, and emit vigil events.
 async fn handle_reverse_proxy(
@@ -369,8 +377,16 @@ async fn handle_reverse_proxy(
     // Determine upstream base URL and provider label.
     // upstream_override routes all requests to a test/custom server.
     let routing = if let Some(ov) = &config.upstream_override {
-        let p = if path.contains("/messages") { "anthropic" } else { "openai" };
+        let p = if path.contains("/messages") {
+            "anthropic"
+        } else if path.contains("/v1beta/models/") && (path.contains(":streamGenerateContent") || path.contains(":generateContent")) {
+            "gemini"
+        } else {
+            "openai"
+        };
         Some((ov.as_str(), p))
+    } else if path.contains("/v1beta/models/") && (path.contains(":streamGenerateContent") || path.contains(":generateContent")) {
+        Some(("https://generativelanguage.googleapis.com", "gemini"))
     } else if path.contains("/messages") || path.contains("/v1/messages") {
         Some(("https://api.anthropic.com", "anthropic"))
     } else if path.contains("/chat/completions") || path.contains("/v1/chat") {
@@ -474,13 +490,29 @@ async fn handle_reverse_proxy(
                 let model = j
                     .get("model")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        // For Gemini, extract model from the path if not in body
+                        if provider == "gemini" {
+                            extract_gemini_model_from_path(&clean_path)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
                 let last_user_message = extract_last_user_message(&j);
                 let system_prompt = extract_system_prompt(&j);
                 (model, last_user_message, system_prompt)
             })
-            .unwrap_or_else(|_| ("unknown".to_string(), None, None));
+            .unwrap_or_else(|_| {
+                // If body parsing fails and we're Gemini, still try to extract from path
+                let model = if provider == "gemini" {
+                    extract_gemini_model_from_path(&clean_path).unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    "unknown".to_string()
+                };
+                (model, None, None)
+            });
 
     // Scan the outgoing user message and system prompt for PII.
     {
@@ -1594,6 +1626,20 @@ pub fn cost_usd_with_cache(model: &str, input_tokens: u32, output_tokens: u32, c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_gemini_model_from_path() {
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/gemini-3-flash:streamGenerateContent"),
+            Some("gemini-3-flash".to_string())
+        );
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/gemini-2.5-flash-lite:generateContent"),
+            Some("gemini-2.5-flash-lite".to_string())
+        );
+        assert_eq!(extract_gemini_model_from_path("/v1/messages"), None);
+        assert_eq!(extract_gemini_model_from_path(""), None);
+    }
 
     #[test]
     fn test_detect_provider_anthropic() {
