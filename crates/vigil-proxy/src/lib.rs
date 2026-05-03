@@ -66,7 +66,17 @@ impl Proxy {
         Self {
             config,
             event_tx,
-            http_client: reqwest::Client::new(),
+            http_client: {
+                // Honor system proxy env vars (http_proxy, https_proxy, no_proxy) by default.
+                // vigil forwards to api.anthropic.com; a corporate proxy may be required.
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(300))
+                    .redirect(reqwest::redirect::Policy::limited(5))
+                    .user_agent(concat!("vigil/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .expect("failed to build HTTP client")
+            },
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
