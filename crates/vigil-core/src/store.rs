@@ -496,6 +496,7 @@ mod tests {
             response_text: Some(format!("The user email is {}.", fake_email)),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            raw_response: None,
         };
         let envelope = crate::envelope::Envelope::new(response_event);
         store.append(&envelope).unwrap();

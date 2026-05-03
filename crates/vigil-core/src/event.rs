@@ -33,6 +33,11 @@ pub enum Event {
         cache_read_input_tokens: u32,
         #[serde(default)]
         cache_creation_input_tokens: u32,
+        /// Raw upstream SSE bytes, gzip-compressed and base64-encoded.
+        /// Used by `vigil replay` to replay recorded responses verbatim.
+        /// None if the response exceeded 4 MiB uncompressed or compression failed.
+        #[serde(default)]
+        raw_response: Option<String>,
     },
     ToolCall {
         agent: String,

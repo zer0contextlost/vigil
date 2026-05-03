@@ -591,6 +591,9 @@ struct SseState {
     block_id: HashMap<usize, String>,
     response_text: String,
     response_text_bytes: usize,
+    /// Raw SSE bytes captured for replay. Capped at 4 MiB uncompressed.
+    raw_tee: Vec<u8>,
+    raw_tee_capped: bool,
     /// True when we are buffering a Write/Edit block for potential approval.
     holding: bool,
     /// Which block index triggered the hold.
@@ -627,6 +630,16 @@ async fn stream_sse_response(
 
         if chunk.is_empty() {
             continue;
+        }
+
+        // Tee raw bytes for replay capture (4 MiB uncompressed cap).
+        if !state.raw_tee_capped {
+            const RAW_TEE_CAP: usize = 4 * 1024 * 1024;
+            if state.raw_tee.len() + chunk.len() <= RAW_TEE_CAP {
+                state.raw_tee.extend_from_slice(&chunk);
+            } else {
+                state.raw_tee_capped = true;
+            }
         }
 
         // Parse the chunk first, then decide whether to buffer or forward.
@@ -847,6 +860,18 @@ async fn stream_sse_response(
         if let Some(text) = &response_text {
             emit_pii_alert_if_found("llm_response", text, pii_watchlist, session_id, event_tx);
         }
+        let raw_response = if !state.raw_tee.is_empty() && !state.raw_tee_capped {
+            use base64::Engine as _;
+            use flate2::{write::GzEncoder, Compression};
+            use std::io::Write as _;
+            let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+            enc.write_all(&state.raw_tee)
+                .and_then(|_| enc.finish())
+                .ok()
+                .map(|compressed| base64::engine::general_purpose::STANDARD.encode(&compressed))
+        } else {
+            None
+        };
         let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmResponse {
             provider: provider.to_string(),
             model: state.model.clone(),
@@ -857,6 +882,7 @@ async fn stream_sse_response(
             response_text,
             cache_read_input_tokens: state.cache_read_input_tokens,
             cache_creation_input_tokens: state.cache_creation_input_tokens,
+            raw_response,
         }));
     }
 
@@ -1441,6 +1467,7 @@ fn emit_anthropic_response(
         response_text,
         cache_read_input_tokens,
         cache_creation_input_tokens,
+        raw_response: None,
     }));
 
     if let Some(content) = json.get("content").and_then(|v| v.as_array()) {
@@ -1509,6 +1536,7 @@ fn emit_openai_response(
         response_text,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        raw_response: None,
     }));
 
     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {

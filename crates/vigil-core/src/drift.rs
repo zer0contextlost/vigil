@@ -330,6 +330,7 @@ mod tests {
             response_text: text,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            raw_response: None,
         }
     }
 
