@@ -1104,7 +1104,7 @@ fn draw_launcher(frame: &mut Frame, input: &str, recent: &[SessionSummary]) {
 
 pub async fn run_tui(
     mut app: App,
-    mut event_rx: tokio::sync::mpsc::Receiver<TimestampedEvent>,
+    mut event_rx: tokio::sync::broadcast::Receiver<TimestampedEvent>,
 ) -> Result<App> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -1125,7 +1125,7 @@ pub async fn run_tui(
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    event_rx: &mut tokio::sync::mpsc::Receiver<TimestampedEvent>,
+    event_rx: &mut tokio::sync::broadcast::Receiver<TimestampedEvent>,
 ) -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, app))?;
@@ -1137,12 +1137,13 @@ async fn run_app<B: Backend>(
             // starving the keyboard poller and making 'q' unresponsive.
             event_result = event_rx.recv(), if !app.agent_done => {
                 match event_result {
-                    Some(ts_event) => {
+                    Ok(ts_event) => {
                         app.push_event(&ts_event);
                     }
-                    None => {
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         app.agent_done = true;
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {

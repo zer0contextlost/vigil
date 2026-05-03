@@ -687,7 +687,7 @@ async fn main() -> Result<()> {
                 match vigil_tui::run_session_browser(summaries).await? {
                     Some(BrowseAction::Replay(id)) => {
                         let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
-                        let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                        let (tx, rx) = tokio::sync::broadcast::channel(envelopes.len().max(1));
                         let envelopes_clone = envelopes.clone();
                         tokio::spawn(async move {
                             for (i, env) in envelopes_clone.iter().enumerate() {
@@ -697,7 +697,7 @@ async fn main() -> Result<()> {
                                     let ms = delta.num_milliseconds().max(0).min(500) as u64;
                                     if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
                                 }
-                                if tx.send(env.clone()).await.is_err() { break; }
+                                if tx.send(env.clone()).is_err() { break; }
                             }
                         });
                         let meta = vigil_core::store::SessionStore::load_meta(&id).ok();
@@ -805,7 +805,7 @@ async fn main() -> Result<()> {
             let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
             if !envelopes.is_empty() {
                 println!("Replaying session {} ({} events, NDJSON)...", session_id, envelopes.len());
-                let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                let (tx, rx) = tokio::sync::broadcast::channel(envelopes.len().max(1));
                 let envelopes_clone = envelopes.clone();
                 tokio::spawn(async move {
                     for (i, event) in envelopes_clone.iter().enumerate() {
@@ -817,7 +817,7 @@ async fn main() -> Result<()> {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
                             }
                         }
-                        if tx.send(event.clone()).await.is_err() {
+                        if tx.send(event.clone()).is_err() {
                             break;
                         }
                     }
@@ -833,9 +833,9 @@ async fn main() -> Result<()> {
             } else {
                 let session = vigil_core::session::Session::load(&uuid)?;
                 println!("Replaying session {} ({} events, JSON)...", session_id, session.events.len());
-                let (tx, rx) = tokio::sync::mpsc::channel(session.events.len().max(1));
+                let (tx, rx) = tokio::sync::broadcast::channel(session.events.len().max(1));
                 for event in &session.events {
-                    tx.try_send(event.clone()).ok();
+                    tx.send(event.clone()).ok();
                 }
                 drop(tx);
                 let mut app = App::new(session);
@@ -1303,14 +1303,14 @@ async fn run_fork(
     let new_session_id = uuid::Uuid::new_v4();
     let store = vigil_core::store::SessionStore::create(new_session_id, &agent_name).ok();
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<vigil_core::TimestampedEvent>(1024);
+    let (tx, rx) = tokio::sync::broadcast::channel::<vigil_core::TimestampedEvent>(1024);
 
     // Send prefix events instantly (no timestamp pacing)
     let prefix_envelopes = envelopes[..prefix].to_vec();
     let tx_clone = tx.clone();
     tokio::spawn(async move {
         for env in prefix_envelopes {
-            if tx_clone.send(env).await.is_err() {
+            if tx_clone.send(env).is_err() {
                 break;
             }
         }
@@ -1498,7 +1498,7 @@ pub async fn run_proxy_mode(
     let ctx_start = make_plugin_ctx(session_id);
     plugin_host.dispatch_session_start(&ctx_start).await;
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
-    let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
+    let (filtered_tx, _) = tokio::sync::broadcast::channel::<TimestampedEvent>(1000);
 
     let write_approval_threshold = config.as_ref()
         .and_then(|c| c.proxy.write_approval_threshold.as_deref())
@@ -1588,6 +1588,7 @@ pub async fn run_proxy_mode(
     let plugin_host_filter = plugin_host.clone();
     let engine_clone = engine.clone();
     let pending_denials_filter = pending_denials.clone();
+    let tui_rx = filtered_tx.subscribe();
     let filter_handle = tokio::spawn(async move {
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
@@ -1609,7 +1610,7 @@ pub async fn run_proxy_mode(
                     let ctx = make_plugin_ctx(*sid);
                     plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Loop, &detail).await;
                     plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                    filtered_tx.send(alert).await.ok();
+                    filtered_tx.send(alert).ok();
                 }
                 if tool_name == "Task" {
                     sub_agent_depth = sub_agent_depth.saturating_add(1);
@@ -1620,7 +1621,7 @@ pub async fn run_proxy_mode(
                     });
                     let ctx = make_plugin_ctx(*sid);
                     plugin_host_filter.dispatch_event(&ctx, &spawn_event).await;
-                    filtered_tx.send(spawn_event).await.ok();
+                    filtered_tx.send(spawn_event).ok();
                     if let Some(max) = sub_agent_depth_limit_proxy {
                         if sub_agent_depth > max {
                             tracing::warn!(depth = sub_agent_depth, max, "sub-agent depth limit exceeded");
@@ -1641,7 +1642,7 @@ pub async fn run_proxy_mode(
                 let ctx = make_plugin_ctx(payload.session_id);
                 plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Drift, &detail).await;
                 plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                filtered_tx.send(alert).await.ok();
+                filtered_tx.send(alert).ok();
             }
 
             // Credential exfiltration detection — check child process command-line args
@@ -1663,7 +1664,7 @@ pub async fn run_proxy_mode(
                         let ctx = make_plugin_ctx(*sid);
                         plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
                         plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                        filtered_tx.send(alert).await.ok();
+                        filtered_tx.send(alert).ok();
                     }
                 }
             }
@@ -1691,7 +1692,7 @@ pub async fn run_proxy_mode(
                         let ctx = make_plugin_ctx(*sid);
                         plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
                         plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                        filtered_tx.send(alert).await.ok();
+                        filtered_tx.send(alert).ok();
                     }
                 }
             }
@@ -1703,7 +1704,7 @@ pub async fn run_proxy_mode(
                 let ctx = make_plugin_ctx(*sid);
                 plugin_host_filter.dispatch_alert(&ctx, AlertLabel::PromptInjection, &detail).await;
                 plugin_host_filter.dispatch_event(&ctx, &event).await;
-                filtered_tx.send(event).await.ok();
+                filtered_tx.send(event).ok();
                 continue;
             }
 
@@ -1730,7 +1731,7 @@ pub async fn run_proxy_mode(
                             correlation_id: None, duration_ms: None, is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
-                        filtered_tx.send(blocked).await.ok();
+                        filtered_tx.send(blocked).ok();
                     }
                 }
                 _ => {
@@ -1754,7 +1755,7 @@ pub async fn run_proxy_mode(
                                 correlation_id: None, duration_ms: None, is_error: false,
                             });
                             plugin_host_filter.dispatch_event(&ctx, &blocked).await;
-                            filtered_tx.send(blocked).await.ok();
+                            filtered_tx.send(blocked).ok();
                             continue;
                         }
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
@@ -1762,7 +1763,7 @@ pub async fn run_proxy_mode(
                         let ctx = make_plugin_ctx(event.session_id);
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     }
-                    filtered_tx.send(event).await.ok();
+                    filtered_tx.send(event).ok();
                 }
             }
         }
@@ -1772,7 +1773,7 @@ pub async fn run_proxy_mode(
     app.store = store;
     app.config_path = config_path;
     app.decision_tx = Some(decision_tx);
-    vigil_tui::run_tui(app, filtered_rx).await?;
+    vigil_tui::run_tui(app, tui_rx).await?;
 
     proxy_handle.abort();
     filter_handle.abort();
@@ -1862,7 +1863,7 @@ pub async fn run_agent_with_plugins(
     let plugin_host = Arc::new(plugins);
 
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
-    let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
+    let (filtered_tx, _) = tokio::sync::broadcast::channel::<TimestampedEvent>(1000);
 
     println!("vigil v{}", env!("CARGO_PKG_VERSION"));
     println!("Session ID: {}", session_id);
@@ -2061,7 +2062,7 @@ pub async fn run_agent_with_plugins(
                         let ctx = make_plugin_ctx(sid);
                         plugin_host_tout.dispatch_alert(&ctx, AlertLabel::Timeout, &detail).await;
                         plugin_host_tout.dispatch_event(&ctx, &ev).await;
-                        tx.send(ev).await.ok();
+                        tx.send(ev).ok();
                         eprintln!("[TIMEOUT] Tool '{}' has been running {}s with no response", tool_name, secs);
                     }
                     if let Some(ks) = kill_secs {
@@ -2100,7 +2101,7 @@ pub async fn run_agent_with_plugins(
             let ctx = make_plugin_ctx(sid);
             plugin_host_dura.dispatch_alert(&ctx, AlertLabel::Duration, &detail).await;
             plugin_host_dura.dispatch_event(&ctx, &ev).await;
-            tx.send(ev).await.ok();
+            tx.send(ev).ok();
             eprintln!("[DURATION] Session has been running {}min", duration_mins);
         });
     }
@@ -2113,6 +2114,7 @@ pub async fn run_agent_with_plugins(
     let notifier_filter = webhook_notifier.clone();
     let plugin_host_filter = plugin_host.clone();
     let pending_denials_filter = pending_denials.clone();
+    let tui_rx = filtered_tx.subscribe();
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
@@ -2172,7 +2174,7 @@ pub async fn run_agent_with_plugins(
                             let ctx = make_plugin_ctx(*sid);
                             plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
                             plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                            filtered_tx.send(alert).await.ok();
+                            filtered_tx.send(alert).ok();
                         }
                     }
                 }
@@ -2198,7 +2200,7 @@ pub async fn run_agent_with_plugins(
                             let ctx = make_plugin_ctx(*sid);
                             plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
                             plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                            filtered_tx.send(alert).await.ok();
+                            filtered_tx.send(alert).ok();
                         }
                     }
                 }
@@ -2230,7 +2232,7 @@ pub async fn run_agent_with_plugins(
                         let ctx = make_plugin_ctx(*sid);
                         plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
                         plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                        filtered_tx.send(alert).await.ok();
+                        filtered_tx.send(alert).ok();
                     }
                 }
             }
@@ -2257,7 +2259,7 @@ pub async fn run_agent_with_plugins(
                         let ctx = make_plugin_ctx(*sid);
                         plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
                         plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                        filtered_tx.send(alert).await.ok();
+                        filtered_tx.send(alert).ok();
                     }
                 }
             }
@@ -2291,7 +2293,7 @@ pub async fn run_agent_with_plugins(
                         let ctx = make_plugin_ctx(session_id_for_alerts);
                         plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Cost, &detail).await;
                         plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                        filtered_tx.send(alert).await.ok();
+                        filtered_tx.send(alert).ok();
                         eprintln!("[COST] Session cost ${:.4} crossed alert threshold ${:.4}", session_cost, threshold);
                     }
                 }
@@ -2314,7 +2316,7 @@ pub async fn run_agent_with_plugins(
                         let ctx = make_plugin_ctx(session_id_for_alerts);
                         plugin_host_filter.dispatch_alert(&ctx, AlertLabel::BurnRate, &detail).await;
                         plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                        filtered_tx.send(alert).await.ok();
+                        filtered_tx.send(alert).ok();
                         if let Some(ref path) = lock_path {
                             vigil_core::update_active(path, |s| {
                                 s.burn_rate_per_min = rate;
@@ -2341,7 +2343,7 @@ pub async fn run_agent_with_plugins(
                     let ctx = make_plugin_ctx(*sid);
                     plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Loop, &detail).await;
                     plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                    filtered_tx.send(alert).await.ok();
+                    filtered_tx.send(alert).ok();
                     if let Some(ref path) = lock_path {
                         vigil_core::update_active(path, |s| {
                             s.needs_attention = true;
@@ -2358,7 +2360,7 @@ pub async fn run_agent_with_plugins(
                     });
                     let ctx = make_plugin_ctx(*sid);
                     plugin_host_filter.dispatch_event(&ctx, &spawn_event).await;
-                    filtered_tx.send(spawn_event).await.ok();
+                    filtered_tx.send(spawn_event).ok();
                     if let Some(max) = sub_agent_depth_limit_agent {
                         if sub_agent_depth > max {
                             tracing::warn!(depth = sub_agent_depth, max, "sub-agent depth limit exceeded");
@@ -2382,7 +2384,7 @@ pub async fn run_agent_with_plugins(
                 let ctx = make_plugin_ctx(payload.session_id);
                 plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Drift, &detail).await;
                 plugin_host_filter.dispatch_event(&ctx, &alert).await;
-                filtered_tx.send(alert).await.ok();
+                filtered_tx.send(alert).ok();
                 if let Some(ref path) = lock_path {
                     vigil_core::update_active(path, |s| {
                         s.needs_attention = true;
@@ -2401,7 +2403,7 @@ pub async fn run_agent_with_plugins(
                 let ctx = make_plugin_ctx(*sid);
                 plugin_host_filter.dispatch_alert(&ctx, AlertLabel::PromptInjection, &detail).await;
                 plugin_host_filter.dispatch_event(&ctx, &event).await;
-                filtered_tx.send(event).await.ok();
+                filtered_tx.send(event).ok();
                 continue;
             }
 
@@ -2494,7 +2496,7 @@ pub async fn run_agent_with_plugins(
                             is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
-                        filtered_tx.send(blocked).await.ok();
+                        filtered_tx.send(blocked).ok();
                     }
                 }
                 _ => {
@@ -2531,7 +2533,7 @@ pub async fn run_agent_with_plugins(
                                 is_error: false,
                             });
                             plugin_host_filter.dispatch_event(&ctx, &blocked).await;
-                            filtered_tx.send(blocked).await.ok();
+                            filtered_tx.send(blocked).ok();
                             continue;
                         }
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
@@ -2539,7 +2541,7 @@ pub async fn run_agent_with_plugins(
                         let ctx = make_plugin_ctx(event.session_id);
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     }
-                    filtered_tx.send(event).await.ok();
+                    filtered_tx.send(event).ok();
                 }
             }
         }
@@ -2549,7 +2551,7 @@ pub async fn run_agent_with_plugins(
     app.store = store;
     app.config_path = config_path;
     app.decision_tx = Some(decision_tx);
-    let mut tui_handle = tokio::spawn(async move { vigil_tui::run_tui(app, filtered_rx).await });
+    let mut tui_handle = tokio::spawn(async move { vigil_tui::run_tui(app, tui_rx).await });
 
     // Wait for TUI exit (user pressed q) or agent exit — whichever comes first.
     // When the agent exits first, give in-flight proxy tasks a window to emit
