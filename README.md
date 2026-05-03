@@ -1,5 +1,7 @@
 # vigil
 
+No more ooopsies!
+
 Runtime observability and policy enforcement for AI coding agents.
 
 vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, and any agent that respects `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`.
