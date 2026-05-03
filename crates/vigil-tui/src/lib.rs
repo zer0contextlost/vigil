@@ -32,6 +32,7 @@ pub struct EventCounts {
     pub exfil_alerts: usize,
     pub drift_alerts: usize,
     pub sub_agent_spawns: usize,
+    pub injection_alerts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +162,9 @@ impl App {
             }
             vigil_core::Event::SubAgentSpawned { .. } => {
                 self.counts.sub_agent_spawns += 1;
+            }
+            vigil_core::Event::PromptInjectionAlert { .. } => {
+                self.counts.injection_alerts += 1;
             }
         }
         if !self.is_replay {
@@ -344,6 +348,8 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("DRFT", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         vigil_core::Event::SubAgentSpawned { .. } =>
             ("TASK", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::PromptInjectionAlert { .. } =>
+            ("PINJ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
@@ -359,6 +365,7 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
         | vigil_core::Event::SessionDurationAlert { .. }
         | vigil_core::Event::DriftAlert { .. }
         | vigil_core::Event::SubAgentSpawned { .. }
+        | vigil_core::Event::PromptInjectionAlert { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -426,6 +433,8 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("{}: {}", signal.as_str(), truncate(details, 60)),
         vigil_core::Event::SubAgentSpawned { depth, .. } =>
             format!("Sub-agent spawned (depth {})", depth),
+        vigil_core::Event::PromptInjectionAlert { category, .. } =>
+            format!("Prompt injection: {}", category),
     }
 }
 
@@ -573,6 +582,12 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(body_line(&format!("tool:  {}", tool_name)));
             out.push(body_line(&format!("depth: {}", depth)));
         }
+        vigil_core::Event::PromptInjectionAlert { tool_name, category, snippet, .. } => {
+            out.push(header_line("PROMPT INJECTION ALERT".to_string(), Color::Red));
+            out.push(body_line(&format!("tool_use_id: {}", tool_name)));
+            out.push(body_line(&format!("category:    {}", category)));
+            out.push(body_line(&format!("snippet:     {}", snippet)));
+        }
     }
 
     out
@@ -679,6 +694,13 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
             "sub-agents",
             c.sub_agent_spawns.to_string(),
             Color::Yellow,
+        ));
+    }
+    if c.injection_alerts > 0 {
+        out.push(stat_row(
+            "inj alerts",
+            c.injection_alerts.to_string(),
+            Color::Red,
         ));
     }
 

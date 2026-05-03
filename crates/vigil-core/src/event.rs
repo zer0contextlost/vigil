@@ -150,4 +150,12 @@ pub enum Event {
         depth: u32,
         tool_name: String,
     },
+    /// Emitted when a tool_result content block contains a known indirect prompt
+    /// injection pattern (instruction override, system tag, bidi Unicode, etc.).
+    PromptInjectionAlert {
+        session_id: Uuid,
+        tool_name: String,
+        category: String,
+        snippet: String,
+    },
 }

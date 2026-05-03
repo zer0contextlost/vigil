@@ -1,5 +1,42 @@
 use std::fmt;
 
+/// Normalizes provider-specific request/response formats into vigil's internal event model.
+pub trait ProviderAdapter: Send + Sync {
+    /// List of tool names that perform filesystem writes (used for write-approval gating).
+    fn write_tools(&self) -> &[&'static str];
+
+    /// List of tool names that perform filesystem reads (used for drift stall detection).
+    fn read_tools(&self) -> &[&'static str];
+
+    /// Map a provider tool name to a vigil-canonical name (e.g. "write_file" → "Write").
+    /// Returns the original name unchanged if no mapping exists.
+    fn canonical_tool_name<'a>(&self, name: &'a str) -> &'a str {
+        name
+    }
+}
+
+pub struct AnthropicAdapter;
+
+impl ProviderAdapter for AnthropicAdapter {
+    fn write_tools(&self) -> &[&'static str] {
+        &["Write", "Edit", "MultiEdit", "NotebookEdit", "create_file", "str_replace_editor"]
+    }
+    fn read_tools(&self) -> &[&'static str] {
+        &["Read", "Glob", "Grep", "LS", "Bash"]
+    }
+}
+
+pub struct OpenAiAdapter;
+
+impl ProviderAdapter for OpenAiAdapter {
+    fn write_tools(&self) -> &[&'static str] {
+        &["create_file", "str_replace_editor", "insert_edit_into_file"]
+    }
+    fn read_tools(&self) -> &[&'static str] {
+        &["read_file", "run_terminal_cmd"]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderKind {
     Anthropic,

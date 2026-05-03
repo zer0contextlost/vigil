@@ -9,12 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-use vigil_core::{scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host};
+use vigil_core::{scan_for_injection, scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host, AnthropicAdapter, ProviderAdapter};
 
 const MAX_HEADER_SIZE: usize = 65536;
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-
-const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// Response headers that are safe to forward to the client.
 /// Any header NOT in this list is silently dropped to prevent header injection
@@ -480,6 +478,11 @@ async fn handle_reverse_proxy(
         }
     }
 
+    // Scan tool_result content blocks in the request body for prompt injection.
+    if let Ok(body_json) = serde_json::from_slice::<Value>(&effective_body) {
+        scan_tool_results_for_injection(&body_json, session_id, event_tx);
+    }
+
     tracing::info!(provider, model = %model, "LLM request forwarded upstream");
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
         provider: provider.to_string(),
@@ -885,7 +888,7 @@ fn process_sse_event(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if WRITE_TOOLS.iter().any(|t| name.eq_ignore_ascii_case(t)) {
+                    if AnthropicAdapter.write_tools().iter().any(|t| name.eq_ignore_ascii_case(t)) {
                         state.holding = true;
                         state.holding_tool_idx = Some(idx);
                     }
@@ -932,7 +935,7 @@ fn process_sse_event(
                 tracing::info!(tool = %tool_name, "tool call detected in stream");
                 emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                 emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
-                if WRITE_TOOLS.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                if AnthropicAdapter.write_tools().iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
                     state.pending_approval_data = Some((tool_name.clone(), input.clone()));
                 }
                 let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
@@ -1061,6 +1064,77 @@ fn emit_pii_alert_if_found(
         kinds,
         session_id,
     }));
+}
+
+/// Scan all `tool_result` content blocks in an outbound request body for prompt
+/// injection patterns. For each finding, emit a `PromptInjectionAlert` event.
+fn scan_tool_results_for_injection(
+    body: &Value,
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<TimestampedEvent>,
+) {
+    let messages = match body.get("messages").and_then(|v| v.as_array()) {
+        Some(m) => m,
+        None => return,
+    };
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let content = match msg.get("content").and_then(|v| v.as_array()) {
+            Some(c) => c,
+            None => continue,
+        };
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            // tool_use_id is the name proxy for tool results; fall back to "unknown"
+            let tool_name = block
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Content may be a plain string or an array of text blocks
+            let texts: Vec<String> = match block.get("content") {
+                Some(Value::String(s)) => vec![s.clone()],
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter_map(|b| {
+                        if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => continue,
+            };
+
+            for text in &texts {
+                if text.is_empty() {
+                    continue;
+                }
+                let findings = scan_for_injection(text);
+                if findings.is_empty() {
+                    continue;
+                }
+                let f = &findings[0];
+                tracing::warn!(
+                    tool_name = %tool_name,
+                    category = f.category,
+                    "prompt injection pattern detected in tool result"
+                );
+                let _ = event_tx.try_send(TimestampedEvent::new(Event::PromptInjectionAlert {
+                    session_id,
+                    tool_name: tool_name.clone(),
+                    category: f.category.to_string(),
+                    snippet: f.snippet.clone(),
+                }));
+            }
+        }
+    }
 }
 
 /// Derive FsRead / FsWrite events from a tool call's name and input JSON,

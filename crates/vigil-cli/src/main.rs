@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, AlertLabel, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision};
+use vigil_core::{session::Session, store::SessionStore, AlertLabel, BashExfilFinding, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision, scan_bash_for_exfil};
 use vigil_proxy::Proxy;
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
@@ -1369,6 +1369,45 @@ pub async fn run_proxy_mode(
                 }
             }
 
+            // Network exfiltration detection — scan Bash tool call commands for
+            // curl/wget/netcat/scp/base64-pipe and similar patterns that can exfiltrate
+            // data to remote hosts regardless of whether credentials were previously seen.
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let shell_tools = ["Bash", "bash", "shell", "run_command", "execute"];
+                if shell_tools.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                    let cmd = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| input.as_str().unwrap_or(""));
+                    if let Some(BashExfilFinding { label, trigger }) = scan_bash_for_exfil(cmd) {
+                        let detail = serde_json::json!({
+                            "source": "bash-command",
+                            "pattern": label,
+                            "trigger": trigger,
+                        });
+                        let alert = TimestampedEvent::new(Event::ExfilAlert {
+                            matches: vec![format!("{} ({})", label, trigger)],
+                            source: "bash-command".to_string(),
+                            session_id: *sid,
+                        });
+                        let ctx = make_plugin_ctx(*sid);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                        filtered_tx.send(alert).await.ok();
+                    }
+                }
+            }
+
+            // Prompt injection alert — dispatch to plugins and forward to TUI
+            if let Event::PromptInjectionAlert { tool_name, category, snippet, session_id: sid } = &event.event {
+                let detail = serde_json::json!({"tool_name": tool_name, "category": category, "snippet": snippet});
+                eprintln!("[PINJ] Prompt injection detected in tool result '{}' ({})", tool_name, category);
+                let ctx = make_plugin_ctx(*sid);
+                plugin_host_filter.dispatch_alert(&ctx, AlertLabel::PromptInjection, &detail).await;
+                plugin_host_filter.dispatch_event(&ctx, &event).await;
+                filtered_tx.send(event).await.ok();
+                continue;
+            }
+
             let decision = engine_clone.evaluate(&event.event, 0);
             match decision.action {
                 vigil_core::PolicyAction::Deny => {
@@ -1797,6 +1836,37 @@ pub async fn run_agent_with_plugins(
                 }
             }
 
+            // Network exfiltration detection — scan Bash tool call commands for
+            // curl/wget/netcat/scp/base64-pipe and similar patterns that can exfiltrate
+            // data to remote hosts regardless of whether credentials were previously seen.
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let shell_tools = ["Bash", "bash", "shell", "run_command", "execute"];
+                if shell_tools.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                    let cmd = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| input.as_str().unwrap_or(""));
+                    if let Some(BashExfilFinding { label, trigger }) = scan_bash_for_exfil(cmd) {
+                        let detail = serde_json::json!({
+                            "source": "bash-command",
+                            "pattern": label,
+                            "trigger": trigger,
+                        });
+                        let alert = TimestampedEvent::new(Event::ExfilAlert {
+                            matches: vec![format!("{} ({})", label, trigger)],
+                            source: "bash-command".to_string(),
+                            session_id: *sid,
+                        });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("EXFL", &sid.to_string(), detail.clone());
+                        }
+                        let ctx = make_plugin_ctx(*sid);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                        filtered_tx.send(alert).await.ok();
+                    }
+                }
+            }
+
             // Credential exfiltration detection — check child process command-line args
             if let Event::ProcessSpawn { command, args, session_id: sid } = &event.event {
                 if !cred_tracker.is_empty() {
@@ -1951,6 +2021,20 @@ pub async fn run_agent_with_plugins(
                         s.last_event = "DRFT".to_string();
                     });
                 }
+            }
+
+            // Prompt injection alert — dispatch to plugins, webhook notifier, and TUI
+            if let Event::PromptInjectionAlert { tool_name, category, snippet, session_id: sid } = &event.event {
+                let detail = serde_json::json!({"tool_name": tool_name, "category": category, "snippet": snippet});
+                eprintln!("[PINJ] Prompt injection detected in tool result '{}' ({})", tool_name, category);
+                if let Some(ref n) = notifier_filter {
+                    n.send("PINJ", &sid.to_string(), detail.clone());
+                }
+                let ctx = make_plugin_ctx(*sid);
+                plugin_host_filter.dispatch_alert(&ctx, AlertLabel::PromptInjection, &detail).await;
+                plugin_host_filter.dispatch_event(&ctx, &event).await;
+                filtered_tx.send(event).await.ok();
+                continue;
             }
 
             if let Some(ref enforcer) = budget_enforcer {
@@ -2197,6 +2281,13 @@ fn detect_project_type() -> &'static str {
 fn generate_policy_yaml(project_type: &str) -> String {
     let base_policies = r#"# vigil policy — generated by `vigil init`
 # Docs: https://github.com/vigil-dev/vigil
+#
+# Network exfiltration detection is automatic for all Bash tool calls.
+# vigil scans every Bash command for high-signal patterns such as:
+#   curl --data / --upload, wget --post-data, nc -e / | nc, scp, sftp,
+#   base64 piped to a network tool, and DNS queries with pipes.
+# Matches emit an ExfilAlert event visible in the TUI without any policy
+# configuration required — no entries below are needed to enable this.
 
 policies:
   # Block shell commands that could destroy data
