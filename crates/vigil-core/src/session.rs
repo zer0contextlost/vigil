@@ -18,6 +18,8 @@ pub struct Session {
     #[serde(default)]
     pub pii_detections: u32,
     pub events: Vec<TimestampedEvent>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +50,7 @@ impl Session {
             policy_violations: 0,
             pii_detections: 0,
             events: Vec::new(),
+            name: None,
         }
     }
 

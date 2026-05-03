@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>vigil dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- Header -->
+  <div id="header">
+    <div class="brand">
+      <span class="dot"></span>
+      vigil
+    </div>
+    <div class="spacer"></div>
+    <div class="status-bar" id="conn-status">connecting...</div>
+  </div>
+
+  <!-- Layout -->
+  <div id="layout">
+    <!-- Sidebar -->
+    <div id="sidebar">
+      <div id="sidebar-header">Sessions</div>
+      <div id="session-list">
+        <div class="empty-state">
+          <div class="empty-icon">◯</div>
+          <div>No active sessions</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Main content -->
+    <div id="main">
+      <!-- Write approval banner (hidden until pending) -->
+      <div id="approval-banner">
+        <div class="approval-title">
+          ⚠ Write Approval Required
+          <span id="approval-risk" class="badge"></span>
+        </div>
+        <div class="approval-meta" id="approval-path"></div>
+        <div class="approval-actions">
+          <button class="btn btn-approve" onclick="submitApproval(true)">Approve</button>
+          <button class="btn btn-reject" onclick="submitApproval(false)">Reject</button>
+        </div>
+      </div>
+
+      <!-- Sessions list view (default) -->
+      <div id="sessions-view">
+        <div class="view-title">
+          All Sessions
+          <span class="view-subtitle" id="sessions-count"></span>
+        </div>
+
+        <table class="sessions-table" id="sessions-table">
+          <thead>
+            <tr>
+              <th>Session</th>
+              <th>Agent</th>
+              <th class="num">Cost</th>
+              <th class="num">$/min</th>
+              <th>Last Event</th>
+              <th>Alerts</th>
+              <th>Started</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="sessions-tbody">
+            <tr>
+              <td colspan="8">
+                <div class="empty-state">
+                  <div class="empty-icon">◯</div>
+                  <div>No sessions yet — run <code>vigil run -- claude</code> to start</div>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Session detail view (shown when a session is selected) -->
+      <div id="detail-view" style="display:none;">
+        <div class="detail-breadcrumb">
+          <button class="back-btn" onclick="showSessionsList()">← Sessions</button>
+          <span>›</span>
+          <span id="detail-session-name"></span>
+        </div>
+        <div class="detail-info-strip" id="detail-info"></div>
+        <div class="timeline" id="detail-timeline"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

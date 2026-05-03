@@ -61,6 +61,10 @@ impl PricingTable {
                 ModelPricing { pattern: "claude-3-5-sonnet".into(), input_per_million: 3.0, output_per_million: 15.0 },
                 ModelPricing { pattern: "claude-haiku-4".into(), input_per_million: 0.80, output_per_million: 4.0 },
                 ModelPricing { pattern: "claude-3-7-haiku".into(), input_per_million: 0.80, output_per_million: 4.0 },
+                ModelPricing { pattern: "gemini-3.1-pro".into(),      input_per_million: 2.0,  output_per_million: 12.0 },
+                ModelPricing { pattern: "gemini-3-flash".into(),       input_per_million: 0.5,  output_per_million: 3.0  },
+                ModelPricing { pattern: "gemini-2.5-flash-lite".into(),input_per_million: 0.10, output_per_million: 0.40 },
+                ModelPricing { pattern: "gemini-2.5-flash".into(),     input_per_million: 0.30, output_per_million: 2.50 },
                 ModelPricing { pattern: "gpt-4o-mini".into(), input_per_million: 0.15, output_per_million: 0.60 },
                 ModelPricing { pattern: "gpt-4o".into(), input_per_million: 2.50, output_per_million: 10.0 },
                 ModelPricing { pattern: "o3".into(), input_per_million: 10.0, output_per_million: 40.0 },
@@ -73,5 +77,27 @@ impl PricingTable {
     pub fn global() -> &'static PricingTable {
         static INSTANCE: OnceLock<PricingTable> = OnceLock::new();
         INSTANCE.get_or_init(Self::load)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gemini_pricing_lookup() {
+        let t = PricingTable::defaults();
+        assert_eq!(t.lookup("gemini-3.1-pro"),       (2.0,  12.0));
+        assert_eq!(t.lookup("gemini-3-flash"),        (0.5,  3.0 ));
+        assert_eq!(t.lookup("gemini-2.5-flash-lite"), (0.10, 0.40));
+        assert_eq!(t.lookup("gemini-2.5-flash"),      (0.30, 2.50));
+    }
+
+    #[test]
+    fn test_gemini_flash_lite_does_not_match_flash() {
+        // gemini-2.5-flash-lite must NOT match the gemini-2.5-flash entry
+        let t = PricingTable::defaults();
+        let (input, _) = t.lookup("gemini-2.5-flash-lite");
+        assert_eq!(input, 0.10, "flash-lite matched flash entry — ordering is wrong");
     }
 }

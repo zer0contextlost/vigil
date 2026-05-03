@@ -1,247 +1,299 @@
 # vigil
 
-No more ooopsies!
-
 Runtime observability and policy enforcement for AI coding agents.
 
-vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Codex, Cursor, Aider, and Gemini CLI.
+vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, Gemini CLI, and any agent that respects `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, or `GOOGLE_GEMINI_BASE_URL`.
 
-## Install
+## Quick start
 
 ```bash
 git clone https://github.com/zer0contextlost/vigil
 cd vigil
 cargo install --path crates/vigil-cli
-```
 
-## Quick start
-
-```bash
 # Run Claude Code under vigil
 vigil run -- claude
 
-# Name a session for easy reference later
+# Name a session
 vigil run --name auth-refactor -- claude
 
-# With a config file (budget limits, policies, webhooks)
+# With a config file
 vigil run --config vigil.toml -- claude
-
-# Load a plugin from a shared library
-vigil run --plugin ./my-plugin.dll -- claude
 ```
 
-## Session commands
+For IDEs that can't be launched by vigil (Cursor, etc.), use `vigil proxy` instead:
 
 ```bash
-# Browse sessions in a full TUI (arrow keys / j·k, Enter to replay, d to delete)
-vigil browse
-
-# Text table of all sessions
-vigil sessions
-
-# Tag a session with a human-readable name (UUID or existing name both work)
-vigil tag <session-id> my-label
-vigil tag my-label  better-label
-
-# Replay a session in the TUI
-vigil replay <session-id-or-name>
-
-# Replay a session prefix, then continue live
-vigil fork <session-id> --prefix-events 20 -- claude
-
-# Show all currently running vigil sessions on this machine
-vigil ps
+vigil proxy --port 8877 --config vigil.toml
 ```
 
-## Integrity and export
+Then point your IDE at `http://127.0.0.1:8877`. Cursor: Settings → Models → BYOK → set Override OpenAI Base URL to `http://127.0.0.1:8877/v1`.
+
+For Gemini CLI, set the base URL environment variable before running:
 
 ```bash
-# Verify hash chain + ed25519 signature
-vigil verify <session-id>
-
-# Legacy audit (hash chain + ULID order + meta count)
-vigil audit <session-id>
-
-# Export session to NDJSON with PII redacted
-vigil export <session-id>
-vigil export <session-id> --output redacted.ndjson
+vigil proxy --port 8877 --config vigil.toml
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8877
+gemini
 ```
 
-`vigil verify` exits 0 (PASS) or 1 (FAIL) — suitable for CI.
+vigil auto-detects Gemini requests by path pattern and routes them to `https://generativelanguage.googleapis.com`. The write-approval gate, PII scanner, policy engine, and all other vigil features work identically for Gemini traffic.
 
-## What vigil records
+## Architecture
 
-| Event | What it captures |
-|-------|-----------------|
-| `REQ / RES` | Every model call: provider, model, tokens, cost (including cache tokens) |
-| `TOOL` | Tool calls before execution — inspectable and blockable |
-| `DENY / OK` | Policy decisions on tool calls |
-| `READ / WRIT` | File reads and writes inferred from tool call parameters |
-| `PROC` | Child processes spawned by the agent |
-| `MCP` | MCP server tool calls via vigil-mcp-shim |
-| `PII!` | PII detections (regex + custom watchlist) |
-| `BURN` | Burn-rate alarm: $/min exceeded threshold |
-| `LOOP` | Loop detection: same tool+input repeated N times |
-| `WAPPR` | Write approval required: risky diff gated on human approval |
-| `EXFL` | Credential exfiltration: secret from a file read appeared in outbound request |
-| `COST` | Soft cost alert: session spend crossed a warning threshold |
-| `DURA` | Session duration alert: session has been running longer than configured limit |
-| `TOUT` | Tool timeout: no LLM response after a tool call for N seconds |
+| Crate | Role |
+|-------|------|
+| `vigil-cli` | Binary entrypoint; CLI parsing, agent spawning, TUI orchestration, budget enforcement, plugin loading |
+| `vigil-core` | Event types, Envelope/hash chain, SessionStore, ed25519 signing, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner, PluginHost, drift/exfil/injection detection |
+| `vigil-proxy` | HTTP reverse proxy, SSE parser (Anthropic + OpenAI + Gemini formats), write-approval gate |
+| `vigil-tui` | ratatui dashboard, session browser, replay viewer |
+| `vigil-watch` | Process tree monitor (sysinfo) — tracks child processes spawned by the agent |
+| `vigil-mcp` | MCP server mode (`vigil mcp`) and `vigil-mcp-shim` proxy binary for stdio JSON-RPC MCP servers |
+| `vigil-plugin` | Plugin SDK — `VigilPlugin` trait, `declare_plugin!` macro, ABI versioning |
 
-## Configuration (vigil.toml)
+Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` (Claude Code / Anthropic), `OPENAI_BASE_URL=http://127.0.0.1:8877/v1` (Cursor / OpenAI-compatible), or `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8877` (Gemini CLI) in the agent's environment. The proxy forwards to the real API over TLS.
+
+## CLI commands
+
+### Session management
+
+| Command | Description |
+|---------|-------------|
+| `vigil run [--port N] [--config F] [--name LABEL] [--plugin P] -- <agent>` | Run an agent under observation |
+| `vigil proxy [--port N] [--config F] [--name LABEL] [--plugin P]` | Start proxy and TUI without spawning an agent |
+| `vigil ps` | Show all currently active vigil sessions on this machine |
+| `vigil sessions` | Print a text table of all recorded sessions |
+| `vigil browse` | Interactive TUI session browser (arrow keys / j·k, Enter to replay, d to delete) |
+| `vigil replay <session-id>` | Replay a session in the TUI |
+| `vigil replay <session-id> --mock [--on-miss error\|stub]` | Replay against a fake upstream — no real API calls, cost-free regression testing |
+| `vigil fork <session-id> [--prefix-events N] -- <agent>` | Replay a session prefix, then continue live |
+| `vigil tag <session-id> <name>` | Assign a human-readable label to a session |
+| `vigil clear [-y]` | Delete all session files (prompts for confirmation unless `-y`) |
+| `vigil prune [--older-than N]` | Delete session files older than N days (default 30) |
+| `vigil export <session-id> [--output FILE]` | Export session to NDJSON with PII redacted |
+| `vigil export --all [--output-dir DIR]` | Export all sessions to a directory |
+| `vigil diff <session-a> <session-b> [--brief]` | Compare tool-call sequences of two sessions |
+| `vigil cost-report [--days N] [--branch NAME]` | Show cost breakdown by branch and day |
+
+### Analysis
+
+| Command | Description |
+|---------|-------------|
+| `vigil report <session-id> [--json] [--html] [--html-fragment]` | Generate session audit report with hygiene scorecard |
+| `vigil verify <session-id>` | Verify hash chain and ed25519 signature; exits 0 (PASS) or 1 (FAIL) |
+| `vigil audit <session-id>` | Legacy audit: hash chain, ULID order, meta count |
+
+### Plugins
+
+| Command | Description |
+|---------|-------------|
+| `vigil plugins new <name> [--template alert\|gatekeeper\|logger\|blank]` | Scaffold a new plugin crate |
+| `vigil plugins install <path>` | Copy a compiled plugin to the auto-load directory |
+| `vigil plugins list` | List plugins in `~/.vigil/plugins/` |
+| `vigil plugins check <path>` | Validate ABI/rustc compatibility without installing |
+| `vigil plugins dir` | Print the auto-load directory path |
+
+### Other
+
+| Command | Description |
+|---------|-------------|
+| `vigil init [--output FILE]` | Initialize a policy file for this project |
+| `vigil mcp` | Start vigil as an MCP server (JSON-RPC over stdio) |
+
+## vigil.toml reference
+
+Pass with `vigil run --config vigil.toml -- <agent>`.
+
+### [proxy]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `port` | `u16` | `8877` | Proxy listen port |
+| `metrics_port` | `u16` | — | Optional metrics endpoint port |
+| `blocked_commands` | `[string]` | `["rm -rf", "dd if=", "mkfs", ":(){ :\|:& };:"]` | Bash command substrings to block (case-sensitive substring match) |
+| `write_approval_threshold` | `string` | — | Gate writes at this risk level or above: `"Low"`, `"Medium"`, or `"High"`. Omit to disable |
+| `tool_timeout_secs` | `u64` | — | Emit a TOUT alert if no LLM response follows a tool call within N seconds |
+| `tool_timeout_kill_secs` | `u64` | — | Kill the agent process after N seconds of tool silence (must be ≥ `tool_timeout_secs`) |
+
+### [session]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `store_raw` | `bool` | — | Whether to store raw request/response bodies in session files |
+| `sessions_dir` | `path` | `~/.vigil/sessions/` | Override the session storage directory |
+
+### [pii]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `watchlist_file` | `path` | — | File with one literal term per line for custom PII matching |
+
+### [budget]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_cost_usd` | `f64` | — | Hard stop if session cost exceeds this amount |
+| `max_tokens` | `u32` | — | Hard stop if total tokens exceed this count |
+| `allowed_hours` | `string` | — | Allow runs only during this window, format `"HH:MM-HH:MM"` local time |
+| `max_burn_rate_usd_per_min` | `f64` | — | Fire BURN alert when rolling $/min exceeds this |
+| `loop_detect_threshold` | `u32` | — | Fire LOOP alert when the same tool+input repeats N times |
+| `cost_alert_usd` | `f64` | — | Fire soft COST alert (no stop) at this spend level |
+| `max_session_duration_mins` | `u64` | — | Fire DURA alert after this many minutes |
+| `max_sub_agent_depth` | `u32` | — | Deny Task tool calls when count exceeds this value (fires TASK/SubAgentSpawned) |
+
+### [notify]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `webhook` | `string` | — | HTTP endpoint to POST alert events to (3 retries, exponential backoff) |
+| `webhook_events` | `[string]` | all alerts | Alert codes to forward. Valid: `BURN`, `TOUT`, `EXFL`, `LOOP`, `WAPPR`, `COST`, `DURA`, `DENY`, `DRFT`, `PINJ`, `PII` |
+
+### [report]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `turn_to_first_write_warn` | `u32` | `5` | Turns before first FsWrite to show WATCH verdict |
+| `turn_to_first_write_flag` | `u32` | `15` | Turns before first FsWrite to show FLAG verdict |
+| `input_growth_warn_multiplier` | `f64` | `1.5` | Input token growth multiplier (last third vs first third) to warn |
+| `input_growth_flag_multiplier` | `f64` | `2.0` | Input token growth multiplier to flag |
+| `reread_warn_count` | `u32` | `2` | Paths read more than this many times to warn |
+| `reread_flag_count` | `u32` | `3` | Paths read more than this many times to flag |
+
+### [window]
+
+Auto-position the vigil TUI and agent windows at launch. All fields optional — omit to keep current behavior (no repositioning). Values are in pixels.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tui_x` | `i32` | vigil TUI window X position |
+| `tui_y` | `i32` | vigil TUI window Y position |
+| `tui_width` | `u32` | vigil TUI window width |
+| `tui_height` | `u32` | vigil TUI window height |
+| `agent_x` | `i32` | Agent window X position |
+| `agent_y` | `i32` | Agent window Y position |
+| `agent_width` | `u32` | Agent window width |
+| `agent_height` | `u32` | Agent window height |
+
+Example split-screen layout (1920×1080 monitor):
 
 ```toml
-[proxy]
-port = 8877
+[window]
+tui_x = 0
+tui_y = 0
+tui_width = 960
+tui_height = 1080
+agent_x = 960
+agent_y = 0
+agent_width = 960
+agent_height = 1080
+```
 
-# Shell command substrings to block (case-sensitive). Default list shown.
-# Set to [] to disable all blocking.
-blocked_commands = ["rm -rf", "dd if=", "mkfs", ":(){ :|:& };:"]
+Linux: requires `xterm` (agent window) and optionally `wmctrl` (vigil window). Windows: uses native `CreateProcessW` and `SetWindowPos`.
 
-# Gate writes at this risk level or above. Low / Medium / High.
-write_approval_threshold = "High"
+### [drift]
 
-# Alert if a tool call gets no LLM response within this many seconds.
-tool_timeout_secs = 600
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `baseline_turns` | `usize` | `5` | Number of early LlmResponse events used to build the output-token baseline |
+| `window_turns` | `usize` | `5` | Rolling window size for the recent average |
+| `acceleration_multiplier` | `f64` | `3.0` | Window average must exceed baseline by this multiplier to fire |
+| `acceleration_min_tokens` | `u32` | `200` | Minimum window average tokens before acceleration check applies |
+| `stall_threshold` | `usize` | `5` | Consecutive LlmRequests without FsWrite or novel FsRead before ProgressStall fires |
+| `debounce_events` | `u32` | `25` | Events to suppress the same drift signal after it fires |
 
-# Optionally kill the agent process after this many seconds of tool silence.
-# tool_timeout_kill_secs = 900
+### [[policies]]
 
-[session]
-store_raw = true
+Policies are evaluated in order; first match wins. Actions: `Deny`, `Confirm`, `LogOnly`.
 
-[pii]
-watchlist_file = "~/.vigil/watchlist.txt"
-
-[budget]
-max_cost_usd = 5.00
-max_tokens = 500000
-allowed_hours = "09:00-18:00"      # overnight: "22:00-06:00"
-max_burn_rate_usd_per_min = 0.50   # alert when rolling $/min exceeds this
-loop_detect_threshold = 5          # alert when same tool+input repeats N times
-cost_alert_usd = 1.00              # soft warning before hard limit
-max_session_duration_mins = 60     # alert after this many minutes
-
-[notify]
-webhook = "https://hooks.slack.com/services/..."
-# Which alert labels trigger the webhook. Omit to receive all.
-webhook_events = ["BURN", "EXFL", "DENY", "LOOP"]
-
+```toml
 [[policies]]
 name = "block-bash"
 action = "Deny"
 [policies.matcher]
 type = "ToolCall"
 tool_name_pattern = "Bash"
+
+[[policies]]
+name = "no-env-reads"
+action = "LogOnly"
+[policies.matcher]
+type = "FsPath"
+path_pattern = ".env"
 ```
 
-Pass with `vigil run --config vigil.toml -- <agent>`.
+## Alert types
 
-## Policy enforcement
+| Code | Trigger |
+|------|---------|
+| `BURN` | Rolling $/min burn-rate exceeded `max_burn_rate_usd_per_min` |
+| `DRFT` | Drift signal fired: output token acceleration, progress stall, or self-contradiction |
+| `EXFL` | Credential exfiltration: a fingerprinted secret appeared in an outbound request |
+| `DENY` | Policy or plugin blocked a tool call |
+| `LOOP` | Same tool+input repeated N times |
+| `WAPPR` | Write approval required: risky diff gated on human approval |
+| `TOUT` | Tool timeout: no LLM response after a tool call within the configured window |
+| `COST` | Soft cost alert: session spend crossed `cost_alert_usd` |
+| `DURA` | Session duration alert: session exceeded `max_session_duration_mins` |
+| `PII` | PII detected in traffic (regex patterns or custom watchlist) |
+| `PINJ` | Prompt injection detected in a tool result |
+| `TASK` | Sub-agent spawned: Task tool call count exceeded `max_sub_agent_depth` |
 
-Policies are evaluated in order; first match wins. Actions: `Deny`, `Confirm`, `LogOnly`.
+## Security features
 
-```yaml
-policies:
-  - name: block-writes-outside-project
-    matcher:
-      type: FsWriteOutside
-      root: "."
-    action: Deny
+**Policy engine** — policies in `vigil.toml` match tool calls by name, input pattern, path, or sub-agent depth. Actions: `Deny` (HTTP 403 to agent), `Confirm` (human approval), `LogOnly`.
 
-  - name: no-env-reads
-    matcher:
-      type: FsPath
-      path_pattern: ".env"
-    action: LogOnly
+**Write approval** — at `write_approval_threshold`, vigil buffers SSE streams at Write/Edit/MultiEdit/NotebookEdit calls, scores the diff, and shows a full-screen before/after overlay. Press `y` to approve or `n` to reject. 5-minute timeout auto-rejects. Risk scoring: crown-jewels paths (`.env`, auth, migration, payment, private keys) → High; >40% lines deleted → High; >10 lines deleted → Medium; file >500 lines → Medium.
 
-  - name: token-budget
-    matcher:
-      type: TokenBudget
-      max_tokens: 1000000
-    action: LogOnly
-```
+**PII detection** — runs on every LLM request/response and tool call. Patterns cover email, US phone, SSN, credit card (Luhn-validated), AWS access key, GitHub PAT, JWT, public IPv4, URLs with PII query params. Custom watchlist terms are matched as case-insensitive substrings; matched terms are never echoed in logs.
 
-See `POLICY_ENGINE.md` for all matcher types and hardcoded safety floors.
+**Prompt injection (PINJ)** — scans tool results for instruction-override phrases, hidden system tags, suspicious Unicode (bidi/zero-width), and large base64 blobs. Fires `PINJ` alert with the category and a snippet.
 
-## Budget enforcement
+**Exfil detection** — fingerprints secrets (API keys, tokens, `.env` values) from file reads via SHA-256. If a fingerprint appears in an outbound request or shell command, `EXFL` fires. Bash commands are also scanned for curl/wget/netcat/scp/dns exfiltration patterns.
 
-When any hard limit is hit the agent session is stopped:
+**Drift detection** — three signals: `OutputTokenAcceleration` (rolling token average exceeds baseline by multiplier), `ProgressStall` (N consecutive LLM requests with no file activity), `SelfContradiction` (response negates a path or tool the session has demonstrably used).
 
-```toml
-[budget]
-max_cost_usd = 5.00           # stop if session cost exceeds $5
-max_tokens = 500000           # stop if total tokens exceed 500k
-allowed_hours = "09:00-18:00" # only allow runs during business hours
-```
-
-Soft alerts (`cost_alert_usd`, `max_session_duration_mins`) fire once as TUI events and webhook calls without stopping the session.
-
-## Diff-gated write approval
-
-```toml
-[proxy]
-write_approval_threshold = "High"   # Low / Medium / High
-```
-
-vigil buffers the SSE stream at any Write/Edit/MultiEdit/NotebookEdit call, scores the diff, and if risk meets the threshold shows a full-screen before/after diff overlay. Press `y` to approve or `n` to reject (agent receives HTTP 403). 5-minute timeout auto-rejects.
-
-Risk scoring: crown-jewels paths (`.env`, auth, migration, payment, private keys) → High; >40% lines deleted → High; >10 lines deleted → Medium; file >500 lines → Medium.
-
-## PII detection
-
-Two mechanisms run on every LLM request/response and tool call:
-
-Regex patterns cover: email, US phone, SSN, credit card (Luhn-validated), AWS access key, GitHub PAT, JWT, public IPv4, URLs with PII query params.
-
-Custom watchlist: place one term per line in `~/.vigil/watchlist.txt` (or `--pii-watchlist <file>`). Terms are matched as literal case-insensitive substrings — not regex. Matched terms are never echoed in logs or TUI; only the label `[watchlist term]` is shown.
-
-## Credential exfiltration detection
-
-vigil fingerprints secrets (API keys, tokens, `.env` values) from files the agent reads via SHA-256. If a fingerprint later appears in an outbound LLM request or shell command, an `EXFL` event fires with a redacted match.
-
-## Webhook notifications
-
-```toml
-[notify]
-webhook = "https://hooks.example.com/vigil"
-webhook_events = ["BURN", "EXFL", "DENY", "LOOP", "COST", "DURA", "TOUT"]
-```
-
-vigil POSTs JSON to the webhook on each matching alert. Retries up to 3 times with exponential backoff. Payload:
-
-```json
-{ "label": "BURN", "session_id": "...", "detail": { "rate_per_min_usd": 0.82, ... } }
-```
+**Session signing** — every envelope is SHA-256 chained. On clean exit the chain-root hash is signed with a per-session ed25519 key and stored in the `.meta.json` sidecar. `vigil verify` checks both chain and signature, exits 0 on PASS.
 
 ## Plugin system
 
-Drop a compiled shared library in `~/.vigil/plugins/` to auto-load it on every `vigil run`. See [PLUGINS.md](PLUGINS.md) for authoring instructions and examples.
+Drop a compiled shared library in `~/.vigil/plugins/` to auto-load it on every `vigil run`. See [PLUGINS.md](PLUGINS.md) for authoring instructions and full examples.
 
 ```bash
-vigil plugins list   # list plugins in ~/.vigil/plugins/
-vigil plugins dir    # print the auto-load directory path
-vigil run --plugin ./extra.dll -- claude   # load a specific plugin once
+vigil plugins new my-plugin --template alert
+vigil plugins install ./my-plugin.dll
+vigil run --plugin ./extra.dll -- claude   # one-off load
 ```
 
-## Session integrity
+Plugins implement the `VigilPlugin` trait from `vigil-plugin` and can observe events, react to alerts, block tool calls, and modify outbound requests.
 
-Every envelope is SHA-256 chained. On clean exit the chain-root hash is signed with a per-session ed25519 key and stored in the `.meta.json` sidecar.
+## MCP server
 
-```bash
-vigil verify <session-id>
-# vigil verify: abc-123...
-# Events:     42
-# Hash chain: OK
-# Signature:  OK
-# PASS
+`vigil mcp` starts vigil as a self-contained MCP server over stdio (JSON-RPC 2.0). Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "vigil": {
+      "command": "vigil",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
-Sessions created before signing was added report `Signature: SKIP`.
+Three tools are available to the AI assistant:
+
+| Tool | Description |
+|------|-------------|
+| `vigil_status` | Active session count and proxy status |
+| `vigil_sessions` | List recent sessions with cost, name, and timestamp. Accepts optional `limit` integer |
+| `vigil_policy_check` | Check whether a named tool call would be allowed or require confirmation. Requires `tool_name` string |
+
+The `vigil-mcp-shim` binary is also available as a transparent proxy for wrapping existing MCP servers, logging their `tools/call` events as `McpCall` events in a vigil session.
 
 ## Pricing
 
-Model pricing is loaded from `~/.vigil/pricing.toml` if present, otherwise built-in defaults apply. To override:
+Model pricing is loaded from `~/.vigil/pricing.toml` if present, otherwise built-in defaults apply:
 
 ```toml
 [[model]]
@@ -250,32 +302,11 @@ input_per_million = 3.0
 output_per_million = 15.0
 ```
 
-Patterns match as case-insensitive substrings. Put more-specific patterns first.
+Patterns match as case-insensitive substrings. Put more-specific patterns first. Built-in defaults include entries for Claude, GPT, and Gemini models; Gemini entries are ordered so `gemini-2.5-flash-lite` appears before `gemini-2.5-flash` to prevent the shorter pattern matching the longer model name.
 
-## MCP shim
+## vigil-slack plugin
 
-To intercept MCP server tool calls, replace your MCP server command with `vigil-mcp-shim`:
-
-```bash
-vigil-mcp-shim --session-id <uuid> --ndjson ~/.vigil/sessions/<uuid>.ndjson <real-server> [args]
-```
-
-All `tools/call` requests are PII-scanned and logged as `McpCall` events.
-
-## Architecture
-
-Six Rust crates:
-
-| Crate | Role |
-|-------|------|
-| `vigil-cli` | Binary, CLI args, agent spawning, TUI orchestration, budget enforcement, plugin loading |
-| `vigil-proxy` | HTTP reverse proxy, SSE parser (Anthropic + OpenAI formats), write-approval gate |
-| `vigil-core` | Event types, Envelope/hash chain, SessionStore, ed25519 signing, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner, PluginHost |
-| `vigil-tui` | ratatui dashboard, session browser, replay |
-| `vigil-watch` | Process tree monitor (sysinfo) — no-op on Windows |
-| `vigil-mcp` | vigil-mcp-shim binary for stdio JSON-RPC MCP servers |
-
-Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in the agent's environment. The proxy forwards to the real API over TLS.
+A ready-to-use Slack notification plugin is maintained as a separate crate at `github.com/zer0contextlost/vigil-slack`. It is not part of the vigil workspace.
 
 ## License
 

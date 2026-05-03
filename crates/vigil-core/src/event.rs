@@ -17,6 +17,15 @@ pub enum Event {
         /// System prompt, if present in the request.
         #[serde(default)]
         system_prompt: Option<String>,
+        /// Full request body, base64-encoded JSON.
+        /// Used by `vigil replay --mock` to build a RequestKey for cache lookup.
+        /// None for non-LLM requests or when the body exceeded limits.
+        #[serde(default)]
+        raw_request: Option<String>,
+        /// Monotonic turn counter within the session. Turn 1 = first LlmRequest.
+        /// Computed once at emit time so report queries never derive it from ordering.
+        #[serde(default)]
+        turn_number: u32,
     },
     LlmResponse {
         provider: String,
@@ -33,18 +42,46 @@ pub enum Event {
         cache_read_input_tokens: u32,
         #[serde(default)]
         cache_creation_input_tokens: u32,
+        /// Raw upstream SSE bytes, gzip-compressed and base64-encoded.
+        /// Used by `vigil replay` to replay recorded responses verbatim.
+        /// None if the response exceeded 4 MiB uncompressed or compression failed.
+        #[serde(default)]
+        raw_response: Option<String>,
+        /// Why the model stopped: "end_turn", "max_tokens", "tool_use", "stop_sequence",
+        /// "SAFETY" (Gemini), or None if not reported.
+        #[serde(default)]
+        stop_reason: Option<String>,
     },
     ToolCall {
         agent: String,
         tool_name: String,
         input: Value,
         session_id: Uuid,
+        /// The `id` field from the LLM's tool_use block. Used to inject a
+        /// structured denial message into the next tool_result if policy denies.
+        #[serde(default)]
+        tool_use_id: Option<String>,
+        /// UUID linking this ToolCall to its corresponding ToolCallResult.
+        /// Generated at ToolCall emit time; the proxy passes the same UUID when emitting ToolCallResult.
+        #[serde(default)]
+        correlation_id: Option<Uuid>,
     },
     ToolCallResult {
         agent: String,
         tool_name: String,
         blocked: bool,
         session_id: Uuid,
+        /// UUID linking this ToolCallResult to its corresponding ToolCall.
+        #[serde(default)]
+        correlation_id: Option<Uuid>,
+        /// Wall-clock milliseconds from ToolCall emit to ToolCallResult emit.
+        /// Computed from envelope timestamps at emit time.
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        /// True if the tool returned an error (is_error:true in the tool_result block,
+        /// or the result content begins with "Error:" / non-zero exit code pattern).
+        #[serde(default)]
+        is_error: bool,
     },
     FsRead {
         path: String,
@@ -54,6 +91,15 @@ pub enum Event {
         path: String,
         bytes: u64,
         session_id: Uuid,
+        /// Lines added in this write (from diff hunk analysis). 0 if diff not available.
+        #[serde(default)]
+        lines_added: u32,
+        /// Lines removed in this write. 0 if diff not available.
+        #[serde(default)]
+        lines_removed: u32,
+        /// Number of diff hunks (contiguous changed regions). 0 if diff not available.
+        #[serde(default)]
+        hunk_count: u32,
     },
     ProcessSpawn {
         command: String,
@@ -134,5 +180,28 @@ pub enum Event {
     SessionDurationAlert {
         elapsed_mins: u64,
         session_id: Uuid,
+    },
+    /// Emitted by the filter task when DriftDetector observes a behavioural drift signal
+    /// (output-token runaway, progress stall, or self-contradiction).
+    DriftAlert {
+        signal: crate::drift::DriftSignal,
+        details: String,
+        session_id: Uuid,
+    },
+    /// Emitted when a Task tool call is observed, incrementing the session-level
+    /// sub-agent depth counter. Depth is the total Task invocation count so far
+    /// (not a true call-stack depth — vigil doesn't track returns).
+    SubAgentSpawned {
+        session_id: Uuid,
+        depth: u32,
+        tool_name: String,
+    },
+    /// Emitted when a tool_result content block contains a known indirect prompt
+    /// injection pattern (instruction override, system tag, bidi Unicode, etc.).
+    PromptInjectionAlert {
+        session_id: Uuid,
+        tool_name: String,
+        category: String,
+        snippet: String,
     },
 }

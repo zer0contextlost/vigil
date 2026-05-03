@@ -21,6 +21,12 @@ pub struct VigilConfig {
     pub budget: BudgetSection,
     #[serde(default)]
     pub notify: NotifySection,
+    #[serde(default)]
+    pub drift: DriftSection,
+    #[serde(default)]
+    pub report: Option<ReportConfig>,
+    #[serde(default)]
+    pub window: Option<WindowConfig>,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -36,7 +42,10 @@ fn default_blocked_commands() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 pub struct ProxySection {
     pub port: Option<u16>,
-    pub metrics_port: Option<u16>,
+    /// Port to bind the web dashboard on 127.0.0.1. Default off (None).
+    /// Set to a port (e.g. 8878) to enable the browser dashboard.
+    #[serde(default)]
+    pub dashboard_port: Option<u16>,
     /// Gate writes at this risk level or above. "Low", "Medium", or "High".
     /// None (the default) disables write approval gating.
     #[serde(default)]
@@ -88,6 +97,11 @@ pub struct BudgetSection {
     /// Emit a SessionDurationAlert (and optionally stop) after this many minutes.
     #[serde(default)]
     pub max_session_duration_mins: Option<u64>,
+    /// Emit SubAgentSpawned and deny when Task tool call count exceeds this value.
+    /// Each Task invocation increments the session counter; the policy fires when
+    /// the count exceeds max_sub_agent_depth.
+    #[serde(default)]
+    pub max_sub_agent_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -97,9 +111,77 @@ pub struct NotifySection {
     #[serde(default)]
     pub webhook: Option<String>,
     /// Subset of alert labels to forward. Empty = all alerts.
-    /// Valid labels: BURN, TOUT, EXFL, LOOP, WAPPR, COST, DURA, DENY
+    /// Valid labels: BURN, TOUT, EXFL, LOOP, WAPPR, COST, DURA, DENY, DRFT
     #[serde(default)]
     pub webhook_events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DriftSection {
+    #[serde(default)]
+    pub baseline_turns: Option<usize>,
+    #[serde(default)]
+    pub window_turns: Option<usize>,
+    #[serde(default)]
+    pub acceleration_multiplier: Option<f64>,
+    #[serde(default)]
+    pub acceleration_min_tokens: Option<u32>,
+    #[serde(default)]
+    pub stall_threshold: Option<usize>,
+    #[serde(default)]
+    pub debounce_events: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct ReportConfig {
+    /// Turns before first FsWrite to warn (default: 5)
+    pub turn_to_first_write_warn: Option<u32>,
+    /// Turns before first FsWrite to flag (default: 15)
+    pub turn_to_first_write_flag: Option<u32>,
+    /// Input token growth multiplier to warn (default: 1.5)
+    pub input_growth_warn_multiplier: Option<f64>,
+    /// Input token growth multiplier to flag (default: 2.0)
+    pub input_growth_flag_multiplier: Option<f64>,
+    /// Re-read count per path to warn (default: 2)
+    pub reread_warn_count: Option<u32>,
+    /// Re-read count per path to flag (default: 3)
+    pub reread_flag_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WindowConfig {
+    /// vigil TUI window X position in pixels
+    pub tui_x: Option<i32>,
+    /// vigil TUI window Y position in pixels
+    pub tui_y: Option<i32>,
+    /// vigil TUI window width in pixels
+    pub tui_width: Option<u32>,
+    /// vigil TUI window height in pixels
+    pub tui_height: Option<u32>,
+    /// Agent window X position in pixels
+    pub agent_x: Option<i32>,
+    /// Agent window Y position in pixels
+    pub agent_y: Option<i32>,
+    /// Agent window width in pixels
+    pub agent_width: Option<u32>,
+    /// Agent window height in pixels
+    pub agent_height: Option<u32>,
+}
+
+impl DriftSection {
+    pub fn to_drift_config(&self) -> crate::drift::DriftConfig {
+        let d = crate::drift::DriftConfig::default();
+        crate::drift::DriftConfig {
+            baseline_turns:          self.baseline_turns.unwrap_or(d.baseline_turns),
+            window_turns:            self.window_turns.unwrap_or(d.window_turns),
+            acceleration_multiplier: self.acceleration_multiplier.unwrap_or(d.acceleration_multiplier),
+            acceleration_min_tokens: self.acceleration_min_tokens.unwrap_or(d.acceleration_min_tokens),
+            stall_threshold:         self.stall_threshold.unwrap_or(d.stall_threshold),
+            debounce_events:         self.debounce_events.unwrap_or(d.debounce_events),
+        }
+    }
 }
 
 /// A policy rule as it appears in vigil.toml.
@@ -171,6 +253,13 @@ impl VigilConfig {
                 value_pattern: pattern.clone(),
             },
         }).collect();
+        if let Some(max_depth) = self.budget.max_sub_agent_depth {
+            policies.push(Policy {
+                name: "sub-agent-depth-limit".to_string(),
+                action: PolicyAction::Deny,
+                matcher: PolicyMatcher::SubAgentDepth { max_depth },
+            });
+        }
         policies.extend(self.policies.iter().cloned().map(Into::into));
         policies
     }

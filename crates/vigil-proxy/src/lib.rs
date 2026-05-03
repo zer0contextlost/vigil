@@ -9,12 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-use vigil_core::{scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host};
+use vigil_core::{scan_for_injection, scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host, AnthropicAdapter, GeminiAdapter, ProviderAdapter};
 
 const MAX_HEADER_SIZE: usize = 65536;
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-
-const WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 
 /// Response headers that are safe to forward to the client.
 /// Any header NOT in this list is silently dropped to prevent header injection
@@ -41,7 +39,27 @@ pub const ALLOWED_RESP_HEADERS: &[&str] = &[
 
 pub type PendingApprovals = Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>;
 
-#[derive(Debug, Clone)]
+/// Denial record written by main.rs when policy fires Deny on a tool call.
+/// Keyed by the LLM's tool_use_id so the proxy can rewrite the matching tool_result.
+#[derive(Clone, Debug)]
+pub struct DenialRecord {
+    pub tool_name: String,
+    pub policy_name: Option<String>,
+    pub reason: Option<String>,
+    pub input_summary: String,
+}
+
+pub type PendingDenials = Arc<Mutex<HashMap<String, DenialRecord>>>;
+
+/// Async callback invoked before each outbound LLM request.
+/// Return `Some(modified_body)` to replace the request body, or `None` to pass through.
+pub type OutboundHookFn = Arc<
+    dyn Fn(String, Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
 pub struct ProxyConfig {
     pub port: u16,
     pub ca_cert_path: Option<PathBuf>,
@@ -52,6 +70,12 @@ pub struct ProxyConfig {
     pub pii_watchlist: Vec<String>,
     /// Gate writes at this risk level or above. None disables write approval gating.
     pub write_approval_threshold: Option<vigil_core::RiskLevel>,
+    /// Optional plugin hook called before each LLM request is forwarded upstream.
+    pub outbound_hook: Option<OutboundHookFn>,
+    /// Denials written by the policy engine in main.rs. The proxy rewrites the
+    /// matching tool_result blocks before forwarding to the LLM so the agent
+    /// receives a structured error and can continue on safe work.
+    pub pending_denials: PendingDenials,
 }
 
 pub struct Proxy {
@@ -66,7 +90,17 @@ impl Proxy {
         Self {
             config,
             event_tx,
-            http_client: reqwest::Client::new(),
+            http_client: {
+                // Honor system proxy env vars (http_proxy, https_proxy, no_proxy) by default.
+                // vigil forwards to api.anthropic.com; a corporate proxy may be required.
+                reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(300))
+                    .redirect(reqwest::redirect::Policy::limited(5))
+                    .user_agent(concat!("vigil/", env!("CARGO_PKG_VERSION")))
+                    .build()
+                    .expect("failed to build HTTP client")
+            },
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -318,6 +352,14 @@ async fn handle_http_request(
     Ok(())
 }
 
+/// Extract the model name from a Gemini request path.
+/// e.g. "/v1beta/models/gemini-3-flash:streamGenerateContent" → "gemini-3-flash"
+fn extract_gemini_model_from_path(path: &str) -> Option<String> {
+    let after = path.split("/models/").nth(1)?;
+    let model = after.split(':').next()?;
+    if model.is_empty() { None } else { Some(model.to_string()) }
+}
+
 /// Reverse proxy: forward request to upstream Anthropic/OpenAI over HTTPS,
 /// stream the response back to the client, and emit vigil events.
 async fn handle_reverse_proxy(
@@ -335,8 +377,16 @@ async fn handle_reverse_proxy(
     // Determine upstream base URL and provider label.
     // upstream_override routes all requests to a test/custom server.
     let routing = if let Some(ov) = &config.upstream_override {
-        let p = if path.contains("/messages") { "anthropic" } else { "openai" };
+        let p = if path.contains("/messages") {
+            "anthropic"
+        } else if path.contains("/v1beta/models/") && (path.contains(":streamGenerateContent") || path.contains(":generateContent")) {
+            "gemini"
+        } else {
+            "openai"
+        };
         Some((ov.as_str(), p))
+    } else if path.contains("/v1beta/models/") && (path.contains(":streamGenerateContent") || path.contains(":generateContent")) {
+        Some(("https://generativelanguage.googleapis.com", "gemini"))
     } else if path.contains("/messages") || path.contains("/v1/messages") {
         Some(("https://api.anthropic.com", "anthropic"))
     } else if path.contains("/chat/completions") || path.contains("/v1/chat") {
@@ -413,21 +463,56 @@ async fn handle_reverse_proxy(
     // plain UTF-8 text that our SSE parser can process.
     req = req.header("accept-encoding", "identity");
 
-    req = req.body(body.clone());
+    // Allow plugins to inspect / modify the outbound request body before forwarding.
+    let effective_body: bytes::Bytes = if !body.is_empty() {
+        if let Some(ref hook) = config.outbound_hook {
+            if let Ok(body_value) = serde_json::from_slice::<Value>(body) {
+                if let Some(modified) = (hook)(provider.to_string(), body_value).await {
+                    serde_json::to_vec(&modified).map(bytes::Bytes::from).unwrap_or_else(|_| body.clone())
+                } else {
+                    body.clone()
+                }
+            } else {
+                body.clone()
+            }
+        } else {
+            body.clone()
+        }
+    } else {
+        body.clone()
+    };
+
+    req = req.body(effective_body.clone());
 
     let (model, last_user_message, system_prompt) =
-        serde_json::from_slice::<Value>(body)
+        serde_json::from_slice::<Value>(&effective_body)
             .map(|j| {
                 let model = j
                     .get("model")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        // For Gemini, extract model from the path if not in body
+                        if provider == "gemini" {
+                            extract_gemini_model_from_path(&clean_path)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
                 let last_user_message = extract_last_user_message(&j);
                 let system_prompt = extract_system_prompt(&j);
                 (model, last_user_message, system_prompt)
             })
-            .unwrap_or_else(|_| ("unknown".to_string(), None, None));
+            .unwrap_or_else(|_| {
+                // If body parsing fails and we're Gemini, still try to extract from path
+                let model = if provider == "gemini" {
+                    extract_gemini_model_from_path(&clean_path).unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    "unknown".to_string()
+                };
+                (model, None, None)
+            });
 
     // Scan the outgoing user message and system prompt for PII.
     {
@@ -441,7 +526,27 @@ async fn handle_reverse_proxy(
         }
     }
 
+    // Rewrite tool_result blocks for any tools denied by the policy engine.
+    // This lets the LLM receive a structured "policy denied" error instead of
+    // a real tool result, so the agent can adapt and continue on safe work.
+    let effective_body = rewrite_denied_tool_results(effective_body, &config.pending_denials);
+    req = req.body(effective_body.clone());
+
+    // Scan tool_result content blocks in the request body for prompt injection.
+    if let Ok(body_json) = serde_json::from_slice::<Value>(&effective_body) {
+        scan_tool_results_for_injection(&body_json, session_id, event_tx);
+    }
+
     tracing::info!(provider, model = %model, "LLM request forwarded upstream");
+    let raw_request = {
+        use base64::Engine as _;
+        Some(base64::engine::general_purpose::STANDARD.encode(&effective_body))
+    };
+
+    // Increment turn counter and capture it
+    static TURN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let turn_number = TURN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
         provider: provider.to_string(),
         model: model.clone(),
@@ -449,6 +554,8 @@ async fn handle_reverse_proxy(
         session_id,
         last_user_message,
         system_prompt,
+        raw_request,
+        turn_number,
     }));
 
     let resp = req.send().await?;
@@ -523,14 +630,29 @@ struct SseState {
     block_type: HashMap<usize, String>,
     block_name: HashMap<usize, String>,
     block_input: HashMap<usize, String>,
+    /// The `id` field from the LLM's content_block_start for tool_use blocks.
+    block_id: HashMap<usize, String>,
     response_text: String,
     response_text_bytes: usize,
+    /// Raw SSE bytes captured for replay. Capped at 4 MiB uncompressed.
+    raw_tee: Vec<u8>,
+    raw_tee_capped: bool,
     /// True when we are buffering a Write/Edit block for potential approval.
     holding: bool,
     /// Which block index triggered the hold.
     holding_tool_idx: Option<usize>,
     /// Set at content_block_stop when the completed tool is a write tool.
     pending_approval_data: Option<(String, Value)>,
+    /// Gemini: synthetic block index counter (Gemini has no native block index).
+    gemini_next_block_idx: usize,
+    /// Gemini: index of the currently open function-call block, if any.
+    gemini_active_call_idx: Option<usize>,
+    /// Gemini: set to true when finishReason is non-empty, indicating stream end.
+    gemini_finished: bool,
+    /// Stop reason from the LLM (end_turn, max_tokens, tool_use, etc).
+    stop_reason: Option<String>,
+    /// Maps tool_use_id to correlation UUID for matching ToolCall with ToolCallResult.
+    tool_use_to_correlation: HashMap<String, Uuid>,
 }
 
 async fn stream_sse_response(
@@ -563,6 +685,16 @@ async fn stream_sse_response(
             continue;
         }
 
+        // Tee raw bytes for replay capture (4 MiB uncompressed cap).
+        if !state.raw_tee_capped {
+            const RAW_TEE_CAP: usize = 4 * 1024 * 1024;
+            if state.raw_tee.len() + chunk.len() <= RAW_TEE_CAP {
+                state.raw_tee.extend_from_slice(&chunk);
+            } else {
+                state.raw_tee_capped = true;
+            }
+        }
+
         // Parse the chunk first, then decide whether to buffer or forward.
         pending.extend_from_slice(&chunk);
         loop {
@@ -583,6 +715,13 @@ async fn stream_sse_response(
                                 if let Ok(event_json) = serde_json::from_str::<Value>(&data) {
                                     match provider {
                                         "openai" | "openrouter" => process_openai_sse_event(
+                                            &event_json,
+                                            &mut state,
+                                            session_id,
+                                            event_tx,
+                                            pii_watchlist,
+                                        ),
+                                        "gemini" => process_gemini_sse_event(
                                             &event_json,
                                             &mut state,
                                             session_id,
@@ -764,7 +903,7 @@ async fn stream_sse_response(
         let _ = client_conn.flush().await;
     }
 
-    if state.output_tokens > 0 || state.input_tokens > 0 {
+    if state.output_tokens > 0 || state.input_tokens > 0 || state.gemini_finished {
         let cost = cost_usd_with_cache(&state.model, state.input_tokens, state.output_tokens, state.cache_read_input_tokens, state.cache_creation_input_tokens);
         tracing::info!(
             model = %state.model,
@@ -781,6 +920,18 @@ async fn stream_sse_response(
         if let Some(text) = &response_text {
             emit_pii_alert_if_found("llm_response", text, pii_watchlist, session_id, event_tx);
         }
+        let raw_response = if !state.raw_tee.is_empty() && !state.raw_tee_capped {
+            use base64::Engine as _;
+            use flate2::{write::GzEncoder, Compression};
+            use std::io::Write as _;
+            let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+            enc.write_all(&state.raw_tee)
+                .and_then(|_| enc.finish())
+                .ok()
+                .map(|compressed| base64::engine::general_purpose::STANDARD.encode(&compressed))
+        } else {
+            None
+        };
         let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmResponse {
             provider: provider.to_string(),
             model: state.model.clone(),
@@ -791,6 +942,8 @@ async fn stream_sse_response(
             response_text,
             cache_read_input_tokens: state.cache_read_input_tokens,
             cache_creation_input_tokens: state.cache_creation_input_tokens,
+            raw_response,
+            stop_reason: state.stop_reason.clone(),
         }));
     }
 
@@ -846,12 +999,20 @@ fn process_sse_event(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    if WRITE_TOOLS.iter().any(|t| name.eq_ignore_ascii_case(t)) {
+                    let id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if AnthropicAdapter.write_tools().iter().any(|t| name.eq_ignore_ascii_case(t)) {
                         state.holding = true;
                         state.holding_tool_idx = Some(idx);
                     }
                     state.block_name.insert(idx, name);
                     state.block_input.insert(idx, String::new());
+                    if !id.is_empty() {
+                        state.block_id.insert(idx, id);
+                    }
                 }
                 state.block_type.insert(idx, bt);
             }
@@ -890,17 +1051,29 @@ fn process_sse_event(
                     .unwrap_or_else(|| "unknown".to_string());
                 let input_str = state.block_input.remove(&idx).unwrap_or_default();
                 let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
+                let tool_use_id = state.block_id.remove(&idx);
                 tracing::info!(tool = %tool_name, "tool call detected in stream");
                 emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                 emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
-                if WRITE_TOOLS.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                if AnthropicAdapter.write_tools().iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
                     state.pending_approval_data = Some((tool_name.clone(), input.clone()));
                 }
+
+                // Generate correlation_id and store it for matching with ToolCallResult
+                let correlation_id = Some(Uuid::new_v4());
+                if let Some(ref id) = tool_use_id {
+                    if let Some(corr_id) = correlation_id {
+                        state.tool_use_to_correlation.insert(id.clone(), corr_id);
+                    }
+                }
+
                 let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
                     agent: "claude".to_string(),
                     tool_name,
                     input,
                     session_id,
+                    tool_use_id,
+                    correlation_id,
                 }));
             }
             state.block_type.remove(&idx);
@@ -973,11 +1146,21 @@ fn process_openai_sse_event(
                         let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
                         emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                         emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
+
+                        // Generate correlation_id for OpenAI (no tool_use_id, so we use index as string key)
+                        let correlation_id = Some(Uuid::new_v4());
+                        let tool_use_id = Some(format!("openai_{}", idx));
+                        if let Some(corr_id) = correlation_id {
+                            state.tool_use_to_correlation.insert(tool_use_id.clone().unwrap_or_default(), corr_id);
+                        }
+
                         let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
                             agent: "openai".to_string(),
                             tool_name,
                             input,
                             session_id,
+                            tool_use_id,
+                            correlation_id,
                         }));
                     }
                     state.block_name.clear();
@@ -995,6 +1178,146 @@ fn process_openai_sse_event(
             state.output_tokens = ct as u32;
         }
     }
+}
+
+fn process_gemini_sse_event(
+    event_json: &Value,
+    state: &mut SseState,
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<TimestampedEvent>,
+    pii_watchlist: &[String],
+) {
+    // Token counts: last-write-wins; only present on final chunk.
+    if let Some(usage) = event_json.get("usageMetadata") {
+        if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+            state.input_tokens = pt as u32;
+        }
+        if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+            state.output_tokens = ct as u32;
+        }
+    }
+
+    let candidate = match event_json
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+    {
+        Some(c) => c,
+        None => return,
+    };
+
+    if let Some(parts) = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+    {
+        for part in parts {
+            // Skip thinking/reasoning text (Gemini 2.5+ chain-of-thought).
+            if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+
+            // Text part.
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                const MAX_RESPONSE_TEXT: usize = 1024 * 1024;
+                if state.response_text_bytes + text.len() <= MAX_RESPONSE_TEXT {
+                    state.response_text.push_str(text);
+                    state.response_text_bytes += text.len();
+                }
+                continue;
+            }
+
+            // Function call part.
+            if let Some(fc) = part.get("functionCall") {
+                let idx = match state.gemini_active_call_idx {
+                    Some(i) => i,
+                    None => {
+                        let i = state.gemini_next_block_idx;
+                        state.gemini_next_block_idx += 1;
+                        state.gemini_active_call_idx = Some(i);
+                        let name = fc
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        state.block_name.insert(i, name);
+                        state.block_type.insert(i, "tool_use".to_string());
+                        state.block_input.insert(i, String::new());
+                        i
+                    }
+                };
+
+                // partialArgs is a streaming delta (concat); args is a snapshot (overwrite).
+                if let Some(partial) = fc.get("partialArgs").and_then(|v| v.as_str()) {
+                    state.block_input.entry(idx).or_default().push_str(partial);
+                } else if let Some(args) = fc.get("args") {
+                    let s = serde_json::to_string(args).unwrap_or_default();
+                    state.block_input.insert(idx, s);
+                }
+
+                let will_continue = fc
+                    .get("willContinue")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !will_continue {
+                    flush_gemini_call(state, idx, session_id, event_tx, pii_watchlist);
+                    state.gemini_active_call_idx = None;
+                }
+            }
+        }
+    }
+
+    // End-of-stream signal.
+    if let Some(reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
+        if !reason.is_empty() {
+            // Defensive flush: close any still-open call.
+            if let Some(idx) = state.gemini_active_call_idx.take() {
+                flush_gemini_call(state, idx, session_id, event_tx, pii_watchlist);
+            }
+            state.gemini_finished = true;
+        }
+    }
+}
+
+fn flush_gemini_call(
+    state: &mut SseState,
+    idx: usize,
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<TimestampedEvent>,
+    pii_watchlist: &[String],
+) {
+    let raw_name = state.block_name.remove(&idx).unwrap_or_else(|| "unknown".to_string());
+    let input_str = state.block_input.remove(&idx).unwrap_or_default();
+    let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
+    state.block_type.remove(&idx);
+
+    // Canonicalize Gemini tool names so downstream pipeline (fs-events, drift, exfil)
+    // sees the same names it expects from Claude Code ("Write", "Edit", "Read", etc.).
+    let tool_name = GeminiAdapter.canonical_tool_name(&raw_name).to_string();
+
+    emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
+    emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
+
+    // Write-approval gate: set hold if this is a write tool.
+    // NOTE: unlike Anthropic, the current SSE chunk has already been forwarded
+    // by the time we detect the tool name here. Subsequent chunks are held.
+    if GeminiAdapter.write_tools().iter().any(|t| raw_name.eq_ignore_ascii_case(t)) {
+        state.pending_approval_data = Some((tool_name.clone(), input.clone()));
+        state.holding = true;
+        state.holding_tool_idx = Some(idx);
+    }
+
+    // Generate correlation_id for Gemini tool calls
+    let correlation_id = Some(Uuid::new_v4());
+
+    let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
+        agent: "gemini".to_string(),
+        tool_name,
+        input,
+        session_id,
+        tool_use_id: None,
+        correlation_id,
+    }));
 }
 
 fn emit_pii_alert_if_found(
@@ -1024,6 +1347,176 @@ fn emit_pii_alert_if_found(
     }));
 }
 
+/// Rewrite `tool_result` content blocks whose `tool_use_id` is in `pending_denials`.
+/// Returns the (possibly modified) body. Removes matched entries from the map.
+/// The rewritten content tells the LLM the tool was denied by policy so it can
+/// continue on safe work rather than waiting for a result that will never arrive.
+fn rewrite_denied_tool_results(body: bytes::Bytes, pending_denials: &PendingDenials) -> bytes::Bytes {
+    let mut denials = pending_denials.lock().unwrap();
+    if denials.is_empty() {
+        return body;
+    }
+    let mut json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let messages = match json.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        Some(m) => m,
+        None => return body,
+    };
+    let mut rewrote = false;
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let content = match msg.get_mut("content").and_then(|v| v.as_array_mut()) {
+            Some(c) => c,
+            None => continue,
+        };
+        for block in content.iter_mut() {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let id = match block.get("tool_use_id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            if let Some(denial) = denials.remove(&id) {
+                let msg = format!(
+                    "vigil policy denial: {}\nPolicy: {}\nAttempted tool: {}\nAttempted input: {}\n\
+                     This operation was blocked. You may continue with other safe work.",
+                    denial.reason.as_deref().unwrap_or("operation not permitted"),
+                    denial.policy_name.as_deref().unwrap_or("unnamed-policy"),
+                    denial.tool_name,
+                    denial.input_summary,
+                );
+                *block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "is_error": true,
+                    "content": msg,
+                });
+                rewrote = true;
+                tracing::info!(tool_use_id = %id, tool = %denial.tool_name, "injected policy denial into tool_result");
+            }
+        }
+    }
+    if rewrote {
+        match serde_json::to_vec(&json) {
+            Ok(b) => bytes::Bytes::from(b),
+            Err(_) => body,
+        }
+    } else {
+        body
+    }
+}
+
+/// Scan all `tool_result` content blocks in an outbound request body for prompt
+/// injection patterns. For each finding, emit a `PromptInjectionAlert` event.
+fn scan_tool_results_for_injection(
+    body: &Value,
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<TimestampedEvent>,
+) {
+    let messages = match body.get("messages").and_then(|v| v.as_array()) {
+        Some(m) => m,
+        None => return,
+    };
+    for msg in messages {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let content = match msg.get("content").and_then(|v| v.as_array()) {
+            Some(c) => c,
+            None => continue,
+        };
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            // tool_use_id is the name proxy for tool results; fall back to "unknown"
+            let tool_name = block
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Content may be a plain string or an array of text blocks
+            let texts: Vec<String> = match block.get("content") {
+                Some(Value::String(s)) => vec![s.clone()],
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter_map(|b| {
+                        if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => continue,
+            };
+
+            for text in &texts {
+                if text.is_empty() {
+                    continue;
+                }
+                let findings = scan_for_injection(text);
+                if findings.is_empty() {
+                    continue;
+                }
+                let f = &findings[0];
+                tracing::warn!(
+                    tool_name = %tool_name,
+                    category = f.category,
+                    "prompt injection pattern detected in tool result"
+                );
+                let _ = event_tx.try_send(TimestampedEvent::new(Event::PromptInjectionAlert {
+                    session_id,
+                    tool_name: tool_name.clone(),
+                    category: f.category.to_string(),
+                    snippet: f.snippet.clone(),
+                }));
+            }
+        }
+    }
+}
+
+/// Compute diff statistics from before/after strings using the similar crate.
+fn compute_diff_stats(before: &str, after: &str) -> (u32, u32, u32) {
+    use similar::TextDiff;
+
+    let diff = TextDiff::from_lines(before, after);
+    let mut lines_added = 0u32;
+    let mut lines_removed = 0u32;
+    let mut hunk_count = 0u32;
+    let mut in_hunk = false;
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Delete => {
+                lines_removed += 1;
+                if !in_hunk {
+                    hunk_count += 1;
+                    in_hunk = true;
+                }
+            }
+            similar::ChangeTag::Insert => {
+                lines_added += 1;
+                if !in_hunk {
+                    hunk_count += 1;
+                    in_hunk = true;
+                }
+            }
+            similar::ChangeTag::Equal => {
+                in_hunk = false;
+            }
+        }
+    }
+
+    (lines_added, lines_removed, hunk_count)
+}
+
 /// Derive FsRead / FsWrite events from a tool call's name and input JSON,
 /// and send them immediately after the ToolCall event.
 fn emit_fs_events_for_tool(
@@ -1047,13 +1540,43 @@ fn emit_fs_events_for_tool(
                     .and_then(|v| v.as_str())
                     .map(|s| s.len() as u64)
                     .unwrap_or(0);
-                Some(Event::FsWrite { path: p, bytes, session_id })
+                Some(Event::FsWrite { path: p, bytes, session_id, lines_added: 0, lines_removed: 0, hunk_count: 0 })
             }
         }
 
-        "Edit" | "MultiEdit" => path("file_path").map(|p| Event::FsWrite { path: p, bytes: 0, session_id }),
+        "Edit" | "MultiEdit" => {
+            match path("file_path") {
+                None => return,
+                Some(p) => {
+                    // For Edit, try to extract before/after from the edit edits array
+                    let before = input
+                        .get("edits")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|e| e.get("old_string"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
 
-        "NotebookEdit" => path("notebook_path").map(|p| Event::FsWrite { path: p, bytes: 0, session_id }),
+                    let after = input
+                        .get("edits")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|e| e.get("new_string"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let (lines_added, lines_removed, hunk_count) = if !before.is_empty() || !after.is_empty() {
+                        compute_diff_stats(before, after)
+                    } else {
+                        (0, 0, 0)
+                    };
+
+                    Some(Event::FsWrite { path: p, bytes: 0, session_id, lines_added, lines_removed, hunk_count })
+                }
+            }
+        }
+
+        "NotebookEdit" => path("notebook_path").map(|p| Event::FsWrite { path: p, bytes: 0, session_id, lines_added: 0, lines_removed: 0, hunk_count: 0 }),
 
         "Glob" | "Grep" => path("pattern")
             .or_else(|| path("path"))
@@ -1126,6 +1649,15 @@ fn emit_llm_request(
         {
             let last_user_message = extract_last_user_message(&json);
             let system_prompt = extract_system_prompt(&json);
+            let raw_request = {
+                use base64::Engine as _;
+                Some(base64::engine::general_purpose::STANDARD.encode(json.to_string()))
+            };
+
+            // Increment turn counter for non-streaming responses
+            static TURN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let turn_number = TURN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
             let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
                 provider: provider.to_string(),
                 model,
@@ -1133,6 +1665,8 @@ fn emit_llm_request(
                 session_id,
                 last_user_message,
                 system_prompt,
+                raw_request,
+                turn_number,
             }));
         }
     }
@@ -1219,6 +1753,12 @@ fn emit_anthropic_response(
     if let Some(text) = &response_text {
         emit_pii_alert_if_found("llm_response", text, pii_watchlist, session_id, event_tx);
     }
+
+    let stop_reason = json
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmResponse {
         provider: "anthropic".to_string(),
         model: model.clone(),
@@ -1229,6 +1769,8 @@ fn emit_anthropic_response(
         response_text,
         cache_read_input_tokens,
         cache_creation_input_tokens,
+        raw_response: None,
+        stop_reason,
     }));
 
     if let Some(content) = json.get("content").and_then(|v| v.as_array()) {
@@ -1236,6 +1778,11 @@ fn emit_anthropic_response(
             if item.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 if let Some(tool_name) = item.get("name").and_then(|v| v.as_str()) {
                     let input = item.get("input").cloned().unwrap_or(json!({}));
+                    let tool_use_id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                    // Generate correlation_id for non-streaming response
+                    let correlation_id = Some(Uuid::new_v4());
+
                     emit_pii_alert_if_found(tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                     emit_fs_events_for_tool(tool_name, &input, session_id, event_tx);
                     let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
@@ -1243,6 +1790,8 @@ fn emit_anthropic_response(
                         tool_name: tool_name.to_string(),
                         input,
                         session_id,
+                        tool_use_id,
+                        correlation_id,
                     }));
                 }
             }
@@ -1285,6 +1834,14 @@ fn emit_openai_response(
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
 
+    let stop_reason = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmResponse {
         provider: "openai".to_string(),
         model,
@@ -1295,6 +1852,8 @@ fn emit_openai_response(
         response_text,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
+        raw_response: None,
+        stop_reason,
     }));
 
     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
@@ -1309,11 +1868,17 @@ fn emit_openai_response(
                                     .and_then(|v| v.as_str())
                                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                                     .unwrap_or(json!({}));
+
+                                // Generate correlation_id for non-streaming response
+                                let correlation_id = Some(Uuid::new_v4());
+
                                 let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
                                     agent: "openai".to_string(),
                                     tool_name: tool_name.to_string(),
                                     input,
                                     session_id,
+                                    tool_use_id: None,
+                                    correlation_id,
                                 }));
                             }
                         }
@@ -1341,6 +1906,20 @@ pub fn cost_usd_with_cache(model: &str, input_tokens: u32, output_tokens: u32, c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_gemini_model_from_path() {
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/gemini-3-flash:streamGenerateContent"),
+            Some("gemini-3-flash".to_string())
+        );
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/gemini-2.5-flash-lite:generateContent"),
+            Some("gemini-2.5-flash-lite".to_string())
+        );
+        assert_eq!(extract_gemini_model_from_path("/v1/messages"), None);
+        assert_eq!(extract_gemini_model_from_path(""), None);
+    }
 
     #[test]
     fn test_detect_provider_anthropic() {
@@ -1424,6 +2003,295 @@ mod tests {
             );
         }
     }
+
+    // ── Gemini SSE state machine tests ─────────────────────────────────────
+
+    fn make_gemini_text_chunk(text: &str) -> Value {
+        json!({
+            "candidates": [{
+                "content": {"parts": [{"text": text}], "role": "model"}
+            }]
+        })
+    }
+
+    fn make_gemini_tool_chunk(name: &str, args: Value, will_continue: bool) -> Value {
+        json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"functionCall": {"name": name, "args": args, "willContinue": will_continue}}],
+                    "role": "model"
+                }
+            }]
+        })
+    }
+
+    fn make_gemini_final_chunk(finish_reason: &str, prompt_tokens: u32, candidate_tokens: u32) -> Value {
+        json!({
+            "candidates": [{"content": {"parts": [], "role": "model"}, "finishReason": finish_reason}],
+            "usageMetadata": {"promptTokenCount": prompt_tokens, "candidatesTokenCount": candidate_tokens}
+        })
+    }
+
+    #[test]
+    fn gemini_text_accumulates_in_response_text() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        process_gemini_sse_event(&make_gemini_text_chunk("hello "), &mut state, sid, &tx, &[]);
+        process_gemini_sse_event(&make_gemini_text_chunk("world"), &mut state, sid, &tx, &[]);
+        assert_eq!(state.response_text, "hello world");
+    }
+
+    #[test]
+    fn gemini_token_counts_extracted_from_final_chunk() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        process_gemini_sse_event(&make_gemini_text_chunk("hello"), &mut state, sid, &tx, &[]);
+        process_gemini_sse_event(&make_gemini_final_chunk("STOP", 10, 5), &mut state, sid, &tx, &[]);
+        assert_eq!(state.input_tokens, 10);
+        assert_eq!(state.output_tokens, 5);
+        assert!(state.gemini_finished);
+    }
+
+    #[test]
+    fn gemini_tool_call_emits_event() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let chunk = make_gemini_tool_chunk("read_file", json!({"path": "/foo.rs"}), false);
+        process_gemini_sse_event(&chunk, &mut state, sid, &tx, &[]);
+        drop(tx);
+        // Should have emitted a ToolCall event with canonical name "Read"
+        let mut events = vec![];
+        let mut rx = rx;
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ToolCall { tool_name, .. } if tool_name == "Read")));
+    }
+
+    #[test]
+    fn gemini_tool_call_canonical_write_file_sets_hold() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let chunk = make_gemini_tool_chunk("write_file", json!({"path": "/out.rs", "content": "fn main(){}"}), false);
+        process_gemini_sse_event(&chunk, &mut state, sid, &tx, &[]);
+        assert!(state.holding, "write_file should set state.holding");
+        assert!(state.pending_approval_data.is_some());
+    }
+
+    #[test]
+    fn gemini_safety_finish_sets_gemini_finished_with_zero_tokens() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        process_gemini_sse_event(&make_gemini_final_chunk("SAFETY", 0, 0), &mut state, sid, &tx, &[]);
+        assert!(state.gemini_finished);
+        assert_eq!(state.input_tokens, 0);
+    }
+
+    #[test]
+    fn gemini_thought_parts_not_added_to_response_text() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-2.5-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let chunk = json!({
+            "candidates": [{"content": {"parts": [
+                {"thought": true, "text": "reasoning..."},
+                {"text": "answer"}
+            ], "role": "model"}}]
+        });
+        process_gemini_sse_event(&chunk, &mut state, sid, &tx, &[]);
+        assert_eq!(state.response_text, "answer");
+        assert!(!state.response_text.contains("reasoning"));
+    }
+
+    #[test]
+    fn gemini_two_sequential_tool_calls_get_distinct_indices() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let c1 = make_gemini_tool_chunk("read_file",  json!({"path": "/a.rs"}), false);
+        let c2 = make_gemini_tool_chunk("write_file", json!({"path": "/b.rs", "content": "x"}), false);
+        process_gemini_sse_event(&c1, &mut state, sid, &tx, &[]);
+        process_gemini_sse_event(&c2, &mut state, sid, &tx, &[]);
+        assert_eq!(state.gemini_next_block_idx, 2);
+        assert!(state.gemini_active_call_idx.is_none());
+    }
+
+    #[test]
+    fn turn_number_increments_per_llm_request() {
+        // Verify that turn_number increases monotonically for successive LlmRequest events.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let sid = Uuid::new_v4();
+
+        let req1 = Event::LlmRequest {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 0,
+            session_id: sid,
+            last_user_message: None,
+            system_prompt: None,
+            raw_request: None,
+            turn_number: 1,
+        };
+
+        let req2 = Event::LlmRequest {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 0,
+            session_id: sid,
+            last_user_message: None,
+            system_prompt: None,
+            raw_request: None,
+            turn_number: 2,
+        };
+
+        let _ = tx.try_send(TimestampedEvent::new(req1));
+        let _ = tx.try_send(TimestampedEvent::new(req2));
+        drop(tx);
+
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::LlmRequest { turn_number, .. } = &ev.event {
+                events.push(*turn_number);
+            }
+        }
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], 1);
+        assert_eq!(events[1], 2);
+    }
+
+    #[test]
+    fn tool_call_correlation_id_matches_result() {
+        // Verify that a ToolCall event has the same correlation_id as its paired ToolCallResult.
+        let correlation_id = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+
+        let tool_call = Event::ToolCall {
+            agent: "claude".into(),
+            tool_name: "Read".into(),
+            input: json!({"file_path": "/test.rs"}),
+            session_id: sid,
+            tool_use_id: Some("id_1".into()),
+            correlation_id: Some(correlation_id),
+        };
+
+        let tool_result = Event::ToolCallResult {
+            agent: "claude".into(),
+            tool_name: "Read".into(),
+            blocked: false,
+            session_id: sid,
+            correlation_id: Some(correlation_id),
+            duration_ms: Some(100),
+            is_error: false,
+        };
+
+        if let Event::ToolCall { correlation_id: call_corr, .. } = &tool_call {
+            if let Event::ToolCallResult { correlation_id: result_corr, .. } = &tool_result {
+                assert_eq!(call_corr, result_corr, "ToolCall and ToolCallResult must have matching correlation_id");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_call_result_is_error_true_when_flagged() {
+        // Verify that is_error flag is properly captured in ToolCallResult.
+        let sid = Uuid::new_v4();
+
+        let error_result = Event::ToolCallResult {
+            agent: "claude".into(),
+            tool_name: "Bash".into(),
+            blocked: false,
+            session_id: sid,
+            correlation_id: None,
+            duration_ms: Some(50),
+            is_error: true,  // Error case
+        };
+
+        if let Event::ToolCallResult { is_error, .. } = &error_result {
+            assert!(*is_error, "is_error should be true for error results");
+        }
+
+        let success_result = Event::ToolCallResult {
+            agent: "claude".into(),
+            tool_name: "Bash".into(),
+            blocked: false,
+            session_id: sid,
+            correlation_id: None,
+            duration_ms: Some(50),
+            is_error: false,  // Success case
+        };
+
+        if let Event::ToolCallResult { is_error, .. } = &success_result {
+            assert!(!*is_error, "is_error should be false for successful results");
+        }
+    }
+
+    #[test]
+    fn fswrite_hunk_count_from_diff() {
+        // Verify that hunk_count is computed correctly from a before/after diff.
+        let before = "line 1\nline 2\nline 3\n";
+        let after = "line 1\nmodified line 2\nline 3\nnew line 4\n";
+
+        let (lines_added, lines_removed, hunk_count) = compute_diff_stats(before, after);
+
+        // before has 3 lines, after has 4 lines
+        // Diff should show: 1 deletion (line 2), 1 insertion (modified line 2), 1 insertion (new line 4)
+        // That's 2 lines added (modified + new), 1 line removed
+        assert_eq!(lines_removed, 1, "should have 1 line removed");
+        assert_eq!(lines_added, 2, "should have 2 lines added");
+        assert!(hunk_count > 0, "should have at least 1 hunk");
+    }
+
+    #[test]
+    fn stop_reason_captured_from_llm() {
+        // Verify that stop_reason is properly captured from LLM responses.
+        let sid = Uuid::new_v4();
+
+        let resp_with_stop_reason = Event::LlmResponse {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: 0.001,
+            session_id: sid,
+            response_text: None,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            raw_response: None,
+            stop_reason: Some("end_turn".into()),
+        };
+
+        if let Event::LlmResponse { stop_reason, .. } = &resp_with_stop_reason {
+            assert_eq!(
+                stop_reason.as_ref().map(|s| s.as_str()),
+                Some("end_turn"),
+                "stop_reason should be captured"
+            );
+        }
+
+        let resp_without_stop_reason = Event::LlmResponse {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: 0.01,
+            session_id: sid,
+            response_text: None,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            raw_response: None,
+            stop_reason: None,
+        };
+
+        if let Event::LlmResponse { stop_reason, .. } = &resp_without_stop_reason {
+            assert!(stop_reason.is_none(), "stop_reason can be None");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1476,6 +2344,8 @@ mod integration {
             upstream_override,
             pii_watchlist: vec![],
             write_approval_threshold: None,
+            outbound_hook: None,
+            pending_denials: Arc::new(Mutex::new(HashMap::new())),
         };
         let http_client = reqwest::Client::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

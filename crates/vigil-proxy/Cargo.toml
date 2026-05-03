@@ -24,3 +24,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 futures-util = "0.3"
 vigil-core = { path = "../vigil-core" }
 tracing = { workspace = true }
+flate2 = "1.0"
+base64 = "0.22"
+similar = "2.0"

@@ -45,6 +45,8 @@ pub enum PolicyMatcher {
         input_field: String,
         value_pattern: String,
     },
+    #[serde(rename = "SubAgentDepth")]
+    SubAgentDepth { max_depth: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -242,7 +244,7 @@ impl PolicyEngine {
                 matches!(event, Event::LlmRequest { .. })
             }
             PolicyMatcher::ToolCallInput {
-                tool_name_pattern,
+                tool_name_pattern: _,
                 input_field,
                 ..
             } => {
@@ -266,13 +268,19 @@ impl PolicyEngine {
                 }
                 false
             }
+            PolicyMatcher::SubAgentDepth { max_depth } => {
+                if let Event::SubAgentSpawned { depth, .. } = event {
+                    return *depth > *max_depth;
+                }
+                false
+            }
         }
     }
 
     fn matcher_reason(&self, matcher: &PolicyMatcher, event: &Event) -> Option<String> {
         match matcher {
             PolicyMatcher::ToolCall { tool_name_pattern } => {
-                if let Event::ToolCall { tool_name, .. } = event {
+                if let Event::ToolCall { tool_name: _, .. } = event {
                     Some(format!(
                         "ToolCall matched pattern '{}'",
                         tool_name_pattern
@@ -291,7 +299,7 @@ impl PolicyEngine {
             PolicyMatcher::FsPath { path_pattern } => {
                 Some(format!("FsPath matched pattern '{}'", path_pattern))
             }
-            PolicyMatcher::NetworkDomain { deny_unless_in } => {
+            PolicyMatcher::NetworkDomain { deny_unless_in: _ } => {
                 if let Event::LlmRequest { provider, .. } = event {
                     Some(format!(
                         "NetworkDomain '{}' not in allowlist",
@@ -317,6 +325,16 @@ impl PolicyEngine {
                     "ToolCall {} input field {} matched pattern '{}'",
                     tool_name_pattern, input_field, value_pattern
                 ))
+            }
+            PolicyMatcher::SubAgentDepth { max_depth } => {
+                if let Event::SubAgentSpawned { depth, tool_name, .. } = event {
+                    Some(format!(
+                        "sub-agent depth {} exceeds max {}  (tool: {})",
+                        depth, max_depth, tool_name
+                    ))
+                } else {
+                    Some(format!("sub-agent depth limit: max {}", max_depth))
+                }
             }
         }
     }
