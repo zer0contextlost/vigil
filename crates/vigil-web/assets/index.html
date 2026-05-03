@@ -53,17 +53,26 @@
           <input id="search-box" class="search-input" type="search" placeholder="Filter sessions… (/ to focus)" oninput="onSearchInput(this.value)" autocomplete="off">
         </div>
 
+        <!-- Status filter tabs -->
+        <div class="status-filter-strip">
+          <div class="filter-tabs">
+            <button class="filter-tab active" data-filter="all">All <span class="tab-count">(0)</span></button>
+            <button class="filter-tab" data-filter="live">Live <span class="tab-count">(0)</span></button>
+            <button class="filter-tab" data-filter="completed">Completed <span class="tab-count">(0)</span></button>
+          </div>
+        </div>
+
         <table class="sessions-table" id="sessions-table">
           <thead>
             <tr>
-              <th>Session</th>
-              <th>Agent</th>
-              <th class="num">Cost</th>
-              <th class="num">$/min</th>
-              <th>Last Event</th>
-              <th>Alerts</th>
-              <th>Started</th>
-              <th>Status</th>
+              <th class="sortable" data-sort-key="name">Session <span class="sort-indicator"></span></th>
+              <th class="sortable" data-sort-key="agent">Agent <span class="sort-indicator"></span></th>
+              <th class="sortable num" data-sort-key="cost">Cost <span class="sort-indicator"></span></th>
+              <th class="sortable num" data-sort-key="burn">$/min <span class="sort-indicator"></span></th>
+              <th class="sortable" data-sort-key="last_event">Last Event <span class="sort-indicator"></span></th>
+              <th class="sortable" data-sort-key="alerts">Alerts <span class="sort-indicator"></span></th>
+              <th class="sortable" data-sort-key="started">Started <span class="sort-indicator"></span></th>
+              <th class="sortable" data-sort-key="status">Status <span class="sort-indicator"></span></th>
             </tr>
           </thead>
           <tbody id="sessions-tbody">

@@ -12,6 +12,9 @@ const state = {
   selectedId: null,
   pendingApproval: null,
   sseConnected: false,
+  sortCol: 'status',
+  sortDir: 'desc',
+  statusFilter: 'all',
 };
 let searchQuery = '';
 let keyboardRow = null;
@@ -21,6 +24,23 @@ window.addEventListener('DOMContentLoaded', () => {
   const params = new URLSearchParams(window.location.search);
   VIGIL_TOKEN = params.get('token') || sessionStorage.getItem('vigil-token') || '';
   if (VIGIL_TOKEN) sessionStorage.setItem('vigil-token', VIGIL_TOKEN);
+
+  state.sortCol = sessionStorage.getItem('vigil-sort-col') || 'status';
+  state.sortDir = sessionStorage.getItem('vigil-sort-dir') || 'desc';
+  state.statusFilter = sessionStorage.getItem('vigil-status-filter') || 'all';
+
+  // Sync the active tab to the stored filter
+  document.querySelectorAll('.filter-tab').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.filter === state.statusFilter);
+  });
+
+  attachFilterHandlers();
+
+  // Close export dropdown when clicking outside
+  document.addEventListener('click', () => {
+    const dropdown = document.getElementById('export-dropdown');
+    if (dropdown) dropdown.classList.remove('visible');
+  });
 
   loadSessions();
   connectSSE();
@@ -39,6 +59,7 @@ async function loadSessions() {
     renderSidebar();
     if (!state.selectedId) renderSessionsTable();
     updateSessionCount();
+    updateFilterCounts();
   } catch (e) {
     console.warn('Failed to load sessions:', e);
   }
@@ -137,6 +158,7 @@ function handleEvent(envelope) {
 
   updateTableRow(sid);
   renderSidebar();
+  updateFilterCounts();
   if (state.selectedId === sid) appendTimelineItem(envelope);
 }
 
@@ -162,7 +184,16 @@ function onSearchInput(val) {
 }
 
 function filteredSessions() {
-  const sessions = Object.values(state.sessions);
+  let sessions = Object.values(state.sessions);
+
+  // Status filter
+  if (state.statusFilter === 'live') {
+    sessions = sessions.filter(s => s.status === 'live');
+  } else if (state.statusFilter === 'completed') {
+    sessions = sessions.filter(s => s.status !== 'live');
+  }
+
+  // Search filter
   if (!searchQuery) return sessions;
   return sessions.filter(s =>
     (s.name || '').toLowerCase().includes(searchQuery) ||
@@ -171,12 +202,98 @@ function filteredSessions() {
   );
 }
 
+// ── Sorting ────────────────────────────────────────────────────────────────
 function sortedSessions(sessions) {
-  return [...sessions].sort((a, b) => {
-    if (a.status === 'live' && b.status !== 'live') return -1;
-    if (b.status === 'live' && a.status !== 'live') return 1;
+  const sorted = [...sessions];
+  const col = state.sortCol;
+  const dir = state.sortDir === 'asc' ? 1 : -1;
+
+  sorted.sort((a, b) => {
+    let aVal, bVal;
+    if (col === 'name')       { aVal = (a.name || a.id).toLowerCase(); bVal = (b.name || b.id).toLowerCase(); }
+    else if (col === 'agent') { aVal = (a.agent || '').toLowerCase(); bVal = (b.agent || '').toLowerCase(); }
+    else if (col === 'cost')  { aVal = a.cost_usd || 0; bVal = b.cost_usd || 0; }
+    else if (col === 'burn')  { aVal = a.burn_rate_per_min || 0; bVal = b.burn_rate_per_min || 0; }
+    else if (col === 'last_event') { aVal = (a.last_event || '').toLowerCase(); bVal = (b.last_event || '').toLowerCase(); }
+    else if (col === 'alerts') { aVal = (a.alerts || []).length; bVal = (b.alerts || []).length; }
+    else if (col === 'started') { aVal = new Date(a.started_at).getTime(); bVal = new Date(b.started_at).getTime(); }
+    else { // status: live first
+      aVal = a.status === 'live' ? 0 : 1;
+      bVal = b.status === 'live' ? 0 : 1;
+    }
+
+    if (aVal < bVal) return -1 * dir;
+    if (aVal > bVal) return 1 * dir;
+    // Secondary sort: newest first
     return new Date(b.started_at) - new Date(a.started_at);
   });
+  return sorted;
+}
+
+function attachSortHandlers() {
+  document.querySelectorAll('.sessions-table thead th.sortable').forEach(th => {
+    th.addEventListener('click', (e) => {
+      if (e.shiftKey) {
+        state.sortCol = 'status';
+        state.sortDir = 'desc';
+      } else {
+        const col = th.dataset.sortKey;
+        if (state.sortCol === col) {
+          state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+          state.sortCol = col;
+          // Default sort direction: numeric/date columns go desc, text goes asc
+          state.sortDir = (col === 'cost' || col === 'burn' || col === 'started' || col === 'alerts') ? 'desc' : 'asc';
+        }
+      }
+      sessionStorage.setItem('vigil-sort-col', state.sortCol);
+      sessionStorage.setItem('vigil-sort-dir', state.sortDir);
+      renderSessionsTable();
+    });
+  });
+  updateSortIndicators();
+}
+
+function updateSortIndicators() {
+  document.querySelectorAll('.sessions-table thead th.sortable').forEach(th => {
+    const indicator = th.querySelector('.sort-indicator');
+    const col = th.dataset.sortKey;
+    if (col === state.sortCol) {
+      th.classList.add('sort-active');
+      indicator.className = `sort-indicator ${state.sortDir}`;
+    } else {
+      th.classList.remove('sort-active');
+      indicator.className = 'sort-indicator';
+    }
+  });
+}
+
+// ── Status filter tabs ─────────────────────────────────────────────────────
+function attachFilterHandlers() {
+  document.querySelectorAll('.filter-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const filter = btn.dataset.filter;
+      state.statusFilter = filter;
+      sessionStorage.setItem('vigil-status-filter', filter);
+      document.querySelectorAll('.filter-tab').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      keyboardRow = null;
+      renderSessionsTable();
+    });
+  });
+}
+
+function updateFilterCounts() {
+  const all = Object.values(state.sessions).length;
+  const live = Object.values(state.sessions).filter(s => s.status === 'live').length;
+  const completed = Object.values(state.sessions).filter(s => s.status !== 'live').length;
+
+  const allBtn = document.querySelector('[data-filter="all"] .tab-count');
+  const liveBtn = document.querySelector('[data-filter="live"] .tab-count');
+  const completedBtn = document.querySelector('[data-filter="completed"] .tab-count');
+  if (allBtn) allBtn.textContent = `(${all})`;
+  if (liveBtn) liveBtn.textContent = `(${live})`;
+  if (completedBtn) completedBtn.textContent = `(${completed})`;
 }
 
 // ── Keyboard navigation ────────────────────────────────────────────────────
@@ -252,16 +369,21 @@ function renderSessionsTable() {
   const tbody = document.getElementById('sessions-tbody');
   const sessions = sortedSessions(filteredSessions());
   updateSessionCount();
+  updateFilterCounts();
 
   if (sessions.length === 0) {
     const msg = searchQuery
       ? `No sessions match "${escHtml(searchQuery)}"`
-      : 'No sessions yet — run <code>vigil run -- claude</code> to start';
+      : state.statusFilter !== 'all'
+        ? `No ${state.statusFilter} sessions`
+        : 'No sessions yet — run <code>vigil run -- claude</code> to start';
     tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">◯</div><div>${msg}</div></div></td></tr>`;
+    attachSortHandlers();
     return;
   }
 
   tbody.innerHTML = sessions.map((s, idx) => buildTableRow(s, idx)).join('');
+  attachSortHandlers();
 }
 
 function buildTableRow(s, idx) {
@@ -389,12 +511,20 @@ function renderDetailInfo(s) {
     ? formatDuration(new Date(s.started_at), new Date(s.ended_at))
     : formatDuration(new Date(s.started_at), new Date());
 
+  const sid = s.id;
   el.innerHTML = `
     <span>Started: <strong>${new Date(s.started_at).toLocaleString()}</strong></span>
     <span>Duration: <strong>${duration}</strong></span>
     <span>Cost: <strong>$${(s.cost_usd || 0).toFixed(4)}</strong></span>
     <span>Tokens: <strong>${(s.tokens || 0).toLocaleString()}</strong></span>
     <span>Status: <strong>${s.status === 'live' ? '🟢 LIVE' : '⚫ COMPLETED'}</strong></span>
+    <div class="export-menu">
+      <button class="btn btn-export" onclick="toggleExportMenu(event)">↓ Download</button>
+      <div class="export-dropdown" id="export-dropdown">
+        <button class="export-option" onclick="exportSessionJSON('${sid}')">JSON — raw events</button>
+        <button class="export-option" onclick="exportSessionHTML('${sid}')">HTML — report</button>
+      </div>
+    </div>
   `;
 }
 
@@ -461,8 +591,8 @@ function appendTimelineItem(envelope) {
       break;
     case 'WriteApprovalRequired':
       title = `Write approval required: ${shortPath(data.path)}`;
-      meta = `Risk: ${data.risk_level || 'unknown'}`;
-      itemClass = 'warn-item';
+      meta = `Risk: ${data.risk_level || 'unknown'}${data.is_lockdown ? ' · LOCKDOWN' : ''}`;
+      itemClass = data.is_lockdown ? 'alert-item' : 'warn-item';
       break;
     case 'WriteApprovalDecision':
       title = `Write ${data.approved ? 'approved' : 'rejected'}`;
@@ -500,17 +630,31 @@ function appendTimelineItem(envelope) {
 
 // ── Write approval banner ──────────────────────────────────────────────────
 function showApprovalBanner(data, sessionId) {
-  state.pendingApproval = { id: data.approval_id, path: data.path, risk: data.risk_level, session_id: sessionId };
+  state.pendingApproval = {
+    id: data.approval_id,
+    path: data.path,
+    risk: data.risk_level,
+    session_id: sessionId,
+    is_lockdown: data.is_lockdown || false,
+  };
   document.getElementById('approval-path').textContent = data.path || '';
   const riskEl = document.getElementById('approval-risk');
   riskEl.textContent = (data.risk_level || 'Unknown').toUpperCase();
   riskEl.className = `badge badge-${(data.risk_level || '').toLowerCase()}`;
-  document.getElementById('approval-banner').classList.add('visible');
+
+  const banner = document.getElementById('approval-banner');
+  banner.classList.add('visible');
+  if (data.is_lockdown) {
+    banner.classList.add('lockdown');
+  } else {
+    banner.classList.remove('lockdown');
+  }
 }
 
 function hideApprovalBanner() {
   state.pendingApproval = null;
-  document.getElementById('approval-banner').classList.remove('visible');
+  const banner = document.getElementById('approval-banner');
+  banner.classList.remove('visible', 'lockdown');
 }
 
 async function submitApproval(approved) {
@@ -526,6 +670,137 @@ async function submitApproval(approved) {
     console.warn('Approval submit failed:', e);
   }
   hideApprovalBanner();
+}
+
+// ── Export ─────────────────────────────────────────────────────────────────
+function toggleExportMenu(e) {
+  e.stopPropagation();
+  const dropdown = document.getElementById('export-dropdown');
+  if (dropdown) dropdown.classList.toggle('visible');
+}
+
+async function exportSessionJSON(id) {
+  if (!id) id = state.selectedId;
+  if (!id) return;
+
+  try {
+    const res = await fetch(`/api/sessions/${id}?limit=10000&offset=0`, { headers: authHeaders() });
+    const detail = await res.json();
+    const payload = {
+      session_id: detail.id,
+      name: detail.name,
+      agent: detail.agent,
+      status: detail.status,
+      started_at: detail.started_at,
+      ended_at: detail.ended_at,
+      cost_usd: detail.cost_usd,
+      total_input_tokens: detail.total_input_tokens,
+      total_output_tokens: detail.total_output_tokens,
+      policy_violations: detail.policy_violations,
+      event_count: detail.event_count,
+      events: detail.events,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    downloadFile(blob, `vigil-session-${id.slice(0, 8)}-${Date.now()}.json`);
+  } catch (e) {
+    console.warn('Export JSON failed:', e);
+  }
+  const dd = document.getElementById('export-dropdown');
+  if (dd) dd.classList.remove('visible');
+}
+
+async function exportSessionHTML(id) {
+  if (!id) id = state.selectedId;
+  if (!id) return;
+
+  try {
+    const res = await fetch(`/api/sessions/${id}?limit=10000&offset=0`, { headers: authHeaders() });
+    const detail = await res.json();
+    const s = state.sessions[id] || {};
+
+    const duration = detail.ended_at
+      ? formatDuration(new Date(detail.started_at), new Date(detail.ended_at))
+      : formatDuration(new Date(detail.started_at), new Date());
+
+    const eventRows = (detail.events || []).map(ev => {
+      const etype = Object.keys(ev.event)[0];
+      const data = ev.event[etype];
+      const ts = new Date(ev.timestamp).toLocaleTimeString();
+      let title = etype;
+      if (etype === 'LlmRequest') title = `LLM Request (${data.input_tokens || 0} in)`;
+      else if (etype === 'LlmResponse') title = `LLM Response (${data.output_tokens || 0} out) — $${(data.cost_usd || 0).toFixed(4)}`;
+      else if (etype === 'FsWrite') title = `Write: ${shortPath(data.path)} +${data.lines_added || 0} -${data.lines_removed || 0}`;
+      else if (etype === 'FsRead') title = `Read: ${shortPath(data.path)}`;
+      else if (etype === 'ToolCall') title = `Tool: ${data.tool_name}`;
+      else title = etype.replace(/([A-Z])/g, ' $1').trim();
+      const isAlert = etype.includes('Alert') || etype === 'WriteApprovalRequired';
+      return `<tr${isAlert ? ' style="color:#dc2626"' : ''}><td style="white-space:nowrap;padding:6px 8px;border-bottom:1px solid #eee">${ts}</td><td style="padding:6px 8px;border-bottom:1px solid #eee">${escHtml(title)}</td></tr>`;
+    }).join('');
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>vigil — ${escHtml(detail.name || detail.id.slice(0, 8))}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; margin: 0; padding: 20px; color: #1f2937; }
+    .container { max-width: 1000px; margin: 0 auto; background: #fff; padding: 32px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+    h1 { margin: 0 0 4px 0; font-size: 22px; } h2 { font-size: 16px; margin: 28px 0 12px; }
+    .subtitle { color: #6b7280; font-size: 13px; margin-bottom: 24px; font-family: monospace; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 28px; }
+    .stat { padding: 12px 14px; background: #f9fafb; border-left: 3px solid #3b82f6; border-radius: 4px; }
+    .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #9ca3af; margin-bottom: 4px; }
+    .stat-value { font-size: 16px; font-weight: 600; font-family: monospace; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th { background: #f3f4f6; padding: 8px; text-align: left; border-bottom: 2px solid #e5e7eb; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; color: #6b7280; }
+    tbody tr:hover { background: #fafafa; }
+    .footer { margin-top: 24px; font-size: 11px; color: #9ca3af; text-align: center; border-top: 1px solid #e5e7eb; padding-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>vigil Session Report</h1>
+    <div class="subtitle">${escHtml(detail.id)}</div>
+    <div class="grid">
+      <div class="stat"><div class="stat-label">Session</div><div class="stat-value">${escHtml(detail.name || detail.id.slice(0, 8))}</div></div>
+      <div class="stat"><div class="stat-label">Agent</div><div class="stat-value">${escHtml(detail.agent)}</div></div>
+      <div class="stat"><div class="stat-label">Status</div><div class="stat-value">${detail.status.toUpperCase()}</div></div>
+      <div class="stat"><div class="stat-label">Started</div><div class="stat-value">${new Date(detail.started_at).toLocaleString()}</div></div>
+      <div class="stat"><div class="stat-label">Duration</div><div class="stat-value">${duration}</div></div>
+      <div class="stat"><div class="stat-label">Cost</div><div class="stat-value">$${(detail.cost_usd || 0).toFixed(4)}</div></div>
+      <div class="stat"><div class="stat-label">Input Tokens</div><div class="stat-value">${(detail.total_input_tokens || 0).toLocaleString()}</div></div>
+      <div class="stat"><div class="stat-label">Output Tokens</div><div class="stat-value">${(detail.total_output_tokens || 0).toLocaleString()}</div></div>
+      <div class="stat"><div class="stat-label">Violations</div><div class="stat-value">${detail.policy_violations}</div></div>
+      <div class="stat"><div class="stat-label">Events</div><div class="stat-value">${detail.event_count}</div></div>
+    </div>
+    <h2>Event Timeline (${(detail.events || []).length} shown)</h2>
+    <table>
+      <thead><tr><th>Time</th><th>Event</th></tr></thead>
+      <tbody>${eventRows || '<tr><td colspan="2" style="text-align:center;color:#9ca3af;padding:20px">No events recorded</td></tr>'}</tbody>
+    </table>
+    <div class="footer">Generated by vigil v${escHtml(document.title.match(/vigil/) ? '0.7.5' : '')} &nbsp;·&nbsp; ${new Date().toLocaleString()}</div>
+  </div>
+</body>
+</html>`;
+
+    const blob = new Blob([html], { type: 'text/html' });
+    downloadFile(blob, `vigil-session-${id.slice(0, 8)}-${Date.now()}.html`);
+  } catch (e) {
+    console.warn('Export HTML failed:', e);
+  }
+  const dd = document.getElementById('export-dropdown');
+  if (dd) dd.classList.remove('visible');
+}
+
+function downloadFile(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────

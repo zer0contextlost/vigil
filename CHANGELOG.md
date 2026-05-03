@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.6] - 2026-05-03
+
+### Added
+- Column sorting on sessions table — click any header to sort asc/desc; shift-click resets to default; sort preference persists in sessionStorage
+- Status filter tabs (All / Live / Completed with live counts) above the sessions table; composes with search filter; preference persists in sessionStorage
+- Session export from detail view — "Download" button with dropdown: JSON (raw events) and HTML (styled report) download client-side without a server round-trip
+- Lockdown banner variant — `WriteApprovalRequired` with `is_lockdown: true` now renders with red border, glow, and "LOCKDOWN ZONE" label instead of amber
+- Lockdown events in timeline marked as alert-level (red) rather than warn-level (amber)
+
 ## [0.7.5] - 2026-05-03
 
 ### Fixed
