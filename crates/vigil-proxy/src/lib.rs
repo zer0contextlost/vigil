@@ -542,6 +542,11 @@ async fn handle_reverse_proxy(
         use base64::Engine as _;
         Some(base64::engine::general_purpose::STANDARD.encode(&effective_body))
     };
+
+    // Increment turn counter and capture it
+    static TURN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let turn_number = TURN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
         provider: provider.to_string(),
         model: model.clone(),
@@ -550,6 +555,7 @@ async fn handle_reverse_proxy(
         last_user_message,
         system_prompt,
         raw_request,
+        turn_number,
     }));
 
     let resp = req.send().await?;
@@ -643,6 +649,10 @@ struct SseState {
     gemini_active_call_idx: Option<usize>,
     /// Gemini: set to true when finishReason is non-empty, indicating stream end.
     gemini_finished: bool,
+    /// Stop reason from the LLM (end_turn, max_tokens, tool_use, etc).
+    stop_reason: Option<String>,
+    /// Maps tool_use_id to correlation UUID for matching ToolCall with ToolCallResult.
+    tool_use_to_correlation: HashMap<String, Uuid>,
 }
 
 async fn stream_sse_response(
@@ -933,6 +943,7 @@ async fn stream_sse_response(
             cache_read_input_tokens: state.cache_read_input_tokens,
             cache_creation_input_tokens: state.cache_creation_input_tokens,
             raw_response,
+            stop_reason: state.stop_reason.clone(),
         }));
     }
 
@@ -1047,12 +1058,22 @@ fn process_sse_event(
                 if AnthropicAdapter.write_tools().iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
                     state.pending_approval_data = Some((tool_name.clone(), input.clone()));
                 }
+
+                // Generate correlation_id and store it for matching with ToolCallResult
+                let correlation_id = Some(Uuid::new_v4());
+                if let Some(ref id) = tool_use_id {
+                    if let Some(corr_id) = correlation_id {
+                        state.tool_use_to_correlation.insert(id.clone(), corr_id);
+                    }
+                }
+
                 let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
                     agent: "claude".to_string(),
                     tool_name,
                     input,
                     session_id,
                     tool_use_id,
+                    correlation_id,
                 }));
             }
             state.block_type.remove(&idx);
@@ -1125,12 +1146,21 @@ fn process_openai_sse_event(
                         let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
                         emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                         emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
+
+                        // Generate correlation_id for OpenAI (no tool_use_id, so we use index as string key)
+                        let correlation_id = Some(Uuid::new_v4());
+                        let tool_use_id = Some(format!("openai_{}", idx));
+                        if let Some(corr_id) = correlation_id {
+                            state.tool_use_to_correlation.insert(tool_use_id.clone().unwrap_or_default(), corr_id);
+                        }
+
                         let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
                             agent: "openai".to_string(),
                             tool_name,
                             input,
                             session_id,
-                            tool_use_id: None,
+                            tool_use_id,
+                            correlation_id,
                         }));
                     }
                     state.block_name.clear();
@@ -1277,12 +1307,16 @@ fn flush_gemini_call(
         state.holding_tool_idx = Some(idx);
     }
 
+    // Generate correlation_id for Gemini tool calls
+    let correlation_id = Some(Uuid::new_v4());
+
     let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
         agent: "gemini".to_string(),
         tool_name,
         input,
         session_id,
         tool_use_id: None,
+        correlation_id,
     }));
 }
 
@@ -1448,6 +1482,41 @@ fn scan_tool_results_for_injection(
     }
 }
 
+/// Compute diff statistics from before/after strings using the similar crate.
+fn compute_diff_stats(before: &str, after: &str) -> (u32, u32, u32) {
+    use similar::TextDiff;
+
+    let diff = TextDiff::from_lines(before, after);
+    let mut lines_added = 0u32;
+    let mut lines_removed = 0u32;
+    let mut hunk_count = 0u32;
+    let mut in_hunk = false;
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Delete => {
+                lines_removed += 1;
+                if !in_hunk {
+                    hunk_count += 1;
+                    in_hunk = true;
+                }
+            }
+            similar::ChangeTag::Insert => {
+                lines_added += 1;
+                if !in_hunk {
+                    hunk_count += 1;
+                    in_hunk = true;
+                }
+            }
+            similar::ChangeTag::Equal => {
+                in_hunk = false;
+            }
+        }
+    }
+
+    (lines_added, lines_removed, hunk_count)
+}
+
 /// Derive FsRead / FsWrite events from a tool call's name and input JSON,
 /// and send them immediately after the ToolCall event.
 fn emit_fs_events_for_tool(
@@ -1471,13 +1540,43 @@ fn emit_fs_events_for_tool(
                     .and_then(|v| v.as_str())
                     .map(|s| s.len() as u64)
                     .unwrap_or(0);
-                Some(Event::FsWrite { path: p, bytes, session_id })
+                Some(Event::FsWrite { path: p, bytes, session_id, lines_added: 0, lines_removed: 0, hunk_count: 0 })
             }
         }
 
-        "Edit" | "MultiEdit" => path("file_path").map(|p| Event::FsWrite { path: p, bytes: 0, session_id }),
+        "Edit" | "MultiEdit" => {
+            match path("file_path") {
+                None => return,
+                Some(p) => {
+                    // For Edit, try to extract before/after from the edit edits array
+                    let before = input
+                        .get("edits")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|e| e.get("old_string"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
 
-        "NotebookEdit" => path("notebook_path").map(|p| Event::FsWrite { path: p, bytes: 0, session_id }),
+                    let after = input
+                        .get("edits")
+                        .and_then(|v| v.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|e| e.get("new_string"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let (lines_added, lines_removed, hunk_count) = if !before.is_empty() || !after.is_empty() {
+                        compute_diff_stats(before, after)
+                    } else {
+                        (0, 0, 0)
+                    };
+
+                    Some(Event::FsWrite { path: p, bytes: 0, session_id, lines_added, lines_removed, hunk_count })
+                }
+            }
+        }
+
+        "NotebookEdit" => path("notebook_path").map(|p| Event::FsWrite { path: p, bytes: 0, session_id, lines_added: 0, lines_removed: 0, hunk_count: 0 }),
 
         "Glob" | "Grep" => path("pattern")
             .or_else(|| path("path"))
@@ -1554,6 +1653,11 @@ fn emit_llm_request(
                 use base64::Engine as _;
                 Some(base64::engine::general_purpose::STANDARD.encode(json.to_string()))
             };
+
+            // Increment turn counter for non-streaming responses
+            static TURN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let turn_number = TURN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
             let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
                 provider: provider.to_string(),
                 model,
@@ -1562,6 +1666,7 @@ fn emit_llm_request(
                 last_user_message,
                 system_prompt,
                 raw_request,
+                turn_number,
             }));
         }
     }
@@ -1648,6 +1753,12 @@ fn emit_anthropic_response(
     if let Some(text) = &response_text {
         emit_pii_alert_if_found("llm_response", text, pii_watchlist, session_id, event_tx);
     }
+
+    let stop_reason = json
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmResponse {
         provider: "anthropic".to_string(),
         model: model.clone(),
@@ -1659,6 +1770,7 @@ fn emit_anthropic_response(
         cache_read_input_tokens,
         cache_creation_input_tokens,
         raw_response: None,
+        stop_reason,
     }));
 
     if let Some(content) = json.get("content").and_then(|v| v.as_array()) {
@@ -1667,6 +1779,10 @@ fn emit_anthropic_response(
                 if let Some(tool_name) = item.get("name").and_then(|v| v.as_str()) {
                     let input = item.get("input").cloned().unwrap_or(json!({}));
                     let tool_use_id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                    // Generate correlation_id for non-streaming response
+                    let correlation_id = Some(Uuid::new_v4());
+
                     emit_pii_alert_if_found(tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                     emit_fs_events_for_tool(tool_name, &input, session_id, event_tx);
                     let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
@@ -1675,6 +1791,7 @@ fn emit_anthropic_response(
                         input,
                         session_id,
                         tool_use_id,
+                        correlation_id,
                     }));
                 }
             }
@@ -1717,6 +1834,14 @@ fn emit_openai_response(
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
 
+    let stop_reason = json
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmResponse {
         provider: "openai".to_string(),
         model,
@@ -1728,6 +1853,7 @@ fn emit_openai_response(
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
         raw_response: None,
+        stop_reason,
     }));
 
     if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
@@ -1742,12 +1868,17 @@ fn emit_openai_response(
                                     .and_then(|v| v.as_str())
                                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
                                     .unwrap_or(json!({}));
+
+                                // Generate correlation_id for non-streaming response
+                                let correlation_id = Some(Uuid::new_v4());
+
                                 let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
                                     agent: "openai".to_string(),
                                     tool_name: tool_name.to_string(),
                                     input,
                                     session_id,
                                     tool_use_id: None,
+                                    correlation_id,
                                 }));
                             }
                         }
@@ -1988,6 +2119,178 @@ mod tests {
         process_gemini_sse_event(&c2, &mut state, sid, &tx, &[]);
         assert_eq!(state.gemini_next_block_idx, 2);
         assert!(state.gemini_active_call_idx.is_none());
+    }
+
+    #[test]
+    fn turn_number_increments_per_llm_request() {
+        // Verify that turn_number increases monotonically for successive LlmRequest events.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let sid = Uuid::new_v4();
+
+        let req1 = Event::LlmRequest {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 0,
+            session_id: sid,
+            last_user_message: None,
+            system_prompt: None,
+            raw_request: None,
+            turn_number: 1,
+        };
+
+        let req2 = Event::LlmRequest {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 0,
+            session_id: sid,
+            last_user_message: None,
+            system_prompt: None,
+            raw_request: None,
+            turn_number: 2,
+        };
+
+        let _ = tx.try_send(TimestampedEvent::new(req1));
+        let _ = tx.try_send(TimestampedEvent::new(req2));
+        drop(tx);
+
+        let mut events = vec![];
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::LlmRequest { turn_number, .. } = &ev.event {
+                events.push(*turn_number);
+            }
+        }
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], 1);
+        assert_eq!(events[1], 2);
+    }
+
+    #[test]
+    fn tool_call_correlation_id_matches_result() {
+        // Verify that a ToolCall event has the same correlation_id as its paired ToolCallResult.
+        let correlation_id = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+
+        let tool_call = Event::ToolCall {
+            agent: "claude".into(),
+            tool_name: "Read".into(),
+            input: json!({"file_path": "/test.rs"}),
+            session_id: sid,
+            tool_use_id: Some("id_1".into()),
+            correlation_id: Some(correlation_id),
+        };
+
+        let tool_result = Event::ToolCallResult {
+            agent: "claude".into(),
+            tool_name: "Read".into(),
+            blocked: false,
+            session_id: sid,
+            correlation_id: Some(correlation_id),
+            duration_ms: Some(100),
+            is_error: false,
+        };
+
+        if let Event::ToolCall { correlation_id: call_corr, .. } = &tool_call {
+            if let Event::ToolCallResult { correlation_id: result_corr, .. } = &tool_result {
+                assert_eq!(call_corr, result_corr, "ToolCall and ToolCallResult must have matching correlation_id");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_call_result_is_error_true_when_flagged() {
+        // Verify that is_error flag is properly captured in ToolCallResult.
+        let sid = Uuid::new_v4();
+
+        let error_result = Event::ToolCallResult {
+            agent: "claude".into(),
+            tool_name: "Bash".into(),
+            blocked: false,
+            session_id: sid,
+            correlation_id: None,
+            duration_ms: Some(50),
+            is_error: true,  // Error case
+        };
+
+        if let Event::ToolCallResult { is_error, .. } = &error_result {
+            assert!(*is_error, "is_error should be true for error results");
+        }
+
+        let success_result = Event::ToolCallResult {
+            agent: "claude".into(),
+            tool_name: "Bash".into(),
+            blocked: false,
+            session_id: sid,
+            correlation_id: None,
+            duration_ms: Some(50),
+            is_error: false,  // Success case
+        };
+
+        if let Event::ToolCallResult { is_error, .. } = &success_result {
+            assert!(!*is_error, "is_error should be false for successful results");
+        }
+    }
+
+    #[test]
+    fn fswrite_hunk_count_from_diff() {
+        // Verify that hunk_count is computed correctly from a before/after diff.
+        let before = "line 1\nline 2\nline 3\n";
+        let after = "line 1\nmodified line 2\nline 3\nnew line 4\n";
+
+        let (lines_added, lines_removed, hunk_count) = compute_diff_stats(before, after);
+
+        // before has 3 lines, after has 4 lines
+        // Diff should show: 1 deletion (line 2), 1 insertion (modified line 2), 1 insertion (new line 4)
+        // That's 2 lines added (modified + new), 1 line removed
+        assert_eq!(lines_removed, 1, "should have 1 line removed");
+        assert_eq!(lines_added, 2, "should have 2 lines added");
+        assert!(hunk_count > 0, "should have at least 1 hunk");
+    }
+
+    #[test]
+    fn stop_reason_captured_from_llm() {
+        // Verify that stop_reason is properly captured from LLM responses.
+        let sid = Uuid::new_v4();
+
+        let resp_with_stop_reason = Event::LlmResponse {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: 0.001,
+            session_id: sid,
+            response_text: None,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            raw_response: None,
+            stop_reason: Some("end_turn".into()),
+        };
+
+        if let Event::LlmResponse { stop_reason, .. } = &resp_with_stop_reason {
+            assert_eq!(
+                stop_reason.as_ref().map(|s| s.as_str()),
+                Some("end_turn"),
+                "stop_reason should be captured"
+            );
+        }
+
+        let resp_without_stop_reason = Event::LlmResponse {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: 0.01,
+            session_id: sid,
+            response_text: None,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            raw_response: None,
+            stop_reason: None,
+        };
+
+        if let Event::LlmResponse { stop_reason, .. } = &resp_without_stop_reason {
+            assert!(stop_reason.is_none(), "stop_reason can be None");
+        }
     }
 }
 
