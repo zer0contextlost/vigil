@@ -1,0 +1,5 @@
+[proxy]
+port = 8877
+
+[web]
+port = 8878

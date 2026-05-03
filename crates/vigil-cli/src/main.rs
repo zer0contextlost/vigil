@@ -1592,7 +1592,8 @@ pub async fn run_proxy_mode(
     let pending_denials_filter = pending_denials.clone();
     let tui_rx = filtered_tx.subscribe();
 
-    if let Some(dashboard_port) = config.as_ref().and_then(|c| c.proxy.dashboard_port) {
+    if let Some(dashboard_port) = config.as_ref().and_then(|c| c.web.port)
+        .or_else(|| config.as_ref().and_then(|c| c.proxy.dashboard_port)) {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], dashboard_port));
         let tx = filtered_tx.clone();
         let approvals = pending_approvals_for_dashboard;
@@ -2132,7 +2133,8 @@ pub async fn run_agent_with_plugins(
     let pending_denials_filter = pending_denials.clone();
     let tui_rx = filtered_tx.subscribe();
 
-    if let Some(dashboard_port) = config.as_ref().and_then(|c| c.proxy.dashboard_port) {
+    if let Some(dashboard_port) = config.as_ref().and_then(|c| c.web.port)
+        .or_else(|| config.as_ref().and_then(|c| c.proxy.dashboard_port)) {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], dashboard_port));
         let tx = filtered_tx.clone();
         let approvals = pending_approvals_for_dashboard;

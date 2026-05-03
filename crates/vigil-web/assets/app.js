@@ -1,5 +1,14 @@
 'use strict';
 
+// ── Auth token ─────────────────────────────────────────────────────────────
+// Printed to stdout by vigil as: Dashboard: http://127.0.0.1:PORT/?token=...
+// Stored in sessionStorage so the token survives navigations within the tab.
+let VIGIL_TOKEN = '';
+
+function authHeaders() {
+  return VIGIL_TOKEN ? { 'Authorization': `Bearer ${VIGIL_TOKEN}` } : {};
+}
+
 // ── State ──────────────────────────────────────────────────────────────────
 const state = {
   sessions: {},       // id -> session object
@@ -10,16 +19,21 @@ const state = {
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
+  const params = new URLSearchParams(window.location.search);
+  VIGIL_TOKEN = params.get('token') || sessionStorage.getItem('vigil-token') || '';
+  if (VIGIL_TOKEN) sessionStorage.setItem('vigil-token', VIGIL_TOKEN);
+
   loadSessions();
   connectSSE();
-  // Refresh sessions list every 30s as a fallback
   setInterval(loadSessions, 30000);
+  setInterval(tickRelativeTimes, 30000);
 });
 
 // ── Sessions API ───────────────────────────────────────────────────────────
 async function loadSessions() {
   try {
-    const res = await fetch('/api/sessions');
+    const res = await fetch('/api/sessions', { headers: authHeaders() });
+    if (!res.ok) return;
     const sessions = await res.json();
     sessions.forEach(s => { state.sessions[s.id] = s; });
     renderSidebar();
@@ -34,15 +48,28 @@ async function loadSessions() {
 
 // ── SSE ────────────────────────────────────────────────────────────────────
 function connectSSE() {
-  const es = new EventSource('/api/events');
+  const url = VIGIL_TOKEN
+    ? `/api/events?token=${encodeURIComponent(VIGIL_TOKEN)}`
+    : '/api/events';
+  const es = new EventSource(url);
 
-  es.addEventListener('vigil', (ev) => {
-    try {
-      const envelope = JSON.parse(ev.data);
-      handleEvent(envelope);
-    } catch (e) {
-      console.warn('SSE parse error:', e);
-    }
+  // Listen for all named event types the server emits
+  const eventTypes = [
+    'LlmRequest', 'LlmResponse', 'ToolCall', 'ToolCallResult',
+    'FsWrite', 'FsRead', 'BurnRateAlert', 'LoopAlert', 'DriftAlert',
+    'ExfilAlert', 'PromptInjectionAlert', 'WriteApprovalRequired',
+    'WriteApprovalDecision', 'PiiAlert', 'ToolTimeout', 'CostAlert',
+    'SessionDurationAlert', 'SubAgentSpawned', 'ProcessSpawn', 'McpCall',
+    'vigil', // fallback for unknown types
+  ];
+  eventTypes.forEach(type => {
+    es.addEventListener(type, (ev) => {
+      try {
+        handleEvent(JSON.parse(ev.data));
+      } catch (e) {
+        console.warn('SSE parse error:', e);
+      }
+    });
   });
 
   es.onopen = () => {
@@ -63,7 +90,6 @@ function handleEvent(envelope) {
   const sid = envelope.session_id;
   if (!sid) return;
 
-  // Ensure session entry exists
   if (!state.sessions[sid]) {
     state.sessions[sid] = {
       id: sid, name: null, agent: '', status: 'live',
@@ -77,11 +103,10 @@ function handleEvent(envelope) {
   const ev = envelope.event;
   const etype = Object.keys(ev)[0];
 
-  // Update session stats from event payload
+  // Use server-authoritative values from LlmResponse; do NOT accumulate client-side
   if (etype === 'LlmResponse') {
     const d = ev.LlmResponse;
-    s.cost_usd = (s.cost_usd || 0) + (d.cost_usd || 0);
-    s.tokens = (s.tokens || 0) + (d.input_tokens || 0) + (d.output_tokens || 0);
+    // Server snapshot arrives on next loadSessions poll; update last_event only
     s.last_event = `LLM response (${d.output_tokens || 0} out)`;
     s.model = d.model;
   } else if (etype === 'LlmRequest') {
@@ -124,13 +149,12 @@ function handleEvent(envelope) {
     showApprovalBanner(d, sid);
   } else if (etype === 'WriteApprovalDecision') {
     hideApprovalBanner();
+    s.needs_attention = false;
   }
 
-  // Update table row and sidebar if visible
   updateTableRow(sid);
   renderSidebar();
 
-  // If we're viewing this session's detail, add event to timeline
   if (state.selectedId === sid) {
     appendTimelineItem(envelope);
   }
@@ -145,6 +169,14 @@ function shortPath(p) {
   if (!p) return '';
   const parts = p.replace(/\\/g, '/').split('/');
   return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : p;
+}
+
+// ── Relative time ticker ───────────────────────────────────────────────────
+function tickRelativeTimes() {
+  if (!state.selectedId) {
+    renderSessionsTable();
+    renderSidebar();
+  }
 }
 
 // ── Sidebar ────────────────────────────────────────────────────────────────
@@ -222,7 +254,6 @@ function updateTableRow(sid) {
   if (!s) return;
   const row = document.getElementById('row-' + sid);
   if (!row) {
-    // New session — re-render whole table (or insert at top)
     if (!state.selectedId) renderSessionsTable();
     return;
   }
@@ -257,7 +288,6 @@ function selectSession(id) {
     `${s.name || id.slice(0, 8)} · ${s.agent} · $${(s.cost_usd || 0).toFixed(4)}`;
 
   renderDetailInfo(s);
-  // Timeline is populated by SSE events going forward; load historical ones
   loadSessionDetail(id);
 }
 
@@ -274,7 +304,7 @@ async function loadSessionDetail(id) {
   timeline.innerHTML = '<div class="empty-state"><div>Loading events...</div></div>';
 
   try {
-    const res = await fetch(`/api/sessions/${id}`);
+    const res = await fetch(`/api/sessions/${id}`, { headers: authHeaders() });
     if (!res.ok) {
       timeline.innerHTML = '<div class="empty-state"><div>No detailed events available</div></div>';
       return;
@@ -370,6 +400,21 @@ function appendTimelineItem(envelope) {
       meta = `Risk: ${data.risk_level || 'unknown'}`;
       itemClass = 'warn-item';
       break;
+    case 'WriteApprovalDecision':
+      title = `Write ${data.approved ? 'approved' : 'rejected'}`;
+      itemClass = data.approved ? '' : 'alert-item';
+      break;
+    case 'ToolTimeout':
+      title = `TOUT alert — ${data.tool_name} silent for ${data.elapsed_secs}s`;
+      itemClass = 'warn-item';
+      break;
+    case 'CostAlert':
+      title = `COST alert — $${(data.session_cost_usd || 0).toFixed(4)} spent`;
+      itemClass = 'warn-item';
+      break;
+    case 'SubAgentSpawned':
+      title = `Sub-agent spawned (depth ${data.depth}) via ${data.tool_name}`;
+      break;
     default:
       title = etype.replace(/([A-Z])/g, ' $1').trim();
   }
@@ -384,7 +429,6 @@ function appendTimelineItem(envelope) {
     </div>
   `;
   timeline.appendChild(item);
-  // Auto-scroll to bottom only if near bottom
   if (timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 100) {
     timeline.scrollTop = timeline.scrollHeight;
   }
@@ -408,11 +452,11 @@ function hideApprovalBanner() {
 
 async function submitApproval(approved) {
   if (!state.pendingApproval) return;
-  const { id, session_id } = state.pendingApproval;
+  const { id } = state.pendingApproval;
   try {
     await fetch(`/api/approvals/${id}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ approved }),
     });
   } catch (e) {

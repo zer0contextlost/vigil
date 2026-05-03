@@ -27,6 +27,8 @@ pub struct VigilConfig {
     pub report: Option<ReportConfig>,
     #[serde(default)]
     pub window: Option<WindowConfig>,
+    #[serde(default)]
+    pub web: WebSection,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -168,6 +170,15 @@ pub struct WindowConfig {
     pub agent_width: Option<u32>,
     /// Agent window height in pixels
     pub agent_height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WebSection {
+    /// Port to bind the browser dashboard on 127.0.0.1. Omit to disable.
+    /// Supersedes [proxy] dashboard_port when both are set.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 impl DriftSection {

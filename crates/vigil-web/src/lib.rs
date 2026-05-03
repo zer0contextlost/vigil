@@ -1,7 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{header, StatusCode},
+    extract::{Path, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response, sse::{Event as SseEvent, KeepAlive, Sse}},
     routing::{get, post},
 };
@@ -21,6 +22,8 @@ struct Assets;
 pub struct DashboardState {
     event_tx: broadcast::Sender<TimestampedEvent>,
     pending_approvals: PendingApprovals,
+    token: String,
+    port: u16,
 }
 
 pub async fn run_dashboard(
@@ -28,23 +31,100 @@ pub async fn run_dashboard(
     event_tx: broadcast::Sender<TimestampedEvent>,
     pending_approvals: PendingApprovals,
 ) -> anyhow::Result<()> {
-    let state = DashboardState { event_tx, pending_approvals };
-    let app = Router::new()
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    println!("Dashboard: http://127.0.0.1:{}/?token={}", addr.port(), token);
+
+    let state = DashboardState { event_tx, pending_approvals, token, port: addr.port() };
+
+    let static_routes = Router::new()
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
-        .route("/app.js", get(serve_js))
+        .route("/app.js", get(serve_js));
+
+    let api_routes = Router::new()
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/{id}", get(api_session_detail))
         .route("/api/events", get(api_events))
         .route("/api/sessions/{id}/events", get(api_session_events))
         .route("/api/approvals", get(api_approvals_list))
         .route("/api/approvals/{id}", post(api_approval_submit))
-        .with_state(state);
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    let app = Router::new()
+        .merge(static_routes)
+        .merge(api_routes)
+        .with_state(state)
+        .layer(middleware::from_fn(security_headers_middleware));
 
     tracing::info!(%addr, "vigil dashboard listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn security_headers_middleware(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    h.insert("X-Content-Type-Options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "Content-Security-Policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'",
+        ),
+    );
+    resp
+}
+
+async fn require_auth(
+    State(state): State<DashboardState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // DNS rebinding mitigation: only allow requests to the expected host
+    let allowed_hosts = [
+        format!("127.0.0.1:{}", state.port),
+        format!("localhost:{}", state.port),
+    ];
+    if let Some(host) = req.headers().get(header::HOST) {
+        if let Ok(h) = host.to_str() {
+            if !allowed_hosts.iter().any(|a| a == h) {
+                return (StatusCode::FORBIDDEN, "forbidden host").into_response();
+            }
+        }
+    }
+
+    if !check_token(&req, &state.token) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+
+    next.run(req).await
+}
+
+fn check_token(req: &Request, expected: &str) -> bool {
+    // Authorization: Bearer <token>
+    if let Some(auth) = req.headers().get(header::AUTHORIZATION) {
+        if let Ok(val) = auth.to_str() {
+            if val.strip_prefix("Bearer ").map_or(false, |t| t == expected) {
+                return true;
+            }
+        }
+    }
+    // ?token=<token> (EventSource can't set custom headers)
+    if let Some(query) = req.uri().query() {
+        for pair in query.split('&') {
+            if let Some(t) = pair.strip_prefix("token=") {
+                if t == expected {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 async fn serve_index() -> impl IntoResponse {
@@ -196,7 +276,9 @@ async fn api_session_events(
                 Ok(event) => {
                     if event.session_id.to_string() == fid {
                         if let Ok(json) = serde_json::to_string(&event) {
-                            let sse_event = SseEvent::default().event("vigil").data(json);
+                            let sse_event = SseEvent::default()
+                                .event(event_type_name(&event))
+                                .data(json);
                             return Some((Ok(sse_event), (rx, fid)));
                         }
                     }
@@ -219,7 +301,7 @@ async fn api_events(State(state): State<DashboardState>) -> Sse<impl Stream<Item
                 Ok(event) => {
                     if let Ok(json) = serde_json::to_string(&event) {
                         let sse_event = SseEvent::default()
-                            .event("vigil")
+                            .event(event_type_name(&event))
                             .data(json);
                         return Some((Ok(sse_event), rx));
                     }
@@ -231,6 +313,32 @@ async fn api_events(State(state): State<DashboardState>) -> Sse<impl Stream<Item
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn event_type_name(event: &TimestampedEvent) -> &'static str {
+    use vigil_core::Event;
+    match &event.event {
+        Event::LlmRequest { .. } => "LlmRequest",
+        Event::LlmResponse { .. } => "LlmResponse",
+        Event::ToolCall { .. } => "ToolCall",
+        Event::ToolCallResult { .. } => "ToolCallResult",
+        Event::FsWrite { .. } => "FsWrite",
+        Event::FsRead { .. } => "FsRead",
+        Event::BurnRateAlert { .. } => "BurnRateAlert",
+        Event::LoopAlert { .. } => "LoopAlert",
+        Event::DriftAlert { .. } => "DriftAlert",
+        Event::ExfilAlert { .. } => "ExfilAlert",
+        Event::PromptInjectionAlert { .. } => "PromptInjectionAlert",
+        Event::WriteApprovalRequired { .. } => "WriteApprovalRequired",
+        Event::WriteApprovalDecision { .. } => "WriteApprovalDecision",
+        Event::PiiAlert { .. } => "PiiAlert",
+        Event::ToolTimeout { .. } => "ToolTimeout",
+        Event::CostAlert { .. } => "CostAlert",
+        Event::SessionDurationAlert { .. } => "SessionDurationAlert",
+        Event::SubAgentSpawned { .. } => "SubAgentSpawned",
+        Event::ProcessSpawn { .. } => "ProcessSpawn",
+        Event::McpCall { .. } => "McpCall",
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -259,17 +367,31 @@ struct ApprovalBody {
 async fn api_approval_submit(
     Path(id): Path<String>,
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Json(body): Json<ApprovalBody>,
-) -> impl IntoResponse {
+) -> Response {
+    // Origin check: belt-and-suspenders on top of the Bearer token
+    if let Some(origin) = headers.get("Origin") {
+        let ok = [
+            format!("http://127.0.0.1:{}", state.port),
+            format!("http://localhost:{}", state.port),
+        ];
+        if let Ok(o) = origin.to_str() {
+            if !ok.iter().any(|a| a == o) {
+                return (StatusCode::FORBIDDEN, "forbidden origin").into_response();
+            }
+        }
+    }
+
     let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
-        return (StatusCode::BAD_REQUEST, "invalid uuid");
+        return (StatusCode::BAD_REQUEST, "invalid uuid").into_response();
     };
     let sender = state.pending_approvals.lock().unwrap().remove(&uuid);
     match sender {
         Some(tx) => {
             let _ = tx.send(body.approved);
-            (StatusCode::OK, if body.approved { "approved" } else { "rejected" })
+            (StatusCode::OK, if body.approved { "approved" } else { "rejected" }).into_response()
         }
-        None => (StatusCode::NOT_FOUND, "not found"),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
