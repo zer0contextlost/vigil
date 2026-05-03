@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
 use serde_json;
@@ -1067,15 +1067,16 @@ async fn run_app<B: Backend>(
         terminal.draw(|f| draw(f, app))?;
 
         tokio::select! {
-            event_result = event_rx.recv() => {
+            // Stop polling the channel once it is closed so the timer branch
+            // can fire and service keyboard input. Without this guard, recv()
+            // resolves instantly on every iteration after the channel closes,
+            // starving the keyboard poller and making 'q' unresponsive.
+            event_result = event_rx.recv(), if !app.agent_done => {
                 match event_result {
                     Some(ts_event) => {
                         app.push_event(&ts_event);
                     }
                     None => {
-                        // Channel closed: replay finished or agent exited.
-                        // In both cases mark done and let the user press 'q' —
-                        // auto-quitting would close the TUI before they can read it.
                         app.agent_done = true;
                     }
                 }
@@ -1109,32 +1110,32 @@ pub enum BrowseAction {
 
 struct BrowserState {
     sessions: Vec<vigil_core::session::SessionSummary>,
-    list_state: ListState,
+    table_state: TableState,
 }
 
 impl BrowserState {
     fn new(sessions: Vec<vigil_core::session::SessionSummary>) -> Self {
-        let mut list_state = ListState::default();
+        let mut table_state = TableState::default();
         if !sessions.is_empty() {
-            list_state.select(Some(0));
+            table_state.select(Some(0));
         }
-        Self { sessions, list_state }
+        Self { sessions, table_state }
     }
 
     fn selected(&self) -> Option<&vigil_core::session::SessionSummary> {
-        self.list_state.selected().and_then(|i| self.sessions.get(i))
+        self.table_state.selected().and_then(|i| self.sessions.get(i))
     }
 
     fn move_up(&mut self) {
         if self.sessions.is_empty() { return; }
-        let i = self.list_state.selected().unwrap_or(0);
-        self.list_state.select(Some(if i == 0 { self.sessions.len() - 1 } else { i - 1 }));
+        let i = self.table_state.selected().unwrap_or(0);
+        self.table_state.select(Some(if i == 0 { self.sessions.len() - 1 } else { i - 1 }));
     }
 
     fn move_down(&mut self) {
         if self.sessions.is_empty() { return; }
-        let i = self.list_state.selected().unwrap_or(0);
-        self.list_state.select(Some((i + 1) % self.sessions.len()));
+        let i = self.table_state.selected().unwrap_or(0);
+        self.table_state.select(Some((i + 1) % self.sessions.len()));
     }
 }
 
@@ -1199,43 +1200,53 @@ fn draw_browser(frame: &mut Frame, state: &mut BrowserState) {
         .constraints([Constraint::Min(5), Constraint::Length(12), Constraint::Length(1)])
         .split(area);
 
-    // Session list
-    let items: Vec<ListItem> = state.sessions.iter().map(|s| {
+    // Column widths: Name(20), Agent(12), Started(16), Cost(10), Tokens(10), Events(7)
+    let col_widths = [
+        Constraint::Length(20),
+        Constraint::Length(12),
+        Constraint::Length(16),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(7),
+    ];
+
+    let header_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let header = Row::new([
+        Cell::from("NAME / ID").style(header_style),
+        Cell::from("AGENT").style(header_style),
+        Cell::from("STARTED").style(header_style),
+        Cell::from("COST").style(header_style),
+        Cell::from("TOKENS").style(header_style),
+        Cell::from("EVENTS").style(header_style),
+    ]);
+
+    let rows: Vec<Row> = state.sessions.iter().map(|s| {
         let label = s.name.clone().unwrap_or_else(|| s.id.to_string()[..8].to_string());
         let tokens = s.total_input_tokens + s.total_output_tokens;
-        let _duration = s.ended_at
-            .map(|e| format_dur(e - s.started_at))
-            .unwrap_or_else(|| "running".to_string());
-        let line = format!(
-            " {:<20}  {:<10}  {}  ${:.4}  {:>5}tok  {:>4}ev",
-            truncate_str(&label, 20),
-            truncate_str(&s.agent, 10),
-            s.started_at.format("%Y-%m-%d %H:%M"),
-            s.total_cost_usd,
-            tokens,
-            s.event_count,
-        );
-        ListItem::new(Line::from(Span::raw(line)))
+        Row::new([
+            Cell::from(truncate_str(&label, 20)),
+            Cell::from(truncate_str(&s.agent, 12)),
+            Cell::from(s.started_at.format("%Y-%m-%d %H:%M").to_string()),
+            Cell::from(format!("${:.4}", s.total_cost_usd)),
+            Cell::from(format!("{}", tokens)),
+            Cell::from(format!("{}", s.event_count)),
+        ])
     }).collect();
 
-    let header = format!(
-        " {:<20}  {:<10}  {:<16}  {:>7}  {:>8}  {:>6}",
-        "NAME / ID", "AGENT", "STARTED", "COST", "TOKENS", "EVENTS"
-    );
-
-    let list = List::new(items)
+    let table = Table::new(rows, col_widths)
+        .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    format!(" vigil sessions — {} total  |  header: {} ", state.sessions.len(), header),
+                    format!(" vigil sessions ({}) ", state.sessions.len()),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )),
         )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, chunks[0], &mut state.list_state);
+    frame.render_stateful_widget(table, chunks[0], &mut state.table_state);
 
     // Detail panel
     let detail_text = if let Some(s) = state.selected() {
