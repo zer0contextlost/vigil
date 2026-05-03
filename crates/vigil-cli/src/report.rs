@@ -90,17 +90,19 @@ pub async fn run(session: Session, args: ReportArgs) -> Result<()> {
     let report_config = config.report.unwrap_or_default();
     let report = build_report(&session, &report_config)?;
 
+    if args.include_payloads {
+        eprintln!("[warn] --include-payloads is not yet implemented and has no effect");
+    }
+
     if args.json {
         output_json(&report)?;
     } else if args.html {
-        output_html(&report, false, args.include_payloads)?;
+        output_html(&report, false)?;
     } else if args.html_fragment {
-        output_html(&report, true, args.include_payloads)?;
+        output_html(&report, true)?;
     } else {
         output_text(&report)?;
     }
-
-    let _ = args.include_payloads; // Note: raw_request/raw_response not yet exposed in report
 
     Ok(())
 }
@@ -169,6 +171,13 @@ fn extract_headline(session: &Session) -> ReportHeadline {
             }
             _ => {}
         }
+    }
+
+    // Old sessions pre-date turn_number: fall back to counting LlmRequest events
+    if total_turns == 0 {
+        total_turns = session.events.iter()
+            .filter(|e| matches!(e.event, Event::LlmRequest { .. }))
+            .count() as u32;
     }
 
     // Session start time is from session metadata
@@ -776,7 +785,8 @@ fn generate_timeline(events: &[vigil_core::envelope::TimestampedEvent]) -> Strin
 }
 
 fn output_text(report: &Report) -> Result<()> {
-    let supports_color = std::env::var("NO_COLOR").is_err();
+    use std::io::IsTerminal;
+    let supports_color = std::io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err();
     let width = 80;
 
     println!();
@@ -787,7 +797,9 @@ fn output_text(report: &Report) -> Result<()> {
     if let Some(ref name) = report.headline.session_name {
         println!("Session Name:      {}", name);
     }
-    println!("Model:             {} ({})", report.headline.model, report.headline.provider);
+    if !report.headline.model.is_empty() || !report.headline.provider.is_empty() {
+        println!("Model:             {} ({})", report.headline.model, report.headline.provider);
+    }
     if let Some(ref branch) = report.headline.git_branch {
         println!("Git Branch:        {}", branch);
     }
@@ -933,7 +945,7 @@ fn output_json(report: &Report) -> Result<()> {
     Ok(())
 }
 
-fn output_html(report: &Report, fragment_only: bool, _include_payloads: bool) -> Result<()> {
+fn output_html(report: &Report, fragment_only: bool) -> Result<()> {
     let content_hash = {
         use sha2::{Digest, Sha256};
         let json_str = serde_json::to_string(&json!({
@@ -1058,22 +1070,7 @@ fn output_html(report: &Report, fragment_only: bool, _include_payloads: bool) ->
     );
 
     if fragment_only {
-        println!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-{}
-</style>
-</head>
-<body>
-{}
-</body>
-</html>"#,
-            html_styles(),
-            html_content
-        );
+        println!("{}", html_content);
     } else {
         println!(
             r#"<!DOCTYPE html>
@@ -1267,7 +1264,7 @@ mod tests {
         let timestamped_events: Vec<TimestampedEvent> = events
             .into_iter()
             .enumerate()
-            .map(|(i, event)| TimestampedEvent::new(event))
+            .map(|(_i, event)| TimestampedEvent::new(event))
             .collect();
 
         Session {

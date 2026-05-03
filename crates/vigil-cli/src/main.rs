@@ -13,6 +13,7 @@ mod report;
 
 #[derive(Parser)]
 #[command(name = "vigil")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Runtime observability and policy enforcement for AI coding agents", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -64,7 +65,7 @@ enum PluginCommands {
 enum Commands {
     /// Run an AI agent under observation
     Run {
-        /// Port for HTTPS proxy
+        /// Port for the HTTP proxy
         #[arg(long, default_value = "8877")]
         port: u16,
 
@@ -742,18 +743,15 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<36}  {:<12}  {:<20}  {:>8}  {:>6}  {:>5}",
-                "ID", "AGENT", "STARTED", "COST", "TOKENS", "VIOLS"
+                "{:<36}  {:<20}  {:<12}  {:<20}  {:>8}  {:>6}  {:>5}",
+                "ID", "NAME", "AGENT", "STARTED", "COST", "TOKENS", "VIOLS"
             );
-            println!("{}", "-".repeat(95));
+            println!("{}", "-".repeat(115));
             for s in &summaries {
-                let _duration = s
-                    .ended_at
-                    .map(|e| format_duration(e - s.started_at))
-                    .unwrap_or_else(|| "running".to_string());
                 println!(
-                    "{:<36}  {:<12}  {:<20}  {:>8}  {:>6}  {:>5}",
+                    "{:<36}  {:<20}  {:<12}  {:<20}  {:>8}  {:>6}  {:>5}",
                     s.id,
+                    truncate(s.name.as_deref().unwrap_or("—"), 20),
                     truncate(&s.agent, 12),
                     s.started_at.format("%Y-%m-%d %H:%M:%S"),
                     format!("${:.4}", s.total_cost_usd),
@@ -872,7 +870,9 @@ async fn main() -> Result<()> {
             let uuid = uuid::Uuid::parse_str(&session_id)
                 .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
             let envelopes = SessionStore::load_envelopes(&uuid)?;
-            let meta = SessionStore::load_meta(&uuid)?;
+            let meta = SessionStore::load_meta(&uuid).with_context(|| {
+                format!("Session meta not found for {}. The session may be incomplete (agent exited unexpectedly). Try 'vigil audit {}' to inspect the event log.", uuid, uuid)
+            })?;
 
             let session = Session {
                 id: meta.session_id,
@@ -2882,11 +2882,10 @@ policies:
 
 async fn vigil_init(output: PathBuf, force: bool) -> Result<()> {
     if output.exists() && !force {
-        println!(
+        anyhow::bail!(
             "'{}' already exists. Use --force to overwrite.",
             output.display()
         );
-        return Ok(());
     }
 
     let project_type = detect_project_type();
@@ -2902,9 +2901,9 @@ async fn vigil_init(output: PathBuf, force: bool) -> Result<()> {
     println!();
     println!("Active policies:");
     for line in policy_yaml.lines() {
-        if line.trim().starts_with("name:") {
-            let name = line
-                .trim()
+        let trimmed = line.trim().trim_start_matches('-').trim();
+        if trimmed.starts_with("name:") {
+            let name = trimmed
                 .trim_start_matches("name:")
                 .trim()
                 .trim_matches('"');

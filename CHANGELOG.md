@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.5] - 2026-05-03
+
+### Fixed
+- `--html-fragment` flag now outputs a bare HTML fragment instead of a full `<!DOCTYPE html>` page (the two branches were inverted)
+- `vigil report` no longer emits ANSI color codes when stdout is piped or redirected; color is suppressed unless stdout is a TTY or `NO_COLOR` is unset
+- `vigil report` on a session with a missing `.meta.json` now prints an actionable error message pointing to `vigil audit` instead of an opaque OS error
+- `vigil report` turn counter now falls back to counting `LlmRequest` events for sessions recorded before `turn_number` was introduced (older sessions showed `Turns: 0`)
+- `vigil report` no longer prints `Model: ()` when no model was recorded for the session
+- `vigil init` "Active policies:" list now correctly parses YAML list entries (`  - name: foo`) and prints policy names
+- `vigil init` returns exit code 1 when the output file already exists and `--force` is not passed (previously returned 0, breaking scripts)
+- `--include-payloads` flag now emits a `[warn]` on stderr instead of silently doing nothing
+- `vigil sessions` table now includes a NAME column showing the session tag (from `vigil tag`)
+- `vigil --version` / `vigil -V` now works (previously returned an error)
+- `--port` help text corrected from "HTTPS proxy" to "HTTP proxy" (the proxy does not use TLS)
+
 ## [0.7.4] - 2026-05-03
 
 ### Added
