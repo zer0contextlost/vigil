@@ -445,6 +445,7 @@ mod tests {
             tool_name: "WebFetch".into(),
             input: json!({}),
             session_id: sid,
+            tool_use_id: None,
         });
         let text = "I never used WebFetch in this session.".to_string();
         let alert = d.check(&resp(sid, 50, Some(text))).expect("must fire on tool contradiction");
