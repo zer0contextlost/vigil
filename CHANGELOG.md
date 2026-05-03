@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.5.0] - 2026-05-03
+
+### Added
+- `vigil replay <session-id> --mock` — runs a mock proxy that serves recorded LLM responses to a live agent instead of calling the real Anthropic API; enables cost-free regression testing of CLAUDE.md and policy rules
+- `raw_response: Option<String>` on `LlmResponse` events — full upstream SSE wire bytes, gzip+base64-encoded, capped at 4 MiB; the load-bearing prerequisite for replay
+- `raw_request: Option<String>` on `LlmRequest` events — full outbound JSON body, base64-encoded; enables content-based cache key matching in replay
+- `vigil-core::replay` module — `build_request_key()` builds a structural digest of a request body stable across CLAUDE.md edits, tool result content drift, UUID/timestamp noise, and assistant text changes; 15 unit tests
+- Fake upstream HTTP server (`fake_upstream.rs`) — minimal HTTP/1.1 server backed by a per-key `VecDeque<Vec<u8>>`; positional replay within each key; `--on-miss error|stub` control
+- `run_proxy_mode` now accepts `upstream_override: Option<String>` parameter for injection of any alternate upstream
+
+---
+
 ## [0.4.0] - 2026-05-03
 
 ### Added

@@ -506,6 +506,10 @@ async fn handle_reverse_proxy(
     }
 
     tracing::info!(provider, model = %model, "LLM request forwarded upstream");
+    let raw_request = {
+        use base64::Engine as _;
+        Some(base64::engine::general_purpose::STANDARD.encode(&effective_body))
+    };
     let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
         provider: provider.to_string(),
         model: model.clone(),
@@ -513,6 +517,7 @@ async fn handle_reverse_proxy(
         session_id,
         last_user_message,
         system_prompt,
+        raw_request,
     }));
 
     let resp = req.send().await?;
@@ -1364,6 +1369,10 @@ fn emit_llm_request(
         {
             let last_user_message = extract_last_user_message(&json);
             let system_prompt = extract_system_prompt(&json);
+            let raw_request = {
+                use base64::Engine as _;
+                Some(base64::engine::general_purpose::STANDARD.encode(json.to_string()))
+            };
             let _ = event_tx.try_send(TimestampedEvent::new(Event::LlmRequest {
                 provider: provider.to_string(),
                 model,
@@ -1371,6 +1380,7 @@ fn emit_llm_request(
                 session_id,
                 last_user_message,
                 system_prompt,
+                raw_request,
             }));
         }
     }

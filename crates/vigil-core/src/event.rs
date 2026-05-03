@@ -17,6 +17,11 @@ pub enum Event {
         /// System prompt, if present in the request.
         #[serde(default)]
         system_prompt: Option<String>,
+        /// Full request body, base64-encoded JSON.
+        /// Used by `vigil replay --mock` to build a RequestKey for cache lookup.
+        /// None for non-LLM requests or when the body exceeded limits.
+        #[serde(default)]
+        raw_request: Option<String>,
     },
     LlmResponse {
         provider: String,

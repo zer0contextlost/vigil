@@ -128,6 +128,13 @@ enum Commands {
     Replay {
         /// Session ID to replay
         session_id: String,
+        /// Run as a mock proxy: serve recorded responses to a live agent instead of showing TUI.
+        /// Point Claude Code at the proxy with ANTHROPIC_BASE_URL=http://127.0.0.1:<port>
+        #[arg(long)]
+        mock: bool,
+        /// What to do on a cache miss in mock mode: error (default) or stub
+        #[arg(long, default_value = "error")]
+        on_miss: String,
     },
 
     /// Verify hash chain integrity of a recorded session
@@ -254,6 +261,8 @@ enum Commands {
 // new console's own stdin/stdout/stderr to the child automatically.
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
+mod fake_upstream;
+
 mod win_console {
     use anyhow::{anyhow, Result};
     use std::ffi::OsStr;
@@ -620,9 +629,17 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("Warning: {}", e),
                 }
             }
-            run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name).await?;
+            run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name, None).await?;
         }
-        Some(Commands::Replay { session_id }) => {
+        Some(Commands::Replay { session_id, mock, on_miss }) => {
+            if mock {
+                let on_miss_mode = match on_miss.to_ascii_lowercase().as_str() {
+                    "stub" => fake_upstream::OnMiss::Stub,
+                    _ => fake_upstream::OnMiss::Error,
+                };
+                run_replay_mock(&session_id, on_miss_mode).await?;
+                return Ok(());
+            }
             let uuid = uuid::Uuid::parse_str(&session_id)
                 .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
 
@@ -992,6 +1009,74 @@ fn redact_json_value(val: &mut serde_json::Value) {
 }
 
 // ---------------------------------------------------------------------------
+// vigil replay --mock
+// ---------------------------------------------------------------------------
+
+async fn run_replay_mock(session_id_str: &str, on_miss: fake_upstream::OnMiss) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let uuid = uuid::Uuid::parse_str(session_id_str)
+        .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid)?;
+    if envelopes.is_empty() {
+        anyhow::bail!("Session {} not found or empty", session_id_str);
+    }
+
+    let fake = fake_upstream::FakeUpstream::from_envelopes(&envelopes, on_miss);
+    let recorded = fake.recorded_responses;
+    let hits = fake.hits.clone();
+    let misses = fake.misses.clone();
+
+    let fake_port = find_available_port(9900)?;
+    let fake_url = format!("http://127.0.0.1:{}", fake_port);
+    tokio::spawn(async move {
+        if let Err(e) = fake.run(fake_port).await {
+            tracing::error!(err = %e, "fake upstream exited");
+        }
+    });
+    // Brief settle time to ensure the fake upstream is listening before the proxy dials out.
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let port = find_available_port(8877)?;
+    let session_name = format!("{}-replay", &session_id_str[..8]);
+    let watchlist = load_pii_watchlist(None);
+
+    println!("vigil replay --mock");
+    println!("Recording:  {} ({} captured responses)", session_id_str, recorded);
+    println!("On miss:    {:?}", on_miss);
+    println!("Fake upstr: http://127.0.0.1:{}", fake_port);
+    println!("Proxy:      http://127.0.0.1:{}", port);
+    println!();
+    println!("Run your agent with:");
+    println!("  ANTHROPIC_BASE_URL=http://127.0.0.1:{} claude ...", port);
+    println!();
+
+    run_proxy_mode(
+        port,
+        None,
+        None,
+        watchlist,
+        None,
+        None,
+        PluginHost::new(),
+        Some(session_name),
+        Some(fake_url),
+    ).await?;
+
+    let h = hits.load(Ordering::Relaxed);
+    let m = misses.load(Ordering::Relaxed);
+    println!();
+    println!("Replay stats: {} hits, {} misses", h, m);
+    if m > 0 {
+        println!("  {} requests did not match a recorded response.", m);
+        println!("  If this is unexpected, the session may have diverged (CLAUDE.md changed beyond path, new tools added, etc.).");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // vigil fork
 // ---------------------------------------------------------------------------
 
@@ -1196,6 +1281,7 @@ pub async fn run_proxy_mode(
     config_path: Option<String>,
     plugins: PluginHost,
     session_name: Option<String>,
+    upstream_override: Option<String>,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -1253,7 +1339,7 @@ pub async fn run_proxy_mode(
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
-        upstream_override: None,
+        upstream_override,
         pii_watchlist,
         write_approval_threshold,
         outbound_hook,

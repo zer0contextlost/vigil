@@ -316,6 +316,7 @@ mod tests {
             session_id: sid,
             last_user_message: None,
             system_prompt: None,
+            raw_request: None,
         }
     }
 
