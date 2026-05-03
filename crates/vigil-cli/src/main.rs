@@ -1084,6 +1084,31 @@ pub async fn run_proxy_mode(
                     filtered_tx.send(alert).await.ok();
                 }
             }
+
+            // Credential exfiltration detection — check child process command-line args
+            if let Event::ProcessSpawn { command, args, session_id: sid } = &event.event {
+                if !cred_tracker.is_empty() {
+                    let mut combined = command.clone();
+                    for arg in args {
+                        combined.push(' ');
+                        combined.push_str(arg);
+                    }
+                    let hits = cred_tracker.check_outbound(&combined);
+                    if !hits.is_empty() {
+                        let detail = serde_json::json!({"source": command, "matches": hits});
+                        let alert = TimestampedEvent::new(Event::ExfilAlert {
+                            matches: hits.clone(),
+                            source: command.clone(),
+                            session_id: *sid,
+                        });
+                        let ctx = make_plugin_ctx(*sid);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                        filtered_tx.send(alert).await.ok();
+                    }
+                }
+            }
+
             let decision = engine_clone.evaluate(&event.event, 0);
             match decision.action {
                 vigil_core::PolicyAction::Deny => {
@@ -1483,6 +1508,33 @@ pub async fn run_agent_with_plugins(
                             plugin_host_filter.dispatch_event(&ctx, &alert).await;
                             filtered_tx.send(alert).await.ok();
                         }
+                    }
+                }
+            }
+
+            // Credential exfiltration detection — check child process command-line args
+            if let Event::ProcessSpawn { command, args, session_id: sid } = &event.event {
+                if !cred_tracker.is_empty() {
+                    let mut combined = command.clone();
+                    for arg in args {
+                        combined.push(' ');
+                        combined.push_str(arg);
+                    }
+                    let hits = cred_tracker.check_outbound(&combined);
+                    if !hits.is_empty() {
+                        let detail = serde_json::json!({"source": command, "matches": hits});
+                        let alert = TimestampedEvent::new(Event::ExfilAlert {
+                            matches: hits.clone(),
+                            source: command.clone(),
+                            session_id: *sid,
+                        });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("EXFL", &sid.to_string(), detail.clone());
+                        }
+                        let ctx = make_plugin_ctx(*sid);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                        filtered_tx.send(alert).await.ok();
                     }
                 }
             }
