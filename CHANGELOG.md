@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.4] - 2026-05-03
+
+### Added
+- File trust tiers — `[approval]` config section with `yolo_paths`, `watch_paths`, and `lockdown_paths` glob arrays; yolo paths skip approval entirely, watch/lockdown force it regardless of `write_approval_threshold`; lockdown writes show an elevated `⚠ LOCKDOWN PATH` banner in the TUI and include the zone name in the agent's 403 rejection body so it can self-correct
+- `vigil status` — one-line-per-session status dump combining live sessions with recently completed ones; `--recent N` controls how many completed sessions to show (default 5); designed for quick terminal checks and shell scripting
+- Secrets scanner upgraded to trufflehog-quality coverage: Anthropic API key, OpenAI API key (`sk-` and `sk-proj-`), GitHub Actions/OAuth/refresh tokens, Google API key, Google OAuth token, Stripe secret/publishable/restricted keys, Slack bot/user/app tokens, npm auth token, SendGrid API key, Mailgun API key, HuggingFace token, Twilio account SID, Cloudflare API token context pattern, Databricks token, PEM private key header, and a generic API secret context pattern (matches `api_key = <value>` and variants)
+- Rejection reason in write-approval 403 response — agent receives a specific message indicating which path tier triggered the rejection and the risk level, enabling self-correction without a re-prompt from the user
+- `WriteApprovalRequired` event now carries `is_lockdown: bool` so the TUI and dashboard can distinguish lockdown-zone approvals from threshold-triggered ones
+
+### Changed
+- Named sessions (`vigil run --name`, `vigil proxy --name`) were already implemented; no change
+- `vigil ps` unchanged; `vigil status` is the new scriptable counterpart
+
+## [0.7.3] - 2026-05-03
+
+### Security
+- SSRF prevention — plain-HTTP forward path now rejects connections to unrecognized hosts (only known LLM provider hostnames are forwarded); previously any internal address was reachable via the proxy
+- UUID validation in `vigil_report` and `vigil_diff` MCP tools — `session_id`, `session_a`, `session_b` arguments are validated as proper UUIDs before the subprocess is launched, preventing argument injection via AI-controlled inputs
+- Timing-safe token comparison in dashboard auth — `check_token` now uses a constant-time XOR fold instead of `==` to prevent timing side-channel attacks from local processes
+- Host header check hardened — `require_auth` middleware now rejects requests with a missing Host header (previously only rejected when the header was present-and-wrong)
+- Hold buffer cleared on write rejection — stale SSE chunks from a rejected write approval are now discarded before returning, preventing them from leaking into the next write's stream
+
+### Fixed
+- `Proxy::new()` now returns `Result<Self>` instead of panicking if the reqwest HTTP client fails to build
+- `McpShim::run()` returns a proper error if the child process stdin/stdout cannot be opened, instead of panicking
+- `word_in_sentence` in drift detection advances by `word.len()` on a non-boundary match instead of `1`, fixing an O(n²) scan on repetitive LLM output
+- Dangling `tokio::spawn` handles in `vigil browse` replay and `vigil replay` NDJSON mode are now awaited after TUI exit so task panics surface and the runtime does not silently drop in-flight events
+- Approval resolver logs a warning when a decision arrives after the proxy's receiver has already timed out or been dropped
+- Plugin `install` path no longer panics on a path with no filename component
+- JSON parse failure for a tool_use input block now logs a `WARN` trace instead of silently substituting `{}`
+- Request body parse failure for the injection scan now logs a `WARN` trace
+- `api_approvals_list` and `api_approval_submit` return HTTP 500 instead of panicking when the `pending_approvals` mutex is poisoned
+- `api_sessions` logs a `tracing::error!` when `spawn_blocking` panics instead of silently returning `[]`
+
 ## [0.7.2] - 2026-05-03
 
 ### Added

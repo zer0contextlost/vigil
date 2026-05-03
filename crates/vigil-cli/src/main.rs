@@ -170,6 +170,13 @@ enum Commands {
     /// Show all currently active vigil sessions
     Ps,
 
+    /// One-line-per-session status dump (active + recent completed). Scriptable.
+    Status {
+        /// Include this many recently completed sessions (default: 5)
+        #[arg(long, default_value = "5")]
+        recent: usize,
+    },
+
     /// Replay a session prefix and continue with a live agent
     Fork {
         /// Session ID to fork from
@@ -690,7 +697,7 @@ async fn main() -> Result<()> {
                         let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
                         let (tx, rx) = tokio::sync::broadcast::channel(envelopes.len().max(1));
                         let envelopes_clone = envelopes.clone();
-                        tokio::spawn(async move {
+                        let replay_task = tokio::spawn(async move {
                             for (i, env) in envelopes_clone.iter().enumerate() {
                                 if i > 0 {
                                     let prev_ts = envelopes_clone[i - 1].timestamp;
@@ -709,6 +716,7 @@ async fn main() -> Result<()> {
                         let mut app = App::new(session);
                         app.is_replay = true;
                         vigil_tui::run_tui(app, rx).await?;
+                        let _ = replay_task.await;
                         // Return to the browser after replay ends.
                     }
                     Some(BrowseAction::Delete(id)) => {
@@ -771,6 +779,9 @@ async fn main() -> Result<()> {
         Some(Commands::Ps) => {
             run_ps()?;
         }
+        Some(Commands::Status { recent }) => {
+            run_status(recent)?;
+        }
         Some(Commands::Fork { session_id, prefix_events, agent_and_args }) => {
             run_fork(&session_id, prefix_events, agent_and_args).await?;
         }
@@ -808,7 +819,7 @@ async fn main() -> Result<()> {
                 println!("Replaying session {} ({} events, NDJSON)...", session_id, envelopes.len());
                 let (tx, rx) = tokio::sync::broadcast::channel(envelopes.len().max(1));
                 let envelopes_clone = envelopes.clone();
-                tokio::spawn(async move {
+                let replay_task = tokio::spawn(async move {
                     for (i, event) in envelopes_clone.iter().enumerate() {
                         if i > 0 {
                             let prev_ts = envelopes_clone[i - 1].timestamp;
@@ -831,6 +842,7 @@ async fn main() -> Result<()> {
                 let mut app = App::new(session);
                 app.is_replay = true;
                 vigil_tui::run_tui(app, rx).await?;
+                let _ = replay_task.await;
             } else {
                 let session = vigil_core::session::Session::load(&uuid)?;
                 println!("Replaying session {} ({} events, JSON)...", session_id, session.events.len());
@@ -1534,8 +1546,11 @@ pub async fn run_proxy_mode(
         write_approval_threshold,
         outbound_hook,
         pending_denials: pending_denials.clone(),
+        yolo_paths:     config.as_ref().map(|c| c.approval.yolo_paths.clone()).unwrap_or_default(),
+        watch_paths:    config.as_ref().map(|c| c.approval.watch_paths.clone()).unwrap_or_default(),
+        lockdown_paths: config.as_ref().map(|c| c.approval.lockdown_paths.clone()).unwrap_or_default(),
     };
-    let proxy = vigil_proxy::Proxy::new(proxy_config, raw_tx.clone());
+    let proxy = vigil_proxy::Proxy::new(proxy_config, raw_tx.clone())?;
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
     let pending_approvals_for_dashboard = pending_approvals_for_resolver.clone();
     let proxy_handle = tokio::spawn(async move {
@@ -1547,7 +1562,14 @@ pub async fn run_proxy_mode(
     let resolver_handle = tokio::spawn(async move {
         while let Some((approval_id, approved)) = decision_rx.recv().await {
             let tx = { pending_approvals_for_resolver.lock().unwrap().remove(&approval_id) };
-            if let Some(tx) = tx { let _ = tx.send(approved); }
+            match tx {
+                Some(tx) => {
+                    if tx.send(approved).is_err() {
+                        tracing::warn!(%approval_id, "approval receiver dropped before decision reached proxy");
+                    }
+                }
+                None => tracing::warn!(%approval_id, "approval ID not found in pending map"),
+            }
         }
     });
 
@@ -1933,8 +1955,11 @@ pub async fn run_agent_with_plugins(
         write_approval_threshold,
         outbound_hook,
         pending_denials: pending_denials.clone(),
+        yolo_paths:     config.as_ref().map(|c| c.approval.yolo_paths.clone()).unwrap_or_default(),
+        watch_paths:    config.as_ref().map(|c| c.approval.watch_paths.clone()).unwrap_or_default(),
+        lockdown_paths: config.as_ref().map(|c| c.approval.lockdown_paths.clone()).unwrap_or_default(),
     };
-    let proxy = Proxy::new(proxy_config, raw_tx.clone());
+    let proxy = Proxy::new(proxy_config, raw_tx.clone())?;
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
     let pending_approvals_for_dashboard = pending_approvals_for_resolver.clone();
     let proxy_handle = tokio::spawn(async move {
@@ -1950,8 +1975,13 @@ pub async fn run_agent_with_plugins(
                 let mut map = pending_approvals_for_resolver.lock().unwrap();
                 map.remove(&approval_id)
             };
-            if let Some(tx) = tx {
-                let _ = tx.send(approved);
+            match tx {
+                Some(tx) => {
+                    if tx.send(approved).is_err() {
+                        tracing::warn!(%approval_id, "approval receiver dropped before decision reached proxy");
+                    }
+                }
+                None => tracing::warn!(%approval_id, "approval ID not found in pending map"),
             }
         }
     });
@@ -2686,6 +2716,51 @@ fn run_ps() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_status(recent: usize) -> anyhow::Result<()> {
+    let live = vigil_core::list_active();
+    let all = Session::list_all().unwrap_or_default();
+    // Collect completed sessions — those not in the live set, most recent first
+    let live_ids: std::collections::HashSet<_> = live.iter().map(|s| s.session_id).collect();
+    let completed: Vec<_> = all.iter()
+        .filter(|s| !live_ids.contains(&s.id))
+        .take(recent)
+        .collect();
+
+    if live.is_empty() && completed.is_empty() {
+        println!("No vigil sessions found.");
+        return Ok(());
+    }
+
+    for s in &live {
+        let id_short = s.session_id.to_string();
+        let label = s.name.as_deref().unwrap_or(&id_short[..8]);
+        let alert = if s.needs_attention { "  ! ATTENTION" } else { "" };
+        println!(
+            "LIVE  {:<24}  agent={:<12}  cost=${:.4}  {:.3}$/m  {}{}",
+            truncate(label, 24),
+            truncate(&s.agent, 12),
+            s.session_cost_usd,
+            s.burn_rate_per_min,
+            s.last_event,
+            alert,
+        );
+    }
+    for s in &completed {
+        let label = s.name.as_deref()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| s.id.to_string()[..8].to_string());
+        let started = s.started_at.format("%m-%d %H:%M");
+        println!(
+            "DONE  {:<24}  agent={:<12}  cost=${:.4}  started={}",
+            truncate(&label, 24),
+            truncate(&s.agent, 12),
+            s.total_cost_usd,
+            started,
+        );
+    }
+    Ok(())
+}
+
 fn detect_project_type() -> &'static str {
     let current_dir = std::path::Path::new(".");
     if current_dir.join("Cargo.toml").exists() {
@@ -2931,9 +3006,11 @@ async fn run_plugins_command(action: PluginCommands) -> anyhow::Result<()> {
             }
             let dir = plugins_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let dest = dir.join(path.file_name().unwrap());
+            let file_name = path.file_name()
+                .ok_or_else(|| anyhow::anyhow!("plugin path has no filename: {}", path.display()))?;
+            let dest = dir.join(file_name);
             std::fs::copy(&path, &dest)?;
-            println!("Installed {} → {}", path.file_name().unwrap().to_string_lossy(), dest.display());
+            println!("Installed {} → {}", file_name.to_string_lossy(), dest.display());
             println!("It will auto-load on the next `vigil run`.");
         }
 

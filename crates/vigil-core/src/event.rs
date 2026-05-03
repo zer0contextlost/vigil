@@ -147,6 +147,9 @@ pub enum Event {
         session_id: Uuid,
         /// Proxy sets this to a unique ID so the TUI can send the decision back on the right channel.
         approval_id: Uuid,
+        /// True when the path matched a `lockdown_paths` tier — shown with elevated warning in TUI.
+        #[serde(default)]
+        is_lockdown: bool,
     },
     /// Emitted by the filter task after the user approves or rejects a pending write.
     WriteApprovalDecision {

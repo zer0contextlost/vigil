@@ -29,6 +29,8 @@ pub struct VigilConfig {
     pub window: Option<WindowConfig>,
     #[serde(default)]
     pub web: WebSection,
+    #[serde(default)]
+    pub approval: ApprovalSection,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -179,6 +181,26 @@ pub struct WebSection {
     /// Supersedes [proxy] dashboard_port when both are set.
     #[serde(default)]
     pub port: Option<u16>,
+}
+
+/// Per-path write-approval trust tiers.
+/// Each entry is a glob-style pattern (supports `*` wildcard and `/`-terminated prefixes).
+/// Examples:
+///   yolo_paths  = ["src/utils/", "tests/", "*.md"]
+///   watch_paths = ["src/", "*.ts"]
+///   lockdown_paths = [".env", "src/config/", "*.pem"]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalSection {
+    /// Paths that NEVER need write approval, even if write_approval_threshold is set.
+    #[serde(default)]
+    pub yolo_paths: Vec<String>,
+    /// Paths that ALWAYS need write approval, regardless of risk level.
+    #[serde(default)]
+    pub watch_paths: Vec<String>,
+    /// Paths that ALWAYS need write approval and are shown with an elevated warning.
+    #[serde(default)]
+    pub lockdown_paths: Vec<String>,
 }
 
 impl DriftSection {

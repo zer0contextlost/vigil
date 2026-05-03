@@ -280,6 +280,9 @@ impl DriftDetector {
     /// Returns true if `word` appears as a whole word (surrounded by non-alphanumeric
     /// characters or at string boundaries) in `sentence`.
     fn word_in_sentence(word: &str, sentence: &str) -> bool {
+        if word.is_empty() {
+            return false;
+        }
         let mut start = 0;
         while let Some(pos) = sentence[start..].find(word) {
             let abs = start + pos;
@@ -290,7 +293,7 @@ impl DriftDetector {
             if before_ok && after_ok {
                 return true;
             }
-            start = abs + 1;
+            start = abs + word.len(); // skip past the match to avoid O(n²) re-scanning
         }
         false
     }

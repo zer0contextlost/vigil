@@ -287,6 +287,8 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, ErrorObj> {
             let session_id = args.get("session_id")
                 .and_then(|v| v.as_str())
                 .ok_or(ErrorObj { code: -32602, message: "missing session_id".into() })?;
+            uuid::Uuid::parse_str(session_id)
+                .map_err(|_| ErrorObj { code: -32602, message: "session_id must be a valid UUID".into() })?;
             let format_arg = args.get("format").and_then(|v| v.as_str()).unwrap_or("text");
             let exe = std::env::current_exe()
                 .map_err(|e| ErrorObj { code: -32603, message: format!("cannot locate vigil binary: {}", e) })?;
@@ -308,6 +310,10 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, ErrorObj> {
                 .ok_or(ErrorObj { code: -32602, message: "missing session_a".into() })?;
             let b = args.get("session_b").and_then(|v| v.as_str())
                 .ok_or(ErrorObj { code: -32602, message: "missing session_b".into() })?;
+            uuid::Uuid::parse_str(a)
+                .map_err(|_| ErrorObj { code: -32602, message: "session_a must be a valid UUID".into() })?;
+            uuid::Uuid::parse_str(b)
+                .map_err(|_| ErrorObj { code: -32602, message: "session_b must be a valid UUID".into() })?;
             let exe = std::env::current_exe()
                 .map_err(|e| ErrorObj { code: -32603, message: format!("cannot locate vigil binary: {}", e) })?;
             let out = std::process::Command::new(&exe)
@@ -389,8 +395,10 @@ impl McpShim {
             .stderr(std::process::Stdio::inherit())
             .spawn()?;
 
-        let mut child_stdin = child.stdin.take().expect("child stdin");
-        let child_stdout = child.stdout.take().expect("child stdout");
+        let mut child_stdin = child.stdin.take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open child stdin for MCP server"))?;
+        let child_stdout = child.stdout.take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open child stdout for MCP server"))?;
 
         let mut our_stdin = tokio::io::BufReader::new(tokio::io::stdin());
         let mut child_stdout_reader = tokio::io::BufReader::new(child_stdout);

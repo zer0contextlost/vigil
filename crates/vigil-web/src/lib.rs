@@ -85,17 +85,17 @@ async fn require_auth(
     req: Request,
     next: Next,
 ) -> Response {
-    // DNS rebinding mitigation: only allow requests to the expected host
+    // DNS rebinding mitigation: reject requests with missing or invalid Host header.
     let allowed_hosts = [
         format!("127.0.0.1:{}", state.port),
         format!("localhost:{}", state.port),
     ];
-    if let Some(host) = req.headers().get(header::HOST) {
-        if let Ok(h) = host.to_str() {
-            if !allowed_hosts.iter().any(|a| a == h) {
-                return (StatusCode::FORBIDDEN, "forbidden host").into_response();
-            }
-        }
+    let host_ok = req.headers().get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| allowed_hosts.iter().any(|a| a == h))
+        .unwrap_or(false);
+    if !host_ok {
+        return (StatusCode::FORBIDDEN, "forbidden host").into_response();
     }
 
     if !check_token(&req, &state.token) {
@@ -105,12 +105,23 @@ async fn require_auth(
     next.run(req).await
 }
 
+fn constant_eq(a: &str, b: &str) -> bool {
+    // Timing-safe comparison: accumulate XOR over all bytes to prevent timing attacks.
+    // Token length (64 hex chars) is not secret, so the early-exit on length mismatch is fine.
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn check_token(req: &Request, expected: &str) -> bool {
     // Authorization: Bearer <token>
     if let Some(auth) = req.headers().get(header::AUTHORIZATION) {
         if let Ok(val) = auth.to_str() {
-            if val.strip_prefix("Bearer ").map_or(false, |t| t == expected) {
-                return true;
+            if let Some(t) = val.strip_prefix("Bearer ") {
+                if constant_eq(t, expected) {
+                    return true;
+                }
             }
         }
     }
@@ -118,7 +129,7 @@ fn check_token(req: &Request, expected: &str) -> bool {
     if let Some(query) = req.uri().query() {
         for pair in query.split('&') {
             if let Some(t) = pair.strip_prefix("token=") {
-                if t == expected {
+                if constant_eq(t, expected) {
                     return true;
                 }
             }
@@ -165,7 +176,10 @@ struct SessionEntry {
 
 async fn api_sessions() -> impl IntoResponse {
     let json = tokio::task::spawn_blocking(build_sessions_json).await
-        .unwrap_or_else(|_| "[]".to_string());
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "spawn_blocking panicked in build_sessions_json");
+            "[]".to_string()
+        });
     ([(header::CONTENT_TYPE, "application/json")], json)
 }
 
@@ -378,17 +392,21 @@ struct PendingApprovalEntry {
     id: String,
 }
 
-async fn api_approvals_list(State(state): State<DashboardState>) -> impl IntoResponse {
-    let ids: Vec<PendingApprovalEntry> = state.pending_approvals
-        .lock()
-        .unwrap()
-        .keys()
+async fn api_approvals_list(State(state): State<DashboardState>) -> Response {
+    let map = match state.pending_approvals.lock() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(error = %e, "pending_approvals mutex poisoned");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let ids: Vec<PendingApprovalEntry> = map.keys()
         .map(|id| PendingApprovalEntry { id: id.to_string() })
         .collect();
     (
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()),
-    )
+    ).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,7 +436,13 @@ async fn api_approval_submit(
     let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
         return (StatusCode::BAD_REQUEST, "invalid uuid").into_response();
     };
-    let sender = state.pending_approvals.lock().unwrap().remove(&uuid);
+    let sender = match state.pending_approvals.lock() {
+        Ok(mut m) => m.remove(&uuid),
+        Err(e) => {
+            tracing::error!(error = %e, "pending_approvals mutex poisoned");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     match sender {
         Some(tx) => {
             let _ = tx.send(body.approved);
@@ -469,7 +493,12 @@ mod tests {
         let app = test_app(state);
 
         let resp = app
-            .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/sessions")
+                    .header("Host", "127.0.0.1:9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

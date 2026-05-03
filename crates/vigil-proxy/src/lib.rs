@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -13,6 +13,30 @@ use vigil_core::{scan_for_injection, scan_pii, scan_watchlist, Event, Timestampe
 
 const MAX_HEADER_SIZE: usize = 65536;
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Simple glob match supporting `*` (matches any chars except `/`) and prefix patterns.
+/// `src/config/` matches any path starting with that prefix.
+/// `*.env` matches any path ending with `.env`.
+/// `src/config` matches `src/config` and `src/config/anything`.
+fn path_matches_tier(path: &str, patterns: &[String]) -> bool {
+    let norm = path.replace('\\', "/");
+    patterns.iter().any(|p| {
+        let p = p.replace('\\', "/");
+        if p.starts_with('*') {
+            // suffix match: *.env
+            norm.ends_with(p.trim_start_matches('*'))
+        } else if p.ends_with('*') {
+            // prefix match: src/utils/*
+            norm.starts_with(p.trim_end_matches('*'))
+        } else if p.ends_with('/') {
+            // directory prefix: src/config/
+            norm.starts_with(p.as_str())
+        } else {
+            // exact or path-prefix: src/config → matches src/config and src/config/foo.rs
+            norm == p.as_str() || norm.starts_with(&format!("{}/", p))
+        }
+    })
+}
 
 /// Response headers that are safe to forward to the client.
 /// Any header NOT in this list is silently dropped to prevent header injection
@@ -76,6 +100,12 @@ pub struct ProxyConfig {
     /// matching tool_result blocks before forwarding to the LLM so the agent
     /// receives a structured error and can continue on safe work.
     pub pending_denials: PendingDenials,
+    /// Paths that skip approval even when write_approval_threshold is set.
+    pub yolo_paths: Vec<String>,
+    /// Paths that always require approval regardless of risk threshold.
+    pub watch_paths: Vec<String>,
+    /// Paths that always require approval and are shown with an elevated warning.
+    pub lockdown_paths: Vec<String>,
 }
 
 pub struct Proxy {
@@ -86,23 +116,19 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    pub fn new(config: ProxyConfig, event_tx: mpsc::Sender<TimestampedEvent>) -> Self {
-        Self {
+    pub fn new(config: ProxyConfig, event_tx: mpsc::Sender<TimestampedEvent>) -> Result<Self> {
+        Ok(Self {
             config,
             event_tx,
-            http_client: {
-                // Honor system proxy env vars (http_proxy, https_proxy, no_proxy) by default.
-                // vigil forwards to api.anthropic.com; a corporate proxy may be required.
-                reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(15))
-                    .timeout(std::time::Duration::from_secs(300))
-                    .redirect(reqwest::redirect::Policy::limited(5))
-                    .user_agent(concat!("vigil/", env!("CARGO_PKG_VERSION")))
-                    .build()
-                    .expect("failed to build HTTP client")
-            },
+            http_client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(300))
+                .redirect(reqwest::redirect::Policy::limited(5))
+                .user_agent(concat!("vigil/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .context("failed to build HTTP client")?,
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -315,7 +341,13 @@ async fn handle_http_request(
         .await;
     }
 
-    // Legacy: plain HTTP forward to remote host
+    // Legacy: plain HTTP forward to remote host.
+    // Only forward to recognized LLM provider hosts to prevent SSRF to internal services.
+    if detect_provider(&host).is_none() {
+        tracing::warn!(host = %host, "plain-HTTP forward rejected: unrecognized provider host");
+        client_conn.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await?;
+        return Ok(());
+    }
     if let Some(provider) = detect_provider(&host) {
         if method == "POST" {
             emit_llm_request(provider, &path, &body_bytes, session_id, &event_tx);
@@ -533,8 +565,9 @@ async fn handle_reverse_proxy(
     req = req.body(effective_body.clone());
 
     // Scan tool_result content blocks in the request body for prompt injection.
-    if let Ok(body_json) = serde_json::from_slice::<Value>(&effective_body) {
-        scan_tool_results_for_injection(&body_json, session_id, event_tx);
+    match serde_json::from_slice::<Value>(&effective_body) {
+        Ok(body_json) => scan_tool_results_for_injection(&body_json, session_id, event_tx),
+        Err(e) => tracing::warn!(error = %e, "failed to parse request body for injection scan"),
     }
 
     tracing::info!(provider, model = %model, "LLM request forwarded upstream");
@@ -597,6 +630,9 @@ async fn handle_reverse_proxy(
             &config.pii_watchlist,
             config.write_approval_threshold,
             pending_approvals,
+            &config.yolo_paths,
+            &config.watch_paths,
+            &config.lockdown_paths,
         )
         .await?;
     } else {
@@ -665,6 +701,9 @@ async fn stream_sse_response(
     pii_watchlist: &[String],
     write_approval_threshold: Option<vigil_core::RiskLevel>,
     pending_approvals: &PendingApprovals,
+    yolo_paths: &[String],
+    watch_paths: &[String],
+    lockdown_paths: &[String],
 ) -> Result<()> {
     let mut state = SseState {
         model: model.to_string(),
@@ -806,9 +845,18 @@ async fn stream_sse_response(
 
             let risk = vigil_core::score_write(&path_str, &before, &after);
 
-            let needs_approval = write_approval_threshold
-                .map(|t| risk.level >= t)
-                .unwrap_or(false);
+            // Apply path trust tiers: yolo skips approval, watch/lockdown force it.
+            let in_yolo     = path_matches_tier(&path_str, yolo_paths);
+            let in_watch    = path_matches_tier(&path_str, watch_paths);
+            let in_lockdown = path_matches_tier(&path_str, lockdown_paths);
+
+            let needs_approval = if in_yolo {
+                false
+            } else if in_lockdown || in_watch {
+                true
+            } else {
+                write_approval_threshold.map(|t| risk.level >= t).unwrap_or(false)
+            };
 
             if needs_approval {
                 let approval_id = Uuid::new_v4();
@@ -827,6 +875,7 @@ async fn stream_sse_response(
                     reasons: risk.reasons.clone(),
                     session_id,
                     approval_id,
+                    is_lockdown: in_lockdown,
                 })).await.is_err() {
                     tracing::error!(approval_id = %approval_id, "approval event channel closed — rejecting write");
                     hold_buffer.clear();
@@ -866,17 +915,24 @@ async fn stream_sse_response(
                     state.holding = false;
                     state.holding_tool_idx = None;
                 } else {
-                    // Rejected: send HTTP 403 and close.
+                    // Rejected: send HTTP 403 with context so the agent can adapt.
                     if client_alive {
-                        let body = b"Write rejected by vigil";
+                        let reason = if in_lockdown {
+                            format!("Write rejected by vigil: '{}' is in a lockdown zone — edit a safer path or ask for approval", path_str)
+                        } else if in_watch {
+                            format!("Write rejected by vigil: '{}' is in a watched zone", path_str)
+                        } else {
+                            format!("Write rejected by vigil: '{}' ({:?} risk)", path_str, risk.level)
+                        };
                         let resp_str = format!(
                             "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
-                            body.len()
+                            reason.len()
                         );
                         let _ = client_conn.write_all(resp_str.as_bytes()).await;
-                        let _ = client_conn.write_all(body).await;
+                        let _ = client_conn.write_all(reason.as_bytes()).await;
                         let _ = client_conn.flush().await;
                     }
+                    hold_buffer.clear();
                     return Ok(());
                 }
             } else {
@@ -1050,7 +1106,13 @@ fn process_sse_event(
                     .remove(&idx)
                     .unwrap_or_else(|| "unknown".to_string());
                 let input_str = state.block_input.remove(&idx).unwrap_or_default();
-                let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
+                let input: Value = match serde_json::from_str(&input_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to parse tool_use input JSON, using empty object");
+                        json!({})
+                    }
+                };
                 let tool_use_id = state.block_id.remove(&idx);
                 tracing::info!(tool = %tool_name, "tool call detected in stream");
                 emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
@@ -2346,6 +2408,9 @@ mod integration {
             write_approval_threshold: None,
             outbound_hook: None,
             pending_denials: Arc::new(Mutex::new(HashMap::new())),
+            yolo_paths: vec![],
+            watch_paths: vec![],
+            lockdown_paths: vec![],
         };
         let http_client = reqwest::Client::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

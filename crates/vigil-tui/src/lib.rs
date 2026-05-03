@@ -536,9 +536,17 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(body_line(&format!("Repeat count: {}", repeat_count)));
             out.push(body_line("Same tool+input combination repeated too many times."));
         }
-        vigil_core::Event::WriteApprovalRequired { path, risk_level, reasons, .. } => {
-            out.push(header_line(format!("WRITE APPROVAL REQUIRED  [{}]", risk_level), Color::Yellow));
+        vigil_core::Event::WriteApprovalRequired { path, risk_level, reasons, is_lockdown, .. } => {
+            let (title, color) = if *is_lockdown {
+                (format!("⚠ LOCKDOWN PATH — WRITE APPROVAL REQUIRED  [{}]", risk_level), Color::Red)
+            } else {
+                (format!("WRITE APPROVAL REQUIRED  [{}]", risk_level), Color::Yellow)
+            };
+            out.push(header_line(title, color));
             out.push(body_line(&format!("Path: {}", path)));
+            if *is_lockdown {
+                out.push(body_line("  ! This path is in a lockdown zone. Approval required regardless of risk level."));
+            }
             for r in reasons {
                 out.push(body_line(&format!("  - {}", r)));
             }
@@ -548,6 +556,7 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(header_line(format!("WRITE DECISION  [{}]", label), color));
             out.push(body_line(&format!("approval_id: {}", approval_id)));
         }
+
         vigil_core::Event::ExfilAlert { source, matches, .. } => {
             out.push(header_line(format!("EXFIL ALERT  source: {}", source), Color::Red));
             out.push(body_line("Credential fingerprint(s) from a file read detected in outbound content:"));
