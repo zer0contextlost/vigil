@@ -1,8 +1,8 @@
 # vigil
 
-Runtime observability and policy enforcement for AI coding agents.
+**v0.7.7** — Runtime observability and policy enforcement for AI coding agents.
 
-vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, Gemini CLI, and any agent that respects `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, or `GOOGLE_GEMINI_BASE_URL`.
+vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui TUI, serves a browser dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, Gemini CLI, and any agent that respects `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, or `GOOGLE_GEMINI_BASE_URL`.
 
 ## Quick start
 
@@ -47,6 +47,7 @@ vigil auto-detects Gemini requests by path pattern and routes them to `https://g
 | `vigil-core` | Event types, Envelope/hash chain, SessionStore, ed25519 signing, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner, PluginHost, drift/exfil/injection detection |
 | `vigil-proxy` | HTTP reverse proxy, SSE parser (Anthropic + OpenAI + Gemini formats), write-approval gate |
 | `vigil-tui` | ratatui dashboard, session browser, replay viewer |
+| `vigil-web` | Browser dashboard (axum + rust-embed) — sessions table, event timeline, write-approval UI, SSE live updates, JSON/HTML export |
 | `vigil-watch` | Process tree monitor (sysinfo) — tracks child processes spawned by the agent |
 | `vigil-mcp` | MCP server mode (`vigil mcp`) and `vigil-mcp-shim` proxy binary for stdio JSON-RPC MCP servers |
 | `vigil-plugin` | Plugin SDK — `VigilPlugin` trait, `declare_plugin!` macro, ABI versioning |
@@ -62,7 +63,8 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 | `vigil run [--port N] [--config F] [--name LABEL] [--plugin P] -- <agent>` | Run an agent under observation |
 | `vigil proxy [--port N] [--config F] [--name LABEL] [--plugin P]` | Start proxy and TUI without spawning an agent |
 | `vigil ps` | Show all currently active vigil sessions on this machine |
-| `vigil sessions` | Print a text table of all recorded sessions |
+| `vigil status [--recent N]` | One-line-per-session status dump (live + last N completed); scriptable |
+| `vigil sessions` | Print a text table of all recorded sessions (ID, name, agent, cost, tokens, violations) |
 | `vigil browse` | Interactive TUI session browser (arrow keys / j·k, Enter to replay, d to delete) |
 | `vigil replay <session-id>` | Replay a session in the TUI |
 | `vigil replay <session-id> --mock [--on-miss error\|stub]` | Replay against a fake upstream — no real API calls, cost-free regression testing |
@@ -79,9 +81,10 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 
 | Command | Description |
 |---------|-------------|
-| `vigil report <session-id> [--json] [--html] [--html-fragment]` | Generate session audit report with hygiene scorecard |
-| `vigil verify <session-id>` | Verify hash chain and ed25519 signature; exits 0 (PASS) or 1 (FAIL) |
-| `vigil audit <session-id>` | Legacy audit: hash chain, ULID order, meta count |
+| `vigil report <id> [--json] [--html] [--html-fragment]` | Generate session audit report with hygiene scorecard. `<id>` accepts full UUID, prefix, or session name |
+| `vigil verify <id>` | Verify hash chain and ed25519 signature; exits 0 (PASS) or 1 (FAIL) |
+| `vigil audit <id>` | Hash chain audit: ULID order, meta count, chain integrity |
+| `vigil diff <id-a> <id-b> [--brief]` | Compare tool-call sequences of two sessions |
 
 ### Plugins
 
@@ -97,7 +100,7 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 
 | Command | Description |
 |---------|-------------|
-| `vigil init [--output FILE]` | Initialize a policy file for this project |
+| `vigil init [--output FILE] [--force]` | Initialize a policy file for this project; exits 1 if file already exists without `--force` |
 | `vigil mcp` | Start vigil as an MCP server (JSON-RPC over stdio) |
 
 ## vigil.toml reference
@@ -114,6 +117,33 @@ Pass with `vigil run --config vigil.toml -- <agent>`.
 | `write_approval_threshold` | `string` | — | Gate writes at this risk level or above: `"Low"`, `"Medium"`, or `"High"`. Omit to disable |
 | `tool_timeout_secs` | `u64` | — | Emit a TOUT alert if no LLM response follows a tool call within N seconds |
 | `tool_timeout_kill_secs` | `u64` | — | Kill the agent process after N seconds of tool silence (must be ≥ `tool_timeout_secs`) |
+
+### [web]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `port` | `u16` | — | Bind the browser dashboard on `127.0.0.1:<port>`. Omit to disable. Access via the printed URL which includes a one-time bearer token |
+
+The dashboard is always bound to `127.0.0.1` — never exposed to the network. It shows a live sessions table, per-session event timelines, write-approval banners, and supports column sorting, status filtering, and JSON/HTML session export.
+
+### [approval]
+
+File trust tiers that override `write_approval_threshold` on a per-path basis. Globs support prefix (`src/*`), suffix (`*.env`), and directory (`src/config/`) patterns.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `yolo_paths` | `[string]` | `[]` | Skip write approval for these paths entirely |
+| `watch_paths` | `[string]` | `[]` | Always require write approval for these paths, regardless of risk score |
+| `lockdown_paths` | `[string]` | `[]` | Same as `watch_paths` but shows an elevated ⚠ LOCKDOWN ZONE banner and includes the zone name in the agent's 403 rejection body so it can self-correct |
+
+Example:
+
+```toml
+[approval]
+yolo_paths   = ["tests/", "*.md", "docs/"]
+watch_paths  = ["src/"]
+lockdown_paths = [".env", "src/config/", "*.pem", "*.key"]
+```
 
 ### [session]
 
@@ -244,7 +274,7 @@ path_pattern = ".env"
 
 **Write approval** — at `write_approval_threshold`, vigil buffers SSE streams at Write/Edit/MultiEdit/NotebookEdit calls, scores the diff, and shows a full-screen before/after overlay. Press `y` to approve or `n` to reject. 5-minute timeout auto-rejects. Risk scoring: crown-jewels paths (`.env`, auth, migration, payment, private keys) → High; >40% lines deleted → High; >10 lines deleted → Medium; file >500 lines → Medium.
 
-**PII detection** — runs on every LLM request/response and tool call. Patterns cover email, US phone, SSN, credit card (Luhn-validated), AWS access key, GitHub PAT, JWT, public IPv4, URLs with PII query params. Custom watchlist terms are matched as case-insensitive substrings; matched terms are never echoed in logs.
+**PII and secrets detection** — runs on every LLM request/response and tool call. Personal data patterns: email, US phone, SSN, credit card (Luhn-validated), public IPv4, URLs with PII query params. Secret patterns (trufflehog-quality coverage): Anthropic, OpenAI (`sk-` and `sk-proj-`), GitHub PAT/Actions/OAuth/refresh tokens, AWS access key, Google API key and OAuth token, Stripe secret/publishable/restricted keys, Slack bot/user/app tokens, npm token, SendGrid, Mailgun, HuggingFace, Twilio account SID, Cloudflare API token, Databricks token, PEM private key header, JWT, and a generic `api_key = <value>` context pattern. Custom watchlist terms are matched as case-insensitive substrings; matched terms are never echoed in logs or snippets.
 
 **Prompt injection (PINJ)** — scans tool results for instruction-override phrases, hidden system tags, suspicious Unicode (bidi/zero-width), and large base64 blobs. Fires `PINJ` alert with the category and a snippet.
 
@@ -281,13 +311,15 @@ Plugins implement the `VigilPlugin` trait from `vigil-plugin` and can observe ev
 }
 ```
 
-Three tools are available to the AI assistant:
+Five tools are available to the AI assistant:
 
 | Tool | Description |
 |------|-------------|
 | `vigil_status` | Active session count and proxy status |
 | `vigil_sessions` | List recent sessions with cost, name, and timestamp. Accepts optional `limit` integer |
 | `vigil_policy_check` | Check whether a named tool call would be allowed or require confirmation. Requires `tool_name` string |
+| `vigil_report` | Generate an audit report for a session. Accepts `session_id` (UUID) and optional `format: "json"` for structured output |
+| `vigil_diff` | Diff two sessions' tool-call sequences. Accepts `session_a` and `session_b` UUIDs |
 
 The `vigil-mcp-shim` binary is also available as a transparent proxy for wrapping existing MCP servers, logging their `tools/call` events as `McpCall` events in a vigil session.
 
