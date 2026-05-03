@@ -1,116 +1,160 @@
 # vigil plugin system
 
-vigil exposes a stable Rust trait (`VigilPlugin`) that lets you observe every event, react to every alert, and block tool calls — all without forking vigil itself.
+vigil exposes a stable Rust trait (`VigilPlugin`) that lets you observe every event, react to every alert, block tool calls, and modify outbound requests — all without forking vigil itself.
 
-## How it works
+## What plugins can do
 
-`vigil-core` exports the trait, context, and decision types:
+Five hooks are available. All are async; override only the ones you need.
 
-```rust
-pub struct PluginContext {
-    pub session_id: uuid::Uuid,
-    pub config_dir: PathBuf,      // ~/.vigil/plugins/<plugin-name>/
-    pub host_version: &'static str,
-}
+| Hook | When it fires | Can block? |
+|------|--------------|------------|
+| `on_session_start(ctx)` | Once, before any events are dispatched | No |
+| `on_session_end(ctx)` | Once, on clean exit or TUI quit | No |
+| `on_event(ctx, envelope)` | Every event that passes the policy filter | No |
+| `on_alert(ctx, label, detail)` | Every time vigil fires an alert | No |
+| `on_tool_call(ctx, tool_name, input)` | Every tool call the built-in policy engine allows | Yes — return `Deny(reason)` |
+| `on_outbound_request(ctx, provider, body)` | Every LLM request before forwarding | Yes — return `Some(modified_body)` |
 
-pub enum PluginDecision {
-    Allow,
-    Deny(String),   // reason shown to the agent (HTTP 403) and logged as DENY
-}
+`on_tool_call` is evaluated after the built-in policy engine allows a call. The first plugin to return `Deny` blocks it; the agent receives HTTP 403 and a `DENY` alert fires. `on_outbound_request` lets you modify the request body; the first `Some(value)` returned wins.
 
-pub enum AlertLabel {
-    BurnRate, Loop, Exfil, Deny, Cost, Duration, Timeout, WriteApproval, Pii,
-    // label.code() returns the short string, e.g. BurnRate → "BURN"
-}
+## Alert label codes
 
-pub trait VigilPlugin: Send + Sync {
-    fn name(&self) -> &str { "unnamed" }
-    async fn on_event(&self, ctx: &PluginContext, envelope: &Envelope) {}
-    async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &serde_json::Value) {}
-    async fn on_tool_call(&self, ctx: &PluginContext, tool_name: &str, input: &serde_json::Value) -> PluginDecision {
-        PluginDecision::Allow
-    }
-}
+| Code | Variant | Trigger |
+|------|---------|---------|
+| `BURN` | `BurnRate` | Rolling $/min exceeded `max_burn_rate_usd_per_min` |
+| `DRFT` | `Drift` | Drift signal fired (acceleration, stall, or self-contradiction) |
+| `EXFL` | `Exfil` | Fingerprinted secret appeared in an outbound request or shell command |
+| `DENY` | `Deny` | Policy or plugin blocked a tool call |
+| `LOOP` | `Loop` | Same tool+input repeated N times |
+| `WAPPR` | `WriteApproval` | Write approval required; risky diff gated on human approval |
+| `TOUT` | `Timeout` | No LLM response after a tool call within the configured window |
+| `COST` | `Cost` | Soft cost alert: session spend crossed `cost_alert_usd` |
+| `DURA` | `Duration` | Session exceeded `max_session_duration_mins` |
+| `PII` | `Pii` | PII detected in traffic |
+| `PINJ` | `PromptInjection` | Prompt injection detected in a tool result |
 
-pub struct PluginHost { … }
-impl PluginHost {
-    pub fn add(&mut self, plugin: Box<dyn VigilPlugin>);
-    pub fn load_from_file(&mut self, path: &Path) -> anyhow::Result<()>;
-}
-```
+## AlertDetail variants
 
-`PluginHost` fans out to all registered plugins. `on_event` and `on_alert` are passive observers. `on_tool_call` is called after the built-in policy engine allows a tool call — the first plugin to return `Deny` blocks it, firing a DENY alert identical to a policy deny.
+The `detail: &Value` passed to `on_alert` can be deserialized into a typed struct using `label.parse_detail(detail)`. Fields for each variant:
 
-## Alert labels
+`alert::BurnRate` — `rate_per_min_usd: f64`, `projected_total_usd: f64`
 
-| Label  | Trigger |
-|--------|---------|
-| `BURN` | Rolling $/min burn-rate exceeded threshold |
-| `LOOP` | Same tool+input repeated N times |
-| `EXFL` | Credential exfiltration attempt detected |
-| `DENY` | Policy blocked a tool call |
-| `COST` | Soft cost alert threshold crossed |
-| `DURA` | Session duration limit reached |
-| `TOUT` | Tool call hung with no LLM response |
-| `WAPPR`| Write approval required |
-| `PII`  | PII detected in traffic |
+`alert::Drift` — `signal: String` (one of `OutputTokenAcceleration`, `ProgressStall`, `SelfContradiction`), `details: String`
 
-## Loading plugins
+`alert::Exfil` — `source: String`, `matches: Vec<String>` (redacted snippets)
 
-### Auto-load (recommended)
+`alert::Deny` — `tool_name: String`, `policy: Option<String>`, `reason: Option<String>`
 
-Drop your compiled shared library in `~/.vigil/plugins/`. vigil scans this directory on every `vigil run` and loads any `.dll` (Windows), `.so` (Linux), or `.dylib` (macOS) file it finds.
+`alert::Loop` — `tool_name: String`, `repeat_count: u32`
+
+`alert::WriteApproval` — `path: String`, `risk: String`
+
+`alert::Timeout` — `tool_name: String`, `elapsed_secs: u64`
+
+`alert::Cost` — `threshold_usd: f64`, `session_cost_usd: f64`
+
+`alert::Duration` — `elapsed_mins: u64`
+
+`alert::Pii` — `kind: String`, `snippet: String`
+
+`alert::PromptInjection` — `tool_name: String`, `category: String` (one of `instruction-override`, `system-tag`, `hidden-unicode`, `base64-payload`), `snippet: String`
+
+## PluginContext fields
+
+Every hook receives `ctx: &PluginContext`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | `uuid::Uuid` | Current session UUID |
+| `config_dir` | `PathBuf` | Per-plugin data directory: `~/.vigil/plugins/<plugin-name>/`. Created on first dispatch if missing |
+| `host_version` | `&'static str` | Version string of the running vigil binary |
+
+Note: `config_dir` is automatically scoped per plugin — two plugins with different names get different directories even though they share the same base context.
+
+## Scaffold and install
 
 ```bash
-vigil plugins dir    # prints the auto-load directory
-vigil plugins list   # shows what's currently in it
-vigil plugins check ./my-plugin.dll  # validate ABI/rustc without loading
+# Scaffold a new plugin crate
+vigil plugins new my-plugin --template alert
+
+# Available templates: alert, gatekeeper, logger, blank
+vigil plugins new my-plugin --template gatekeeper
+
+# Build it
+cd my-plugin
+cargo build --release
+
+# Install to the auto-load directory
+vigil plugins install ./target/release/my_plugin.dll   # Windows
+vigil plugins install ./target/release/libmy_plugin.so # Linux
+
+# Validate without installing
+vigil plugins check ./target/release/my_plugin.dll
+
+# Show the auto-load directory
+vigil plugins dir
+
+# List installed plugins
+vigil plugins list
 ```
 
-### Explicit load
+Auto-load directory: `~/.vigil/plugins/`. vigil scans it on every `vigil run` and loads any `.dll` (Windows), `.so` (Linux), or `.dylib` (macOS).
+
+One-off load without installing:
 
 ```bash
-vigil run --plugin ./my-plugin.dll -- claude
-vigil run --plugin ./a.dll --plugin ./b.dll -- claude
+vigil run --plugin ./my-plugin.dll --plugin ./other.dll -- claude
 ```
 
-### Compatibility
-
-Plugin and host must be compiled with the same Rust toolchain and `vigil-core` version. The `dyn VigilPlugin` vtable layout is not stable across compiler versions. Use `vigil-plugin` (the SDK crate) and the `declare_plugin!` macro — it embeds ABI and rustc version metadata so vigil can detect mismatches before instantiation and give you a clear error instead of undefined behavior.
-
-## Writing a dynamic plugin
-
-Add `vigil-plugin` as your only vigil dependency — it re-exports everything you need and provides the `declare_plugin!` macro that handles all C-ABI boilerplate.
+## Full example: webhook notifier for PINJ alerts
 
 **`Cargo.toml`**
 
 ```toml
+[package]
+name = "vigil-pinj-notifier"
+version = "0.1.0"
+edition = "2021"
+
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-vigil-plugin = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.1" }
+vigil-plugin = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.4.0" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde_json = "1"
 ```
 
 **`src/lib.rs`**
 
 ```rust
-use vigil_plugin::{async_trait, declare_plugin, AlertLabel, Envelope, PluginContext, PluginDecision, Value, VigilPlugin};
+use vigil_plugin::{
+    async_trait, declare_plugin, AlertLabel, PluginContext, PluginDecision, Value, VigilPlugin,
+};
 
-struct SlackNotifier {
+struct PinjNotifier {
     webhook_url: String,
 }
 
 #[async_trait]
-impl VigilPlugin for SlackNotifier {
-    fn name(&self) -> &str { "slack-notifier" }
+impl VigilPlugin for PinjNotifier {
+    fn name(&self) -> &str { "pinj-notifier" }
 
     async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {
+        // Only act on prompt injection alerts
+        if label != AlertLabel::PromptInjection {
+            return;
+        }
+
         let url = self.webhook_url.clone();
         let sid = ctx.session_id.to_string();
-        let text = format!("[vigil {}] {} — {}", label.code(), &sid[..8], detail);
+        let text = format!(
+            "[vigil PINJ] session {} — {}",
+            &sid[..8],
+            detail.get("category").and_then(|v| v.as_str()).unwrap_or("unknown")
+        );
+
         tokio::spawn(async move {
             let _ = reqwest::Client::new()
                 .post(&url)
@@ -119,131 +163,49 @@ impl VigilPlugin for SlackNotifier {
                 .await;
         });
     }
+
+    async fn on_tool_call(
+        &self,
+        _ctx: &PluginContext,
+        _tool_name: &str,
+        _input: &Value,
+    ) -> PluginDecision {
+        PluginDecision::Allow
+    }
 }
 
-declare_plugin!(SlackNotifier {
-    webhook_url: std::env::var("SLACK_WEBHOOK").unwrap_or_default(),
+declare_plugin!(PinjNotifier {
+    webhook_url: std::env::var("WEBHOOK_URL").unwrap_or_default(),
 });
 ```
 
-Build with `cargo build --release` and copy the resulting `.dll`/`.so`/`.dylib` to `~/.vigil/plugins/`.
+Build and install:
 
-`declare_plugin!` generates three C-ABI exports (exporting ABI version 3) that vigil checks before instantiation:
-
-- `vigil_plugin_create` — constructs your plugin
-- `vigil_plugin_abi_version` — returns the ABI version the plugin was built against
-- `vigil_plugin_rustc_version` — returns the rustc version string baked in at compile time
-
-If the ABI or rustc version doesn't match the running vigil binary, load is refused with a message like:
-
-```
-ABI mismatch loading my-plugin.dll: plugin ABI v1, host ABI v2.
-Rebuild your plugin against vigil-plugin v0.3.0.
+```bash
+cargo build --release
+vigil plugins install ./target/release/vigil_pinj_notifier.dll
 ```
 
-or:
+Set `WEBHOOK_URL` in your environment before running `vigil run`.
+
+## ABI versioning
+
+The current ABI version is **4**. It is embedded in every plugin compiled with `declare_plugin!` via the `vigil_plugin_abi_version` C export. vigil checks this before instantiation and refuses to load a mismatched plugin with a clear error:
 
 ```
-rustc mismatch loading my-plugin.dll: plugin built with rustc 1.83.0, host built with rustc 1.84.0.
+ABI mismatch in my-plugin.dll: plugin ABI v3, host ABI v4.
+Rebuild against vigil-plugin v0.4.0.
+```
+
+rustc version is also checked:
+
+```
+rustc mismatch in my-plugin.dll: plugin built with rustc 1.83.0, host built with rustc 1.84.0.
 Rebuild both with the same toolchain.
 ```
 
-## Writing an in-process plugin (wrapper binary)
-
-For tighter integration — custom CLI flags, combining with your own config — write a thin wrapper binary that calls vigil's `run_agent_with_plugins`:
-
-**`Cargo.toml`**
-
-```toml
-[dependencies]
-vigil-core = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.0" }
-vigil-cli  = { git = "https://github.com/zer0contextlost/vigil", tag = "v0.2.0", package = "vigil" }
-tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-```
-
-**`src/main.rs`**
-
-```rust
-use vigil_core::PluginHost;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut host = PluginHost::new();
-    host.add(Box::new(MyPlugin::new()));
-
-    vigil_cli::run_agent_with_plugins(
-        8877,                    // port
-        None,                    // policy file
-        None,                    // log file
-        vec!["claude".into()],   // agent argv
-        vec![],                  // PII watchlist terms
-        None,                    // vigil.toml config
-        None,                    // config path string
-        host,
-        None,                    // session name
-    ).await
-}
-```
+Whenever `ABI_VERSION` bumps you must rebuild all plugins against the new `vigil-plugin` SDK crate. There is no backward compatibility for ABI mismatches — vtable layout is not stable across compiler versions. In-process plugins (added via `PluginHost::add`) are unaffected.
 
 ## Threading contract
 
-All methods (`on_event`, `on_alert`, `on_tool_call`) are async. Do not block — spawn tasks or send to channels for any I/O.
-
-## Example: structured NDJSON logger
-
-```rust
-use vigil_plugin::{async_trait, declare_plugin, Envelope, PluginContext, VigilPlugin};
-use std::sync::Mutex;
-
-pub struct NdjsonLogger {
-    file: Mutex<std::fs::File>,
-}
-
-impl NdjsonLogger {
-    pub fn new(path: &str) -> Self {
-        let file = std::fs::OpenOptions::new()
-            .create(true).append(true).open(path).unwrap();
-        Self { file: Mutex::new(file) }
-    }
-}
-
-#[async_trait]
-impl VigilPlugin for NdjsonLogger {
-    fn name(&self) -> &str { "ndjson-logger" }
-
-    async fn on_event(&self, _ctx: &PluginContext, envelope: &Envelope) {
-        if let Ok(line) = serde_json::to_string(envelope) {
-            if let Ok(mut f) = self.file.lock() {
-                let _ = std::io::Write::write_fmt(&mut *f, format_args!("{}\n", line));
-            }
-        }
-    }
-}
-
-declare_plugin!(NdjsonLogger::new("/tmp/vigil-extra.ndjson"));
-```
-
-## Low-level FFI (advanced)
-
-If you can't use `vigil-plugin` (e.g. you're writing bindings for another language), you must export these three C symbols manually:
-
-```rust
-#[no_mangle]
-pub extern "C" fn vigil_plugin_create() -> *mut Box<dyn VigilPlugin> {
-    let plugin: Box<dyn VigilPlugin> = Box::new(MyPlugin::new());
-    Box::into_raw(Box::new(plugin))
-}
-
-#[no_mangle]
-pub extern "C" fn vigil_plugin_abi_version() -> u32 {
-    3  // must match vigil_core::ABI_VERSION
-}
-
-#[no_mangle]
-pub extern "C" fn vigil_plugin_rustc_version() -> *const std::os::raw::c_char {
-    b"rustc 1.XX.0 (HASH DATE)\0".as_ptr() as *const _
-}
-```
-
-If `vigil_plugin_abi_version` or `vigil_plugin_rustc_version` are absent, vigil skips those checks and attempts to load anyway (backward compatibility with plugins built before v0.2.0).
+All hook methods are async. Do not block synchronously — spawn tasks or send to channels for any I/O. The PluginHost fans out to all registered plugins sequentially; long blocking in one plugin delays all subsequent ones.
