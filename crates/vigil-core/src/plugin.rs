@@ -27,6 +27,7 @@ pub enum AlertLabel {
     Timeout,
     WriteApproval,
     Pii,
+    Drift,
 }
 
 impl AlertLabel {
@@ -42,6 +43,7 @@ impl AlertLabel {
             Self::Timeout      => "TOUT",
             Self::WriteApproval => "WAPPR",
             Self::Pii          => "PII",
+            Self::Drift        => "DRFT",
         }
     }
 
@@ -58,6 +60,7 @@ impl AlertLabel {
             "TOUT"  => Some(Self::Timeout),
             "WAPPR" => Some(Self::WriteApproval),
             "PII"   => Some(Self::Pii),
+            "DRFT"  => Some(Self::Drift),
             _       => None,
         }
     }
@@ -134,6 +137,12 @@ pub mod alert {
         pub kind: String,
         pub snippet: String,
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Drift {
+        pub signal: String,
+        pub details: String,
+    }
 }
 
 /// Typed wrapper around the alert detail payload. Prefer matching on this
@@ -149,6 +158,7 @@ pub enum AlertDetail {
     Timeout(alert::Timeout),
     WriteApproval(alert::WriteApproval),
     Pii(alert::Pii),
+    Drift(alert::Drift),
     /// Catch-all for unrecognised or future alert types.
     Unknown(Value),
 }
@@ -171,6 +181,7 @@ impl AlertDetail {
             AlertLabel::Timeout      => try_parse(v, AlertDetail::Timeout),
             AlertLabel::WriteApproval => try_parse(v, AlertDetail::WriteApproval),
             AlertLabel::Pii          => try_parse(v, AlertDetail::Pii),
+            AlertLabel::Drift        => try_parse(v, AlertDetail::Drift),
         }
         .unwrap_or_else(|| AlertDetail::Unknown(v.clone()))
     }
@@ -187,6 +198,7 @@ impl AlertDetail {
             Self::Timeout(v)       => serde_json::to_value(v).unwrap_or_default(),
             Self::WriteApproval(v) => serde_json::to_value(v).unwrap_or_default(),
             Self::Pii(v)           => serde_json::to_value(v).unwrap_or_default(),
+            Self::Drift(v)         => serde_json::to_value(v).unwrap_or_default(),
             Self::Unknown(v)       => v.clone(),
         }
     }

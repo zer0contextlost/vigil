@@ -21,6 +21,8 @@ pub struct VigilConfig {
     pub budget: BudgetSection,
     #[serde(default)]
     pub notify: NotifySection,
+    #[serde(default)]
+    pub drift: DriftSection,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -97,9 +99,40 @@ pub struct NotifySection {
     #[serde(default)]
     pub webhook: Option<String>,
     /// Subset of alert labels to forward. Empty = all alerts.
-    /// Valid labels: BURN, TOUT, EXFL, LOOP, WAPPR, COST, DURA, DENY
+    /// Valid labels: BURN, TOUT, EXFL, LOOP, WAPPR, COST, DURA, DENY, DRFT
     #[serde(default)]
     pub webhook_events: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DriftSection {
+    #[serde(default)]
+    pub baseline_turns: Option<usize>,
+    #[serde(default)]
+    pub window_turns: Option<usize>,
+    #[serde(default)]
+    pub acceleration_multiplier: Option<f64>,
+    #[serde(default)]
+    pub acceleration_min_tokens: Option<u32>,
+    #[serde(default)]
+    pub stall_threshold: Option<usize>,
+    #[serde(default)]
+    pub debounce_events: Option<u32>,
+}
+
+impl DriftSection {
+    pub fn to_drift_config(&self) -> crate::drift::DriftConfig {
+        let d = crate::drift::DriftConfig::default();
+        crate::drift::DriftConfig {
+            baseline_turns:          self.baseline_turns.unwrap_or(d.baseline_turns),
+            window_turns:            self.window_turns.unwrap_or(d.window_turns),
+            acceleration_multiplier: self.acceleration_multiplier.unwrap_or(d.acceleration_multiplier),
+            acceleration_min_tokens: self.acceleration_min_tokens.unwrap_or(d.acceleration_min_tokens),
+            stall_threshold:         self.stall_threshold.unwrap_or(d.stall_threshold),
+            debounce_events:         self.debounce_events.unwrap_or(d.debounce_events),
+        }
+    }
 }
 
 /// A policy rule as it appears in vigil.toml.

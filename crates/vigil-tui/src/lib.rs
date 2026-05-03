@@ -30,6 +30,7 @@ pub struct EventCounts {
     pub burn_alerts: usize,
     pub loop_alerts: usize,
     pub exfil_alerts: usize,
+    pub drift_alerts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +155,9 @@ impl App {
             vigil_core::Event::ToolTimeout { .. } => {}
             vigil_core::Event::CostAlert { .. } => {}
             vigil_core::Event::SessionDurationAlert { .. } => {}
+            vigil_core::Event::DriftAlert { .. } => {
+                self.counts.drift_alerts += 1;
+            }
         }
         if !self.is_replay {
             if let Some(ref mut store) = self.store {
@@ -332,6 +336,8 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("COST", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         vigil_core::Event::SessionDurationAlert { .. } =>
             ("DURA", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::DriftAlert { .. } =>
+            ("DRFT", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
@@ -345,6 +351,7 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
         | vigil_core::Event::ToolTimeout { .. }
         | vigil_core::Event::CostAlert { .. }
         | vigil_core::Event::SessionDurationAlert { .. }
+        | vigil_core::Event::DriftAlert { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -408,6 +415,8 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("cost ${:.4} crossed alert threshold ${:.4}", session_cost_usd, threshold_usd),
         vigil_core::Event::SessionDurationAlert { elapsed_mins, .. } =>
             format!("session running {}min", elapsed_mins),
+        vigil_core::Event::DriftAlert { signal, details, .. } =>
+            format!("{}: {}", signal.as_str(), truncate(details, 60)),
     }
 }
 
@@ -546,6 +555,10 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(body_line(&format!("elapsed: {}min ({:.1}h)", elapsed_mins, *elapsed_mins as f64 / 60.0)));
             out.push(body_line("Session has exceeded budget.max_session_duration_mins."));
         }
+        vigil_core::Event::DriftAlert { signal, details, .. } => {
+            out.push(header_line(format!("DRIFT ALERT  {}", signal.as_str()), Color::Red));
+            out.push(body_line(details));
+        }
     }
 
     out
@@ -573,8 +586,9 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
 
     let sid = app.session.id.to_string();
     let sid_short = sid[..8.min(sid.len())].to_string();
+    let name_display = app.session.name.clone().unwrap_or(sid_short);
 
-    out.push(stat_row("session", sid_short, Color::White));
+    out.push(stat_row("session", truncate(&name_display, 18), Color::White));
     out.push(stat_row("agent", truncate(&app.session.agent, 14), Color::White));
     out.push(Line::from(""));
 
@@ -636,6 +650,13 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
         out.push(stat_row(
             "exfil alerts",
             c.exfil_alerts.to_string(),
+            Color::Red,
+        ));
+    }
+    if c.drift_alerts > 0 {
+        out.push(stat_row(
+            "drift alerts",
+            c.drift_alerts.to_string(),
             Color::Red,
         ));
     }
@@ -702,7 +723,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let sid = app.session.id.to_string();
-    let sid_short = &sid[..8.min(sid.len())];
+    let sid_short = app.session.name.as_deref().unwrap_or(&sid[..8.min(sid.len())]);
 
     let status = if app.is_replay && app.agent_done {
         Span::styled(" REPLAY DONE ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))

@@ -135,4 +135,11 @@ pub enum Event {
         elapsed_mins: u64,
         session_id: Uuid,
     },
+    /// Emitted by the filter task when DriftDetector observes a behavioural drift signal
+    /// (output-token runaway, progress stall, or self-contradiction).
+    DriftAlert {
+        signal: crate::drift::DriftSignal,
+        details: String,
+        session_id: Uuid,
+    },
 }

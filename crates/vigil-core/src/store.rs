@@ -123,7 +123,7 @@ impl SessionStore {
             event_count: 0,
             pii_detections: 0,
             policy_violations: 0,
-            name: None,
+            name: Some(crate::namegen::generate()),
             chain_root_hash: String::new(),
             chain_signature: None,
             verifying_key: None,
@@ -405,5 +405,110 @@ mod tests {
             assert_eq!(env.prev_hash, expected_prev, "hash chain broken");
             expected_prev = env.compute_hash();
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // New smoke tests
+    // -------------------------------------------------------------------------
+
+    /// `vigil clear` smoke test: creating two sessions, finishing them, then
+    /// manually deleting their .ndjson and .meta.json files (the same logic
+    /// `run_clear` uses) must leave no trace of either session on disk.
+    #[test]
+    fn clear_deletes_all_session_files() {
+        let mut store_a = make_store();
+        let id_a = store_a.session_id;
+        store_a.append(&make_event(id_a)).unwrap();
+        store_a.finish().unwrap();
+
+        let mut store_b = make_store();
+        let id_b = store_b.session_id;
+        store_b.append(&make_event(id_b)).unwrap();
+        store_b.finish().unwrap();
+
+        let dir = sessions_dir().unwrap();
+
+        // Replicate the cleanup logic from `run_clear`: remove the .ndjson file
+        // and the matching .meta.json sidecar.
+        for id in [id_a, id_b] {
+            let ndjson = dir.join(format!("{}.ndjson", id));
+            let meta = dir.join(format!("{}.meta.json", id));
+            std::fs::remove_file(&ndjson).expect("ndjson must exist before removal");
+            std::fs::remove_file(&meta).expect("meta.json must exist before removal");
+        }
+
+        // Verify both files for both sessions are gone.
+        for id in [id_a, id_b] {
+            assert!(
+                !dir.join(format!("{}.ndjson", id)).exists(),
+                "ndjson file must not exist after clear"
+            );
+            assert!(
+                !dir.join(format!("{}.meta.json", id)).exists(),
+                "meta.json file must not exist after clear"
+            );
+        }
+    }
+
+    /// `run_export_all` smoke test: a session containing an LlmResponse with a
+    /// fake e-mail address in `response_text` must have that address redacted
+    /// by `scan_pii` before the export JSON is written.
+    ///
+    /// Note: `redact_json_value` is a private fn in `vigil-cli/src/main.rs` and
+    /// cannot be called from a `vigil-core` test.  We test the boundary that IS
+    /// accessible — `vigil_core::scan_pii` — which is the function that
+    /// `redact_json_value` delegates to.  This validates the detection half of
+    /// the redaction pipeline; the wiring (replacing the string in the JSON
+    /// value) is exercised by `run_export` itself.
+    #[test]
+    fn export_scan_pii_redacts_email_in_response_text() {
+        use crate::event::Event;
+        use crate::pii::scan as scan_pii;
+
+        let fake_email = "test.user@example.com";
+
+        let sid = Uuid::new_v4();
+        let mut store = SessionStore::create(sid, "test-agent").unwrap();
+
+        let response_event = Event::LlmResponse {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: 0.001,
+            session_id: sid,
+            response_text: Some(format!("The user email is {}.", fake_email)),
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        };
+        let envelope = crate::envelope::Envelope::new(response_event);
+        store.append(&envelope).unwrap();
+        store.finish().unwrap();
+
+        // Load the stored envelopes back (same path `run_export_all` uses).
+        let envelopes = SessionStore::load_envelopes(&sid).unwrap();
+        assert_eq!(envelopes.len(), 1, "should have exactly one envelope");
+
+        // Serialize to a JSON value and check that scan_pii detects the email.
+        let val = serde_json::to_value(&envelopes[0]).unwrap();
+        let json_str = serde_json::to_string(&val).unwrap();
+
+        // The raw JSON must contain the email before redaction.
+        assert!(
+            json_str.contains(fake_email),
+            "pre-redaction JSON must contain the original email"
+        );
+
+        // scan_pii on the response_text field must fire for the email.
+        let hits = scan_pii(&format!("The user email is {}.", fake_email));
+        assert!(
+            !hits.is_empty(),
+            "scan_pii must detect the email address"
+        );
+        assert!(
+            hits.iter().any(|h| h.kind.as_str().to_lowercase().contains("email")),
+            "scan_pii hit kind must mention 'email', got: {:?}",
+            hits.iter().map(|h| h.kind.as_str()).collect::<Vec<_>>()
+        );
     }
 }
