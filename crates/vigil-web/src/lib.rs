@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response, sse::{Event as SseEvent, KeepAlive, Sse}},
@@ -227,16 +227,28 @@ struct SessionDetail {
     total_input_tokens: u32,
     total_output_tokens: u32,
     policy_violations: u32,
-    event_count: usize,
+    event_count: usize,    // total events in session
+    events_offset: usize,  // index of first returned event
     events: Vec<serde_json::Value>,
 }
 
-async fn api_session_detail(Path(id): Path<String>) -> impl IntoResponse {
+#[derive(Debug, Deserialize, Default)]
+struct DetailQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn api_session_detail(
+    Path(id): Path<String>,
+    Query(query): Query<DetailQuery>,
+) -> impl IntoResponse {
     let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
         return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "application/json")], "\"invalid uuid\"".to_string());
     };
 
-    let result = tokio::task::spawn_blocking(move || build_session_detail_json(&uuid)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        build_session_detail_json(&uuid, query.limit, query.offset)
+    }).await;
     let (status, json) = match result {
         Ok(Some(json)) => (StatusCode::OK, json),
         Ok(None) => (StatusCode::NOT_FOUND, "\"not found\"".to_string()),
@@ -245,11 +257,23 @@ async fn api_session_detail(Path(id): Path<String>) -> impl IntoResponse {
     (status, [(header::CONTENT_TYPE, "application/json")], json)
 }
 
-fn build_session_detail_json(uuid: &uuid::Uuid) -> Option<String> {
+fn build_session_detail_json(
+    uuid: &uuid::Uuid,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Option<String> {
     let meta = vigil_core::store::SessionStore::load_meta(uuid).ok()?;
     let envelopes = vigil_core::store::SessionStore::load_envelopes(uuid).unwrap_or_default();
 
-    let events: Vec<serde_json::Value> = envelopes.iter()
+    let total = envelopes.len();
+    let limit = limit.unwrap_or(200).min(2000);
+    // Default: tail — show the last `limit` events unless caller specifies offset
+    let offset = offset.unwrap_or_else(|| total.saturating_sub(limit));
+    let offset = offset.min(total);
+
+    let events: Vec<serde_json::Value> = envelopes[offset..]
+        .iter()
+        .take(limit)
         .filter_map(|e| serde_json::to_value(e).ok())
         .collect();
 
@@ -264,7 +288,8 @@ fn build_session_detail_json(uuid: &uuid::Uuid) -> Option<String> {
         total_input_tokens: meta.total_input_tokens,
         total_output_tokens: meta.total_output_tokens,
         policy_violations: meta.policy_violations,
-        event_count: events.len(),
+        event_count: total,
+        events_offset: offset,
         events,
     };
     serde_json::to_string(&detail).ok()

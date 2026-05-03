@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.2] - 2026-05-03
+
+### Added
+- Session detail pagination — default loads last 200 events; "Load N earlier events" button fetches the full history without blocking the reactor
+- Keyboard navigation in sessions table: j/k or arrow keys to move, Enter to open, Escape to go back, / to focus search
+- Global session filter — search box above the table filters by session name, agent, or ID prefix in real time
+- MCP `vigil_report` tool — agent can call `vigil report <session_id>` on itself via Claude Desktop or Cursor; supports `format: "json"` for structured output
+- MCP `vigil_diff` tool — agent can diff two sessions to detect regression after CLAUDE.md or policy edits
+
 ## [0.7.1] - 2026-05-03
 
 ### Security

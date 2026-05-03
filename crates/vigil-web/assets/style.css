@@ -161,13 +161,60 @@ body {
   letter-spacing: -0.25px;
   margin-bottom: 16px;
   color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .view-subtitle {
   font-size: 13px;
   color: var(--text-secondary);
-  margin-left: 8px;
   font-weight: 400;
+}
+
+.search-input {
+  margin-left: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  padding: 6px 12px;
+  outline: none;
+  width: 220px;
+  transition: border-color 0.15s;
+}
+.search-input:focus {
+  border-color: var(--blue);
+}
+.search-input::placeholder {
+  color: var(--text-muted);
+}
+
+tr.keyboard-selected td {
+  background: var(--surface-hover);
+  outline: 1px solid var(--blue);
+  outline-offset: -1px;
+}
+
+.load-earlier-btn {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  text-align: center;
+  margin-bottom: 8px;
+}
+.load-earlier-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
 }
 
 .sessions-table {

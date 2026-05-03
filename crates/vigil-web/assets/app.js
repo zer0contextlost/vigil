@@ -1,21 +1,20 @@
 'use strict';
 
 // ── Auth token ─────────────────────────────────────────────────────────────
-// Printed to stdout by vigil as: Dashboard: http://127.0.0.1:PORT/?token=...
-// Stored in sessionStorage so the token survives navigations within the tab.
 let VIGIL_TOKEN = '';
-
 function authHeaders() {
   return VIGIL_TOKEN ? { 'Authorization': `Bearer ${VIGIL_TOKEN}` } : {};
 }
 
 // ── State ──────────────────────────────────────────────────────────────────
 const state = {
-  sessions: {},       // id -> session object
-  selectedId: null,   // currently viewed session id
-  pendingApproval: null, // { id, path, risk, session_id }
+  sessions: {},
+  selectedId: null,
+  pendingApproval: null,
   sseConnected: false,
 };
+let searchQuery = '';
+let keyboardRow = null;
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
@@ -27,6 +26,7 @@ window.addEventListener('DOMContentLoaded', () => {
   connectSSE();
   setInterval(loadSessions, 30000);
   setInterval(tickRelativeTimes, 30000);
+  installKeyboardNav();
 });
 
 // ── Sessions API ───────────────────────────────────────────────────────────
@@ -37,9 +37,7 @@ async function loadSessions() {
     const sessions = await res.json();
     sessions.forEach(s => { state.sessions[s.id] = s; });
     renderSidebar();
-    if (!state.selectedId) {
-      renderSessionsTable();
-    }
+    if (!state.selectedId) renderSessionsTable();
     updateSessionCount();
   } catch (e) {
     console.warn('Failed to load sessions:', e);
@@ -53,22 +51,17 @@ function connectSSE() {
     : '/api/events';
   const es = new EventSource(url);
 
-  // Listen for all named event types the server emits
   const eventTypes = [
     'LlmRequest', 'LlmResponse', 'ToolCall', 'ToolCallResult',
     'FsWrite', 'FsRead', 'BurnRateAlert', 'LoopAlert', 'DriftAlert',
     'ExfilAlert', 'PromptInjectionAlert', 'WriteApprovalRequired',
     'WriteApprovalDecision', 'PiiAlert', 'ToolTimeout', 'CostAlert',
     'SessionDurationAlert', 'SubAgentSpawned', 'ProcessSpawn', 'McpCall',
-    'vigil', // fallback for unknown types
+    'vigil',
   ];
   eventTypes.forEach(type => {
     es.addEventListener(type, (ev) => {
-      try {
-        handleEvent(JSON.parse(ev.data));
-      } catch (e) {
-        console.warn('SSE parse error:', e);
-      }
+      try { handleEvent(JSON.parse(ev.data)); } catch (e) { console.warn('SSE parse error:', e); }
     });
   });
 
@@ -77,7 +70,6 @@ function connectSSE() {
     document.getElementById('conn-status').textContent = 'live';
     document.getElementById('conn-status').style.color = 'var(--green)';
   };
-
   es.onerror = () => {
     state.sseConnected = false;
     document.getElementById('conn-status').textContent = 'reconnecting...';
@@ -103,10 +95,8 @@ function handleEvent(envelope) {
   const ev = envelope.event;
   const etype = Object.keys(ev)[0];
 
-  // Use server-authoritative values from LlmResponse; do NOT accumulate client-side
   if (etype === 'LlmResponse') {
     const d = ev.LlmResponse;
-    // Server snapshot arrives on next loadSessions poll; update last_event only
     s.last_event = `LLM response (${d.output_tokens || 0} out)`;
     s.model = d.model;
   } else if (etype === 'LlmRequest') {
@@ -119,11 +109,9 @@ function handleEvent(envelope) {
     s.last_event = `Tool: ${d.tool_name}`;
     s.agent = s.agent || d.agent || 'agent';
   } else if (etype === 'FsWrite') {
-    const d = ev.FsWrite;
-    s.last_event = `Write: ${shortPath(d.path)}`;
+    s.last_event = `Write: ${shortPath(ev.FsWrite.path)}`;
   } else if (etype === 'FsRead') {
-    const d = ev.FsRead;
-    s.last_event = `Read: ${shortPath(d.path)}`;
+    s.last_event = `Read: ${shortPath(ev.FsRead.path)}`;
   } else if (etype === 'BurnRateAlert') {
     const d = ev.BurnRateAlert;
     s.burn_rate_per_min = d.rate_per_min_usd || 0;
@@ -131,22 +119,17 @@ function handleEvent(envelope) {
     addAlert(s, 'BURN');
     s.last_event = `BURN alert: $${s.burn_rate_per_min.toFixed(3)}/min`;
   } else if (etype === 'LoopAlert') {
-    addAlert(s, 'LOOP');
-    s.needs_attention = true;
+    addAlert(s, 'LOOP'); s.needs_attention = true;
   } else if (etype === 'DriftAlert') {
-    addAlert(s, 'DRFT');
-    s.needs_attention = true;
+    addAlert(s, 'DRFT'); s.needs_attention = true;
   } else if (etype === 'ExfilAlert') {
-    addAlert(s, 'EXFL');
-    s.needs_attention = true;
+    addAlert(s, 'EXFL'); s.needs_attention = true;
   } else if (etype === 'PromptInjectionAlert') {
-    addAlert(s, 'PINJ');
-    s.needs_attention = true;
+    addAlert(s, 'PINJ'); s.needs_attention = true;
   } else if (etype === 'WriteApprovalRequired') {
-    const d = ev.WriteApprovalRequired;
     addAlert(s, 'WAPPR');
     s.needs_attention = true;
-    showApprovalBanner(d, sid);
+    showApprovalBanner(ev.WriteApprovalRequired, sid);
   } else if (etype === 'WriteApprovalDecision') {
     hideApprovalBanner();
     s.needs_attention = false;
@@ -154,10 +137,7 @@ function handleEvent(envelope) {
 
   updateTableRow(sid);
   renderSidebar();
-
-  if (state.selectedId === sid) {
-    appendTimelineItem(envelope);
-  }
+  if (state.selectedId === sid) appendTimelineItem(envelope);
 }
 
 function addAlert(session, code) {
@@ -171,6 +151,75 @@ function shortPath(p) {
   return parts.length > 2 ? '…/' + parts.slice(-2).join('/') : p;
 }
 
+// ── Search ─────────────────────────────────────────────────────────────────
+function onSearchInput(val) {
+  searchQuery = val.trim().toLowerCase();
+  keyboardRow = null;
+  if (!state.selectedId) {
+    renderSessionsTable();
+    renderSidebar();
+  }
+}
+
+function filteredSessions() {
+  const sessions = Object.values(state.sessions);
+  if (!searchQuery) return sessions;
+  return sessions.filter(s =>
+    (s.name || '').toLowerCase().includes(searchQuery) ||
+    (s.agent || '').toLowerCase().includes(searchQuery) ||
+    s.id.toLowerCase().startsWith(searchQuery)
+  );
+}
+
+function sortedSessions(sessions) {
+  return [...sessions].sort((a, b) => {
+    if (a.status === 'live' && b.status !== 'live') return -1;
+    if (b.status === 'live' && a.status !== 'live') return 1;
+    return new Date(b.started_at) - new Date(a.started_at);
+  });
+}
+
+// ── Keyboard navigation ────────────────────────────────────────────────────
+function installKeyboardNav() {
+  document.addEventListener('keydown', (e) => {
+    const tag = e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
+
+    if (!state.selectedId) {
+      const sessions = sortedSessions(filteredSessions());
+      if (e.key === 'j' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        keyboardRow = keyboardRow === null ? 0 : Math.min(keyboardRow + 1, sessions.length - 1);
+        renderSessionsTable();
+        scrollKeyboardRowIntoView();
+      } else if (e.key === 'k' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        keyboardRow = keyboardRow === null ? sessions.length - 1 : Math.max(keyboardRow - 1, 0);
+        renderSessionsTable();
+        scrollKeyboardRowIntoView();
+      } else if (e.key === 'Enter' && keyboardRow !== null && sessions[keyboardRow]) {
+        selectSession(sessions[keyboardRow].id);
+      } else if (e.key === '/') {
+        e.preventDefault();
+        const sb = document.getElementById('search-box');
+        if (sb) sb.focus();
+      }
+    } else {
+      if (e.key === 'Escape') showSessionsList();
+    }
+  });
+}
+
+function scrollKeyboardRowIntoView() {
+  if (keyboardRow === null) return;
+  const sessions = sortedSessions(filteredSessions());
+  const s = sessions[keyboardRow];
+  if (s) {
+    const row = document.getElementById('row-' + s.id);
+    if (row) row.scrollIntoView({ block: 'nearest' });
+  }
+}
+
 // ── Relative time ticker ───────────────────────────────────────────────────
 function tickRelativeTimes() {
   if (!state.selectedId) {
@@ -182,19 +231,12 @@ function tickRelativeTimes() {
 // ── Sidebar ────────────────────────────────────────────────────────────────
 function renderSidebar() {
   const list = document.getElementById('session-list');
-  const sessions = Object.values(state.sessions);
+  const sessions = sortedSessions(filteredSessions());
   if (sessions.length === 0) {
     list.innerHTML = `<div class="empty-state"><div class="empty-icon">◯</div><div>No sessions</div></div>`;
     return;
   }
-
-  const sorted = [...sessions].sort((a, b) => {
-    if (a.status === 'live' && b.status !== 'live') return -1;
-    if (b.status === 'live' && a.status !== 'live') return 1;
-    return new Date(b.started_at) - new Date(a.started_at);
-  });
-
-  list.innerHTML = sorted.map(s => `
+  list.innerHTML = sessions.map(s => `
     <div class="session-card${state.selectedId === s.id ? ' active' : ''}" onclick="selectSession('${s.id}')">
       <div class="card-name">${escHtml(s.name || s.id.slice(0, 8))}</div>
       <div class="card-meta">
@@ -208,33 +250,30 @@ function renderSidebar() {
 // ── Sessions table ─────────────────────────────────────────────────────────
 function renderSessionsTable() {
   const tbody = document.getElementById('sessions-tbody');
-  const sessions = Object.values(state.sessions);
+  const sessions = sortedSessions(filteredSessions());
   updateSessionCount();
 
   if (sessions.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">◯</div><div>No sessions yet — run <code>vigil run -- claude</code> to start</div></div></td></tr>`;
+    const msg = searchQuery
+      ? `No sessions match "${escHtml(searchQuery)}"`
+      : 'No sessions yet — run <code>vigil run -- claude</code> to start';
+    tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">◯</div><div>${msg}</div></div></td></tr>`;
     return;
   }
 
-  const sorted = [...sessions].sort((a, b) => {
-    if (a.status === 'live' && b.status !== 'live') return -1;
-    if (b.status === 'live' && a.status !== 'live') return 1;
-    return new Date(b.started_at) - new Date(a.started_at);
-  });
-
-  tbody.innerHTML = sorted.map(s => buildTableRow(s)).join('');
+  tbody.innerHTML = sessions.map((s, idx) => buildTableRow(s, idx)).join('');
 }
 
-function buildTableRow(s) {
+function buildTableRow(s, idx) {
   const live = s.status === 'live';
   const alerts = (s.alerts || []).slice(0, 3).map(a =>
     `<span class="badge badge-${a.toLowerCase()}">${a}</span>`
   ).join(' ');
-
   const costColor = s.cost_usd > 5 ? 'color:var(--red)' : s.cost_usd > 1 ? 'color:var(--amber)' : '';
   const burnColor = s.burn_rate_per_min > 0.1 ? 'color:var(--red)' : '';
+  const kbClass = keyboardRow === idx ? ' keyboard-selected' : '';
 
-  return `<tr id="row-${s.id}" onclick="selectSession('${s.id}')">
+  return `<tr id="row-${s.id}" class="${kbClass}" onclick="selectSession('${s.id}')">
     <td><span style="font-weight:600">${escHtml(s.name || s.id.slice(0, 8))}</span></td>
     <td>${escHtml(s.agent || '—')}</td>
     <td class="num" style="${costColor}">$${(s.cost_usd || 0).toFixed(3)}</td>
@@ -257,7 +296,9 @@ function updateTableRow(sid) {
     if (!state.selectedId) renderSessionsTable();
     return;
   }
-  row.outerHTML = buildTableRow(s);
+  const sessions = sortedSessions(filteredSessions());
+  const idx = sessions.findIndex(x => x.id === sid);
+  row.outerHTML = buildTableRow(s, idx);
 }
 
 function updateSessionCount() {
@@ -276,6 +317,7 @@ function updateSessionCount() {
 // ── Session detail ─────────────────────────────────────────────────────────
 function selectSession(id) {
   state.selectedId = id;
+  keyboardRow = null;
   renderSidebar();
 
   document.getElementById('sessions-view').style.display = 'none';
@@ -299,21 +341,45 @@ function showSessionsList() {
   renderSessionsTable();
 }
 
-async function loadSessionDetail(id) {
+async function loadSessionDetail(id, offset) {
   const timeline = document.getElementById('detail-timeline');
   timeline.innerHTML = '<div class="empty-state"><div>Loading events...</div></div>';
 
+  const query = offset !== undefined ? `?limit=200&offset=${offset}` : '?limit=200';
   try {
-    const res = await fetch(`/api/sessions/${id}`, { headers: authHeaders() });
+    const res = await fetch(`/api/sessions/${id}${query}`, { headers: authHeaders() });
     if (!res.ok) {
       timeline.innerHTML = '<div class="empty-state"><div>No detailed events available</div></div>';
       return;
     }
     const data = await res.json();
     timeline.innerHTML = '';
+
+    if (data.events_offset > 0) {
+      const earlier = data.events_offset;
+      const btn = document.createElement('button');
+      btn.className = 'load-earlier-btn';
+      btn.textContent = `Load ${earlier} earlier event${earlier === 1 ? '' : 's'}`;
+      btn.onclick = () => loadAllSessionDetail(id, data.event_count);
+      timeline.appendChild(btn);
+    }
+
     (data.events || []).forEach(ev => appendTimelineItem(ev));
   } catch {
     timeline.innerHTML = '<div class="empty-state"><div>Session detail not yet available</div></div>';
+  }
+}
+
+async function loadAllSessionDetail(id, total) {
+  const timeline = document.getElementById('detail-timeline');
+  timeline.innerHTML = '<div class="empty-state"><div>Loading all events...</div></div>';
+  try {
+    const res = await fetch(`/api/sessions/${id}?limit=${total}&offset=0`, { headers: authHeaders() });
+    const data = await res.json();
+    timeline.innerHTML = '';
+    (data.events || []).forEach(ev => appendTimelineItem(ev));
+  } catch {
+    timeline.innerHTML = '<div class="empty-state"><div>Failed to load all events</div></div>';
   }
 }
 
@@ -335,7 +401,6 @@ function renderDetailInfo(s) {
 function appendTimelineItem(envelope) {
   const timeline = document.getElementById('detail-timeline');
   if (!timeline) return;
-
   const emptyState = timeline.querySelector('.empty-state');
   if (emptyState) emptyState.remove();
 
@@ -359,8 +424,7 @@ function appendTimelineItem(envelope) {
       break;
     case 'ToolCall':
       title = `Tool: ${data.tool_name}`;
-      const inputStr = typeof data.input === 'string' ? data.input : JSON.stringify(data.input || {});
-      meta = truncate(inputStr, 80);
+      meta = truncate(typeof data.input === 'string' ? data.input : JSON.stringify(data.input || {}), 80);
       break;
     case 'ToolCallResult':
       title = `Tool result: ${data.tool_name}${data.blocked ? ' (BLOCKED)' : ''}`;
@@ -437,12 +501,11 @@ function appendTimelineItem(envelope) {
 // ── Write approval banner ──────────────────────────────────────────────────
 function showApprovalBanner(data, sessionId) {
   state.pendingApproval = { id: data.approval_id, path: data.path, risk: data.risk_level, session_id: sessionId };
-  const banner = document.getElementById('approval-banner');
   document.getElementById('approval-path').textContent = data.path || '';
   const riskEl = document.getElementById('approval-risk');
   riskEl.textContent = (data.risk_level || 'Unknown').toUpperCase();
   riskEl.className = `badge badge-${(data.risk_level || '').toLowerCase()}`;
-  banner.classList.add('visible');
+  document.getElementById('approval-banner').classList.add('visible');
 }
 
 function hideApprovalBanner() {

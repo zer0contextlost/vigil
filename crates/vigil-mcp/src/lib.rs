@@ -150,6 +150,36 @@ fn handle_method(method: &str, params: &Value) -> Result<Value, ErrorObj> {
                         },
                         "required": ["tool_name"]
                     }
+                },
+                {
+                    "name": "vigil_report",
+                    "description": "Generate a full audit report for a vigil session: cost, token growth, tool heatmap, policy friction, hygiene scorecard, and alert timeline. Use this to reflect on your own past session or to compare quality across sessions.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {
+                                "type": "string",
+                                "description": "Session UUID or prefix (from vigil_sessions)"
+                            },
+                            "format": {
+                                "type": "string",
+                                "description": "Output format: 'text' (default) or 'json'"
+                            }
+                        },
+                        "required": ["session_id"]
+                    }
+                },
+                {
+                    "name": "vigil_diff",
+                    "description": "LCS-based diff between two vigil sessions — shows which tool calls, writes, and requests changed between runs. Useful for spotting regressions after editing CLAUDE.md or policies.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_a": { "type": "string", "description": "First session UUID or prefix" },
+                            "session_b": { "type": "string", "description": "Second session UUID or prefix" }
+                        },
+                        "required": ["session_a", "session_b"]
+                    }
                 }
             ]
         })),
@@ -251,6 +281,41 @@ fn call_tool(name: &str, args: &Value) -> Result<Value, ErrorObj> {
             Ok(json!({
                 "content": [{ "type": "text", "text": format!("Tool '{}': {}", tool_name, verdict) }]
             }))
+        }
+
+        "vigil_report" => {
+            let session_id = args.get("session_id")
+                .and_then(|v| v.as_str())
+                .ok_or(ErrorObj { code: -32602, message: "missing session_id".into() })?;
+            let format_arg = args.get("format").and_then(|v| v.as_str()).unwrap_or("text");
+            let exe = std::env::current_exe()
+                .map_err(|e| ErrorObj { code: -32603, message: format!("cannot locate vigil binary: {}", e) })?;
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["report", session_id]);
+            if format_arg == "json" { cmd.arg("--json"); }
+            let out = cmd.output()
+                .map_err(|e| ErrorObj { code: -32603, message: format!("vigil report error: {}", e) })?;
+            let text = if out.status.success() {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            } else {
+                format!("Error: {}", String::from_utf8_lossy(&out.stderr))
+            };
+            Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+        }
+
+        "vigil_diff" => {
+            let a = args.get("session_a").and_then(|v| v.as_str())
+                .ok_or(ErrorObj { code: -32602, message: "missing session_a".into() })?;
+            let b = args.get("session_b").and_then(|v| v.as_str())
+                .ok_or(ErrorObj { code: -32602, message: "missing session_b".into() })?;
+            let exe = std::env::current_exe()
+                .map_err(|e| ErrorObj { code: -32603, message: format!("cannot locate vigil binary: {}", e) })?;
+            let out = std::process::Command::new(&exe)
+                .args(["diff", a, b])
+                .output()
+                .map_err(|e| ErrorObj { code: -32603, message: format!("vigil diff error: {}", e) })?;
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            Ok(json!({ "content": [{ "type": "text", "text": text }] }))
         }
 
         _ => Err(ErrorObj {
