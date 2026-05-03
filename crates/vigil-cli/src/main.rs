@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, AlertLabel, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision};
+use vigil_core::{session::Session, store::SessionStore, AlertLabel, BashExfilFinding, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision, scan_bash_for_exfil};
+use vigil_mcp::run_mcp_server;
 use vigil_proxy::Proxy;
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
@@ -218,6 +219,30 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Show cost breakdown by branch and day
+    CostReport {
+        /// Only show sessions newer than this many days (default: 30)
+        #[arg(long, default_value = "30")]
+        days: u64,
+        /// Filter by branch name (substring match)
+        #[arg(long)]
+        branch: Option<String>,
+    },
+
+    /// Compare tool-call sequences of two sessions
+    Diff {
+        /// First session ID (UUID prefix or full)
+        session_a: String,
+        /// Second session ID (UUID prefix or full)
+        session_b: String,
+        /// Show only lines that differ (default: show context too)
+        #[arg(long)]
+        brief: bool,
+    },
+
+    /// Start vigil as an MCP server (JSON-RPC over stdio for Claude Desktop / Cursor)
+    Mcp,
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +672,15 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Clear { yes }) => {
             run_clear(yes)?;
+        }
+        Some(Commands::CostReport { days, branch }) => {
+            run_cost_report(days, branch.as_deref())?;
+        }
+        Some(Commands::Diff { session_a, session_b, brief }) => {
+            run_diff(&session_a, &session_b, brief)?;
+        }
+        Some(Commands::Mcp) => {
+            run_mcp_server()?;
         }
     }
 
@@ -1113,6 +1147,43 @@ async fn run_agent(
     run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None).await
 }
 
+/// Read a user-scoped (non-inherited) environment variable from the Windows registry.
+/// Falls back to the process env on non-Windows or if registry read fails.
+fn get_user_env_var(name: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Read from HKCU\Environment — the user-level persistent env vars
+        // Use the winreg crate if available, otherwise shell out to reg.exe
+        let output = std::process::Command::new("reg")
+            .args(["query", r"HKCU\Environment", "/v", name])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // reg query output format: "    NAME    REG_SZ    value"
+            for line in stdout.lines() {
+                let line = line.trim();
+                if line.starts_with(name) {
+                    let parts: Vec<&str> = line.splitn(3, "    ").collect();
+                    if parts.len() >= 3 {
+                        return Some(parts[2].trim().to_string());
+                    }
+                    // Sometimes it's tab-separated
+                    let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                    if parts.len() >= 3 {
+                        return Some(parts[2].trim().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var(name).ok()
+    }
+}
+
 /// Start the proxy and TUI without spawning an agent process.
 /// Use this with IDEs (Cursor, etc.) that connect to vigil via their own
 /// "Override Base URL" setting rather than being launched by vigil.
@@ -1209,11 +1280,33 @@ pub async fn run_proxy_mode(
     println!("  Anthropic: ANTHROPIC_BASE_URL=http://127.0.0.1:{}", port);
     println!("  OpenAI:    OPENAI_BASE_URL=http://127.0.0.1:{}", port);
     println!("  Cursor:    Settings > Models > Override OpenAI Base URL = http://127.0.0.1:{}/v1", port);
+    println!("  Permanent (Claude Desktop): setx ANTHROPIC_BASE_URL http://127.0.0.1:{}", port);
     println!();
+
+    // Claude Desktop / system-level routing hint
+    let user_base_url = get_user_env_var("ANTHROPIC_BASE_URL");
+    match user_base_url.as_deref() {
+        Some(url) if url.contains(&port.to_string()) => {
+            println!("[vigil] ANTHROPIC_BASE_URL is set system-wide → Claude Desktop should route here.");
+            println!("[vigil] If Desktop is already running, restart it to pick up the change.");
+        }
+        Some(url) => {
+            println!("[vigil] ANTHROPIC_BASE_URL is set to {} (not this proxy). Override it:", url);
+            println!("[vigil]   setx ANTHROPIC_BASE_URL http://127.0.0.1:{}", port);
+        }
+        None => {
+            println!("[vigil] To route Claude Desktop here, run (then restart Desktop):");
+            println!("[vigil]   setx ANTHROPIC_BASE_URL http://127.0.0.1:{}", port);
+            println!("[vigil] To clear it later: setx ANTHROPIC_BASE_URL \"\"");
+        }
+    }
+    println!();
+
     println!("Press 'q' in the dashboard to stop.");
     println!();
 
     let loop_threshold = config.as_ref().and_then(|c| c.budget.loop_detect_threshold).unwrap_or(5);
+    let sub_agent_depth_limit_proxy = config.as_ref().and_then(|c| c.budget.max_sub_agent_depth);
     let drift_cfg_proxy = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
     let plugin_host_filter = plugin_host.clone();
     let engine_clone = engine.clone();
@@ -1221,6 +1314,7 @@ pub async fn run_proxy_mode(
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
         let mut cred_tracker = CredentialTracker::new();
+        let mut sub_agent_depth: u32 = 0;
         while let Some(event) = raw_rx.recv().await {
             if let Event::FsRead { path, .. } = &event.event {
                 if let Ok(content) = std::fs::read_to_string(path) {
@@ -1238,6 +1332,24 @@ pub async fn run_proxy_mode(
                     plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Loop, &detail).await;
                     plugin_host_filter.dispatch_event(&ctx, &alert).await;
                     filtered_tx.send(alert).await.ok();
+                }
+                if tool_name == "Task" {
+                    sub_agent_depth = sub_agent_depth.saturating_add(1);
+                    let spawn_event = TimestampedEvent::new(Event::SubAgentSpawned {
+                        session_id: *sid,
+                        depth: sub_agent_depth,
+                        tool_name: tool_name.clone(),
+                    });
+                    let ctx = make_plugin_ctx(*sid);
+                    plugin_host_filter.dispatch_event(&ctx, &spawn_event).await;
+                    filtered_tx.send(spawn_event).await.ok();
+                    if let Some(max) = sub_agent_depth_limit_proxy {
+                        if sub_agent_depth > max {
+                            tracing::warn!(depth = sub_agent_depth, max, "sub-agent depth limit exceeded");
+                            eprintln!("[SUB-AGENT] Depth {} exceeds limit {} — stopping", sub_agent_depth, max);
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1276,6 +1388,45 @@ pub async fn run_proxy_mode(
                         filtered_tx.send(alert).await.ok();
                     }
                 }
+            }
+
+            // Network exfiltration detection — scan Bash tool call commands for
+            // curl/wget/netcat/scp/base64-pipe and similar patterns that can exfiltrate
+            // data to remote hosts regardless of whether credentials were previously seen.
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let shell_tools = ["Bash", "bash", "shell", "run_command", "execute"];
+                if shell_tools.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                    let cmd = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| input.as_str().unwrap_or(""));
+                    if let Some(BashExfilFinding { label, trigger }) = scan_bash_for_exfil(cmd) {
+                        let detail = serde_json::json!({
+                            "source": "bash-command",
+                            "pattern": label,
+                            "trigger": trigger,
+                        });
+                        let alert = TimestampedEvent::new(Event::ExfilAlert {
+                            matches: vec![format!("{} ({})", label, trigger)],
+                            source: "bash-command".to_string(),
+                            session_id: *sid,
+                        });
+                        let ctx = make_plugin_ctx(*sid);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                        filtered_tx.send(alert).await.ok();
+                    }
+                }
+            }
+
+            // Prompt injection alert — dispatch to plugins and forward to TUI
+            if let Event::PromptInjectionAlert { tool_name, category, snippet, session_id: sid } = &event.event {
+                let detail = serde_json::json!({"tool_name": tool_name, "category": category, "snippet": snippet});
+                eprintln!("[PINJ] Prompt injection detected in tool result '{}' ({})", tool_name, category);
+                let ctx = make_plugin_ctx(*sid);
+                plugin_host_filter.dispatch_alert(&ctx, AlertLabel::PromptInjection, &detail).await;
+                plugin_host_filter.dispatch_event(&ctx, &event).await;
+                filtered_tx.send(event).await.ok();
+                continue;
             }
 
             let decision = engine_clone.evaluate(&event.event, 0);
@@ -1398,6 +1549,7 @@ pub async fn run_agent_with_plugins(
     let loop_threshold = config.as_ref()
         .and_then(|c| c.budget.loop_detect_threshold)
         .unwrap_or(5);
+    let sub_agent_depth_limit_agent = config.as_ref().and_then(|c| c.budget.max_sub_agent_depth);
     let drift_cfg_agent = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
     let tool_timeout_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_secs);
     let tool_timeout_kill_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_kill_secs);
@@ -1622,6 +1774,7 @@ pub async fn run_agent_with_plugins(
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_agent);
         let mut cred_tracker = CredentialTracker::new();
+        let mut sub_agent_depth: u32 = 0;
         while let Some(event) = raw_rx.recv().await {
             // Tool timeout tracking: arm on ToolCall, disarm on LlmRequest
             if let Event::ToolCall { tool_name, .. } = &event.event {
@@ -1700,6 +1853,37 @@ pub async fn run_agent_with_plugins(
                             plugin_host_filter.dispatch_event(&ctx, &alert).await;
                             filtered_tx.send(alert).await.ok();
                         }
+                    }
+                }
+            }
+
+            // Network exfiltration detection — scan Bash tool call commands for
+            // curl/wget/netcat/scp/base64-pipe and similar patterns that can exfiltrate
+            // data to remote hosts regardless of whether credentials were previously seen.
+            if let Event::ToolCall { tool_name, input, session_id: sid, .. } = &event.event {
+                let shell_tools = ["Bash", "bash", "shell", "run_command", "execute"];
+                if shell_tools.iter().any(|t| tool_name.eq_ignore_ascii_case(t)) {
+                    let cmd = input.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_else(|| input.as_str().unwrap_or(""));
+                    if let Some(BashExfilFinding { label, trigger }) = scan_bash_for_exfil(cmd) {
+                        let detail = serde_json::json!({
+                            "source": "bash-command",
+                            "pattern": label,
+                            "trigger": trigger,
+                        });
+                        let alert = TimestampedEvent::new(Event::ExfilAlert {
+                            matches: vec![format!("{} ({})", label, trigger)],
+                            source: "bash-command".to_string(),
+                            session_id: *sid,
+                        });
+                        if let Some(ref n) = notifier_filter {
+                            n.send("EXFL", &sid.to_string(), detail.clone());
+                        }
+                        let ctx = make_plugin_ctx(*sid);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Exfil, &detail).await;
+                        plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                        filtered_tx.send(alert).await.ok();
                     }
                 }
             }
@@ -1818,6 +2002,24 @@ pub async fn run_agent_with_plugins(
                         });
                     }
                 }
+                if tool_name == "Task" {
+                    sub_agent_depth = sub_agent_depth.saturating_add(1);
+                    let spawn_event = TimestampedEvent::new(Event::SubAgentSpawned {
+                        session_id: *sid,
+                        depth: sub_agent_depth,
+                        tool_name: tool_name.clone(),
+                    });
+                    let ctx = make_plugin_ctx(*sid);
+                    plugin_host_filter.dispatch_event(&ctx, &spawn_event).await;
+                    filtered_tx.send(spawn_event).await.ok();
+                    if let Some(max) = sub_agent_depth_limit_agent {
+                        if sub_agent_depth > max {
+                            tracing::warn!(depth = sub_agent_depth, max, "sub-agent depth limit exceeded");
+                            eprintln!("[SUB-AGENT] Depth {} exceeds limit {} — stopping", sub_agent_depth, max);
+                            break;
+                        }
+                    }
+                }
             }
 
             if let Some(payload) = drift_detector.check(&event.event) {
@@ -1840,6 +2042,20 @@ pub async fn run_agent_with_plugins(
                         s.last_event = "DRFT".to_string();
                     });
                 }
+            }
+
+            // Prompt injection alert — dispatch to plugins, webhook notifier, and TUI
+            if let Event::PromptInjectionAlert { tool_name, category, snippet, session_id: sid } = &event.event {
+                let detail = serde_json::json!({"tool_name": tool_name, "category": category, "snippet": snippet});
+                eprintln!("[PINJ] Prompt injection detected in tool result '{}' ({})", tool_name, category);
+                if let Some(ref n) = notifier_filter {
+                    n.send("PINJ", &sid.to_string(), detail.clone());
+                }
+                let ctx = make_plugin_ctx(*sid);
+                plugin_host_filter.dispatch_alert(&ctx, AlertLabel::PromptInjection, &detail).await;
+                plugin_host_filter.dispatch_event(&ctx, &event).await;
+                filtered_tx.send(event).await.ok();
+                continue;
             }
 
             if let Some(ref enforcer) = budget_enforcer {
@@ -2086,6 +2302,13 @@ fn detect_project_type() -> &'static str {
 fn generate_policy_yaml(project_type: &str) -> String {
     let base_policies = r#"# vigil policy — generated by `vigil init`
 # Docs: https://github.com/vigil-dev/vigil
+#
+# Network exfiltration detection is automatic for all Bash tool calls.
+# vigil scans every Bash command for high-signal patterns such as:
+#   curl --data / --upload, wget --post-data, nc -e / | nc, scp, sftp,
+#   base64 piped to a network tool, and DNS queries with pipes.
+# Matches emit an ExfilAlert event visible in the TUI without any policy
+# configuration required — no entries below are needed to enable this.
 
 policies:
   # Block shell commands that could destroy data
@@ -2852,6 +3075,339 @@ fn run_clear(skip_confirm: bool) -> anyhow::Result<()> {
     } else {
         println!("Cleared {} session(s), freed {} KB.", deleted, kb);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil cost-report
+// ---------------------------------------------------------------------------
+
+fn run_cost_report(days: u64, branch_filter: Option<&str>) -> anyhow::Result<()> {
+    use chrono::Duration;
+    use std::collections::HashMap;
+    use vigil_core::store::SessionMeta;
+
+    let summaries = vigil_core::session::Session::list_all().unwrap_or_default();
+    if summaries.is_empty() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+
+    let cutoff = chrono::Utc::now() - Duration::days(days as i64);
+
+    // Collect (started_at, cost, branch) for matching sessions.
+    // Row: (date_str, branch_str, cost)
+    let mut rows: Vec<(String, String, f64)> = Vec::new();
+
+    for s in &summaries {
+        if s.started_at < cutoff {
+            continue;
+        }
+
+        // Load meta to get branch (and to apply branch filter if set).
+        let meta_path = vigil_core::store::sessions_dir()?
+            .join(format!("{}.meta.json", s.id));
+        let meta: Option<SessionMeta> = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|txt| serde_json::from_str(&txt).ok());
+
+        let branch = meta
+            .as_ref()
+            .and_then(|m| m.git_branch.clone())
+            .unwrap_or_else(|| "(no branch)".to_string());
+
+        if let Some(filter) = branch_filter {
+            if !branch.contains(filter) {
+                continue;
+            }
+        }
+
+        let date = s.started_at.format("%Y-%m-%d").to_string();
+        let cost = meta.as_ref().map(|m| m.total_cost_usd).unwrap_or(s.total_cost_usd);
+        rows.push((date, branch, cost));
+    }
+
+    if rows.is_empty() {
+        println!("No sessions matched the filter.");
+        return Ok(());
+    }
+
+    // Group by (date, branch).
+    let mut groups: HashMap<(String, String), (u64, f64)> = HashMap::new();
+    for (date, branch, cost) in &rows {
+        let entry = groups.entry((date.clone(), branch.clone())).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += cost;
+    }
+
+    // Sort by date desc, then branch asc.
+    let mut sorted: Vec<((String, String), (u64, f64))> = groups.into_iter().collect();
+    sorted.sort_by(|a, b| b.0.0.cmp(&a.0.0).then(a.0.1.cmp(&b.0.1)));
+
+    // Compute column widths.
+    let date_w = "Date".len().max(sorted.iter().map(|r| r.0.0.len()).max().unwrap_or(0));
+    let branch_w = "Branch".len().max(sorted.iter().map(|r| r.0.1.len()).max().unwrap_or(0));
+    let sessions_w = "Sessions".len();
+    let total_w = "Total Cost".len();
+    let avg_w = "Avg Cost".len();
+
+    let sep = format!(
+        "+-{}-+-{}-+-{}-+-{}-+-{}-+",
+        "-".repeat(date_w),
+        "-".repeat(branch_w),
+        "-".repeat(sessions_w),
+        "-".repeat(total_w),
+        "-".repeat(avg_w),
+    );
+
+    println!("{}", sep);
+    println!(
+        "| {:<date_w$} | {:<branch_w$} | {:<sessions_w$} | {:<total_w$} | {:<avg_w$} |",
+        "Date", "Branch", "Sessions", "Total Cost", "Avg Cost",
+        date_w = date_w, branch_w = branch_w,
+        sessions_w = sessions_w, total_w = total_w, avg_w = avg_w,
+    );
+    println!("{}", sep);
+
+    let mut grand_total = 0.0f64;
+    for ((date, branch), (count, total_cost)) in &sorted {
+        let avg = if *count > 0 { total_cost / *count as f64 } else { 0.0 };
+        grand_total += total_cost;
+        println!(
+            "| {:<date_w$} | {:<branch_w$} | {:>sessions_w$} | {:>total_w$} | {:>avg_w$} |",
+            date,
+            branch,
+            count,
+            format!("${:.4}", total_cost),
+            format!("${:.4}", avg),
+            date_w = date_w, branch_w = branch_w,
+            sessions_w = sessions_w, total_w = total_w, avg_w = avg_w,
+        );
+    }
+
+    println!("{}", sep);
+    println!(
+        "  Total across {} session(s): ${:.4}",
+        rows.len(),
+        grand_total
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil diff
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct TraceEntry {
+    seq: usize,
+    tool_name: String,
+    input_digest: String,
+}
+
+enum DiffLine {
+    Same(TraceEntry),
+    OnlyA(TraceEntry),
+    OnlyB(TraceEntry),
+}
+
+fn lcs_diff(a: &[TraceEntry], b: &[TraceEntry]) -> Vec<DiffLine> {
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            if a[i - 1].tool_name == b[j - 1].tool_name
+                && a[i - 1].input_digest == b[j - 1].input_digest
+            {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        if i > 0
+            && j > 0
+            && a[i - 1].tool_name == b[j - 1].tool_name
+            && a[i - 1].input_digest == b[j - 1].input_digest
+        {
+            result.push(DiffLine::Same(a[i - 1].clone()));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            result.push(DiffLine::OnlyB(b[j - 1].clone()));
+            j -= 1;
+        } else {
+            result.push(DiffLine::OnlyA(a[i - 1].clone()));
+            i -= 1;
+        }
+    }
+    result.reverse();
+    result
+}
+
+/// Resolve a session ID that may be a full UUID, a UUID prefix, or a name label.
+/// Prefix matching scans Session::list_all() and matches id.to_string().starts_with(prefix).
+fn resolve_session_id_or_prefix(s: &str) -> anyhow::Result<uuid::Uuid> {
+    // Try full UUID parse first.
+    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+        return Ok(uuid);
+    }
+    // Scan all sessions for prefix or name match.
+    let summaries = Session::list_all()?;
+    let lower = s.to_lowercase();
+    // Prefix match on the UUID string
+    let prefix_matches: Vec<_> = summaries
+        .iter()
+        .filter(|ss| ss.id.to_string().starts_with(s))
+        .collect();
+    if prefix_matches.len() == 1 {
+        return Ok(prefix_matches[0].id);
+    }
+    if prefix_matches.len() > 1 {
+        anyhow::bail!(
+            "Ambiguous session prefix {:?} — {} sessions match. Use more characters.",
+            s,
+            prefix_matches.len()
+        );
+    }
+    // Name match (case-insensitive)
+    let name_matches: Vec<_> = summaries
+        .iter()
+        .filter(|ss| {
+            ss.name
+                .as_deref()
+                .map(|n| n.to_lowercase() == lower)
+                .unwrap_or(false)
+        })
+        .collect();
+    if name_matches.len() == 1 {
+        return Ok(name_matches[0].id);
+    }
+    anyhow::bail!("No session found with ID, prefix, or name {:?}", s);
+}
+
+fn run_diff(a_arg: &str, b_arg: &str, brief: bool) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::IsTerminal;
+    use vigil_core::event::Event;
+
+    // Resolve session IDs (full UUID, prefix, or name).
+    let uuid_a = resolve_session_id_or_prefix(a_arg)?;
+    let uuid_b = resolve_session_id_or_prefix(b_arg)?;
+
+    // Load metadata for header display.
+    let meta_a = vigil_core::store::SessionStore::load_meta(&uuid_a).ok();
+    let meta_b = vigil_core::store::SessionStore::load_meta(&uuid_b).ok();
+
+    let label_a = meta_a
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| {
+            meta_a
+                .as_ref()
+                .map(|m| m.started_at.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| uuid_a.to_string())
+        });
+    let label_b = meta_b
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| {
+            meta_b
+                .as_ref()
+                .map(|m| m.started_at.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| uuid_b.to_string())
+        });
+
+    let id_short_a = &uuid_a.to_string()[..8];
+    let id_short_b = &uuid_b.to_string()[..8];
+
+    // Load envelopes and build traces.
+    let envs_a = vigil_core::store::SessionStore::load_envelopes(&uuid_a)
+        .with_context(|| format!("Cannot load session {}", uuid_a))?;
+    let envs_b = vigil_core::store::SessionStore::load_envelopes(&uuid_b)
+        .with_context(|| format!("Cannot load session {}", uuid_b))?;
+
+    let build_trace = |envs: &[vigil_core::envelope::Envelope]| -> Vec<TraceEntry> {
+        let mut seq = 0usize;
+        envs.iter()
+            .filter_map(|env| {
+                if let Event::ToolCall { tool_name, input, .. } = &env.event {
+                    let input_bytes = serde_json::to_vec(input).unwrap_or_default();
+                    let digest = hex::encode(Sha256::digest(&input_bytes));
+                    let entry = TraceEntry {
+                        seq,
+                        tool_name: tool_name.clone(),
+                        input_digest: digest[..8].to_string(),
+                    };
+                    seq += 1;
+                    Some(entry)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let trace_a = build_trace(&envs_a);
+    let trace_b = build_trace(&envs_b);
+
+    let diff = lcs_diff(&trace_a, &trace_b);
+
+    // Determine colour support.
+    let use_color = std::io::stdout().is_terminal();
+    let red = if use_color { "\x1b[31m" } else { "" };
+    let green = if use_color { "\x1b[32m" } else { "" };
+    let reset = if use_color { "\x1b[0m" } else { "" };
+
+    // Print header.
+    println!("--- session-a: {} ({})", id_short_a, label_a);
+    println!("+++ session-b: {} ({})", id_short_b, label_b);
+
+    // Counters for summary.
+    let mut same_count = 0usize;
+    let mut only_a = 0usize;
+    let mut only_b = 0usize;
+
+    for line in &diff {
+        match line {
+            DiffLine::Same(e) => {
+                same_count += 1;
+                if !brief {
+                    println!("  [{}] {} ({})", e.seq, e.tool_name, e.input_digest);
+                }
+            }
+            DiffLine::OnlyA(e) => {
+                only_a += 1;
+                println!(
+                    "{}- [{}] {} ({}){}",
+                    red, e.seq, e.tool_name, e.input_digest, reset
+                );
+            }
+            DiffLine::OnlyB(e) => {
+                only_b += 1;
+                println!(
+                    "{}+ [{}] {} ({}){}",
+                    green, e.seq, e.tool_name, e.input_digest, reset
+                );
+            }
+        }
+    }
+
+    // Footer summary.
+    println!(
+        "--- {} tool calls in session-a, {} in session-b, {} in common, {} added, {} removed",
+        trace_a.len(),
+        trace_b.len(),
+        same_count,
+        only_b,
+        only_a,
+    );
+
     Ok(())
 }
 

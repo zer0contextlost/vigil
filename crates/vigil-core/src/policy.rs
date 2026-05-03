@@ -45,6 +45,8 @@ pub enum PolicyMatcher {
         input_field: String,
         value_pattern: String,
     },
+    #[serde(rename = "SubAgentDepth")]
+    SubAgentDepth { max_depth: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +268,12 @@ impl PolicyEngine {
                 }
                 false
             }
+            PolicyMatcher::SubAgentDepth { max_depth } => {
+                if let Event::SubAgentSpawned { depth, .. } = event {
+                    return *depth > *max_depth;
+                }
+                false
+            }
         }
     }
 
@@ -317,6 +325,16 @@ impl PolicyEngine {
                     "ToolCall {} input field {} matched pattern '{}'",
                     tool_name_pattern, input_field, value_pattern
                 ))
+            }
+            PolicyMatcher::SubAgentDepth { max_depth } => {
+                if let Event::SubAgentSpawned { depth, tool_name, .. } = event {
+                    Some(format!(
+                        "sub-agent depth {} exceeds max {}  (tool: {})",
+                        depth, max_depth, tool_name
+                    ))
+                } else {
+                    Some(format!("sub-agent depth limit: max {}", max_depth))
+                }
             }
         }
     }

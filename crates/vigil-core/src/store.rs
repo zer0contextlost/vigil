@@ -184,7 +184,23 @@ impl SessionStore {
             self.meta.verifying_key = Some(hex::encode(self.signing_key.verifying_key().to_bytes()));
         }
         self.finished = true;
-        self.flush_meta()
+        self.flush_meta()?;
+
+        // Best-effort: write cost as git notes on the commit this session ran against
+        if let (Some(commit), Some(branch)) = (&self.meta.git_commit, &self.meta.git_branch) {
+            let note = format!(
+                "vigil-cost: ${:.4} | branch: {} | session: {} | agent: {}",
+                self.meta.total_cost_usd,
+                branch,
+                self.meta.session_id,
+                self.meta.agent
+            );
+            let _ = std::process::Command::new("git")
+                .args(["notes", "add", "-f", "-m", &note, commit])
+                .output();
+        }
+
+        Ok(())
     }
 
     /// Verify the stored ed25519 chain-root signature against the provided hash.

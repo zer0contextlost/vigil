@@ -90,6 +90,11 @@ pub struct BudgetSection {
     /// Emit a SessionDurationAlert (and optionally stop) after this many minutes.
     #[serde(default)]
     pub max_session_duration_mins: Option<u64>,
+    /// Emit SubAgentSpawned and deny when Task tool call count exceeds this value.
+    /// Each Task invocation increments the session counter; the policy fires when
+    /// the count exceeds max_sub_agent_depth.
+    #[serde(default)]
+    pub max_sub_agent_depth: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -204,6 +209,13 @@ impl VigilConfig {
                 value_pattern: pattern.clone(),
             },
         }).collect();
+        if let Some(max_depth) = self.budget.max_sub_agent_depth {
+            policies.push(Policy {
+                name: "sub-agent-depth-limit".to_string(),
+                action: PolicyAction::Deny,
+                matcher: PolicyMatcher::SubAgentDepth { max_depth },
+            });
+        }
         policies.extend(self.policies.iter().cloned().map(Into::into));
         policies
     }

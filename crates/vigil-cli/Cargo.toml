@@ -23,11 +23,14 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1.0"
 vigil-core = { path = "../vigil-core" }
+vigil-mcp = { path = "../vigil-mcp" }
 vigil-proxy = { path = "../vigil-proxy" }
 vigil-tui = { path = "../vigil-tui" }
 vigil-watch = { path = "../vigil-watch" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+sha2 = "0.10"
+hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Security"] }
