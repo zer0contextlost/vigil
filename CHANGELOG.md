@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.1] - 2026-05-03
+
+### Security
+- Dashboard API requires bearer token authentication — vigil prints `Dashboard: http://127.0.0.1:PORT/?token=...` on startup; all `/api/*` routes return 401 without a valid `Authorization: Bearer <token>` header or `?token=` query param
+- Host header validation on all API routes blocks DNS rebinding attacks
+- Origin check on `POST /api/approvals/:id` as belt-and-suspenders CSRF guard
+- `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Content-Security-Policy` headers on all responses
+
+### Added
+- `[web]` config section with `port` field — supersedes `[proxy] dashboard_port` (which still works as fallback)
+- 7 integration tests for vigil-web: token enforcement, Bearer auth, query-param token, static asset exemption, security headers, Host rejection, SSE content-type
+- SSE events now carry the specific event type name (`LlmRequest`, `FsWrite`, etc.) instead of the generic `"vigil"` event name
+
+### Fixed
+- `api_sessions` and `api_session_detail` now use `tokio::task::spawn_blocking` so filesystem I/O never blocks the async reactor or stalls the SSE broadcast
+- Dashboard no longer accumulates cost/tokens client-side; server snapshot is authoritative (eliminates visible jitter on 30s poll)
+- `needs_attention` flag is now cleared when a `WriteApprovalDecision` event arrives
+- Relative times in the sessions table tick every 30 seconds instead of freezing
+
 ## [0.7.0] - 2026-05-03
 
 ### Added
