@@ -6,7 +6,7 @@ echo "=== vigil Linux installer ==="
 # Install system dependencies
 echo "[1/4] Installing system dependencies..."
 sudo apt-get update -qq
-sudo apt-get install -y build-essential pkg-config libssl-dev curl git
+sudo apt-get install -y build-essential pkg-config libssl-dev curl git xterm wmctrl
 
 # Install Rust if not present
 if ! command -v cargo &>/dev/null; then
