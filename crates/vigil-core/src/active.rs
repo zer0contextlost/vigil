@@ -13,6 +13,8 @@ pub struct ActiveSession {
     pub last_event: String,
     pub needs_attention: bool,
     pub pid: u32,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 pub fn active_dir() -> anyhow::Result<PathBuf> {

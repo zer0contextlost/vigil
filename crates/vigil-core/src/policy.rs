@@ -242,7 +242,7 @@ impl PolicyEngine {
                 matches!(event, Event::LlmRequest { .. })
             }
             PolicyMatcher::ToolCallInput {
-                tool_name_pattern,
+                tool_name_pattern: _,
                 input_field,
                 ..
             } => {
@@ -272,7 +272,7 @@ impl PolicyEngine {
     fn matcher_reason(&self, matcher: &PolicyMatcher, event: &Event) -> Option<String> {
         match matcher {
             PolicyMatcher::ToolCall { tool_name_pattern } => {
-                if let Event::ToolCall { tool_name, .. } = event {
+                if let Event::ToolCall { tool_name: _, .. } = event {
                     Some(format!(
                         "ToolCall matched pattern '{}'",
                         tool_name_pattern
@@ -291,7 +291,7 @@ impl PolicyEngine {
             PolicyMatcher::FsPath { path_pattern } => {
                 Some(format!("FsPath matched pattern '{}'", path_pattern))
             }
-            PolicyMatcher::NetworkDomain { deny_unless_in } => {
+            PolicyMatcher::NetworkDomain { deny_unless_in: _ } => {
                 if let Event::LlmRequest { provider, .. } = event {
                     Some(format!(
                         "NetworkDomain '{}' not in allowlist",

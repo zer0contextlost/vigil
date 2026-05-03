@@ -19,6 +19,10 @@
 /// impl VigilPlugin for MyPlugin {
 ///     fn name(&self) -> &str { "my-plugin" }
 ///
+///     async fn on_session_start(&self, ctx: &PluginContext) {
+///         eprintln!("Session {} started", ctx.session_id);
+///     }
+///
 ///     async fn on_alert(&self, ctx: &PluginContext, label: AlertLabel, detail: &Value) {
 ///         eprintln!("[{}] session={} {}", label, ctx.session_id, detail);
 ///     }
@@ -33,6 +37,8 @@
 /// }
 /// declare_plugin!(MyPlugin);
 /// ```
+///
+/// Other available hooks: `on_session_end`, `on_event`, `on_outbound_request`.
 
 pub use vigil_core::{alert, AlertDetail, AlertLabel, Envelope, PluginContext, PluginDecision, VigilPlugin};
 pub use serde_json::Value;
@@ -40,7 +46,7 @@ pub use async_trait::async_trait;
 
 /// ABI version. Bumped whenever `VigilPlugin`, `PluginContext`, `PluginDecision`,
 /// `AlertLabel`, `Envelope`, or the FFI contract changes in a breaking way.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// The rustc version vigil-plugin was compiled with, baked in at build time.
 pub const RUSTC_VERSION: &str = env!("VIGIL_RUSTC_VERSION");

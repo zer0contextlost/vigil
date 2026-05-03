@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
     Frame, Terminal,
 };
 use serde_json;
@@ -30,6 +30,7 @@ pub struct EventCounts {
     pub burn_alerts: usize,
     pub loop_alerts: usize,
     pub exfil_alerts: usize,
+    pub drift_alerts: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -154,9 +155,14 @@ impl App {
             vigil_core::Event::ToolTimeout { .. } => {}
             vigil_core::Event::CostAlert { .. } => {}
             vigil_core::Event::SessionDurationAlert { .. } => {}
+            vigil_core::Event::DriftAlert { .. } => {
+                self.counts.drift_alerts += 1;
+            }
         }
-        if let Some(ref mut store) = self.store {
-            let _ = store.append(event);
+        if !self.is_replay {
+            if let Some(ref mut store) = self.store {
+                let _ = store.append(event);
+            }
         }
         self.session.record(event.clone());
         self.event_log.push(format_event_line(event));
@@ -330,6 +336,8 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("COST", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         vigil_core::Event::SessionDurationAlert { .. } =>
             ("DURA", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::DriftAlert { .. } =>
+            ("DRFT", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
     };
 
     let summary = event_summary(event);
@@ -343,6 +351,7 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
         | vigil_core::Event::ToolTimeout { .. }
         | vigil_core::Event::CostAlert { .. }
         | vigil_core::Event::SessionDurationAlert { .. }
+        | vigil_core::Event::DriftAlert { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -406,6 +415,8 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("cost ${:.4} crossed alert threshold ${:.4}", session_cost_usd, threshold_usd),
         vigil_core::Event::SessionDurationAlert { elapsed_mins, .. } =>
             format!("session running {}min", elapsed_mins),
+        vigil_core::Event::DriftAlert { signal, details, .. } =>
+            format!("{}: {}", signal.as_str(), truncate(details, 60)),
     }
 }
 
@@ -544,6 +555,10 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(body_line(&format!("elapsed: {}min ({:.1}h)", elapsed_mins, *elapsed_mins as f64 / 60.0)));
             out.push(body_line("Session has exceeded budget.max_session_duration_mins."));
         }
+        vigil_core::Event::DriftAlert { signal, details, .. } => {
+            out.push(header_line(format!("DRIFT ALERT  {}", signal.as_str()), Color::Red));
+            out.push(body_line(details));
+        }
     }
 
     out
@@ -571,8 +586,9 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
 
     let sid = app.session.id.to_string();
     let sid_short = sid[..8.min(sid.len())].to_string();
+    let name_display = app.session.name.clone().unwrap_or(sid_short);
 
-    out.push(stat_row("session", sid_short, Color::White));
+    out.push(stat_row("session", truncate(&name_display, 18), Color::White));
     out.push(stat_row("agent", truncate(&app.session.agent, 14), Color::White));
     out.push(Line::from(""));
 
@@ -634,6 +650,13 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
         out.push(stat_row(
             "exfil alerts",
             c.exfil_alerts.to_string(),
+            Color::Red,
+        ));
+    }
+    if c.drift_alerts > 0 {
+        out.push(stat_row(
+            "drift alerts",
+            c.drift_alerts.to_string(),
             Color::Red,
         ));
     }
@@ -700,9 +723,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let sid = app.session.id.to_string();
-    let sid_short = &sid[..8.min(sid.len())];
+    let sid_short = app.session.name.as_deref().unwrap_or(&sid[..8.min(sid.len())]);
 
-    let status = if app.is_replay {
+    let status = if app.is_replay && app.agent_done {
+        Span::styled(" REPLAY DONE ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
+    } else if app.is_replay {
         Span::styled(" REPLAY ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else if app.agent_done {
         Span::styled(" DONE ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
@@ -1063,17 +1088,17 @@ async fn run_app<B: Backend>(
         terminal.draw(|f| draw(f, app))?;
 
         tokio::select! {
-            event_result = event_rx.recv() => {
+            // Stop polling the channel once it is closed so the timer branch
+            // can fire and service keyboard input. Without this guard, recv()
+            // resolves instantly on every iteration after the channel closes,
+            // starving the keyboard poller and making 'q' unresponsive.
+            event_result = event_rx.recv(), if !app.agent_done => {
                 match event_result {
                     Some(ts_event) => {
                         app.push_event(&ts_event);
                     }
                     None => {
-                        if app.is_replay {
-                            app.should_quit = true;
-                        } else {
-                            app.agent_done = true;
-                        }
+                        app.agent_done = true;
                     }
                 }
             }
@@ -1106,32 +1131,32 @@ pub enum BrowseAction {
 
 struct BrowserState {
     sessions: Vec<vigil_core::session::SessionSummary>,
-    list_state: ListState,
+    table_state: TableState,
 }
 
 impl BrowserState {
     fn new(sessions: Vec<vigil_core::session::SessionSummary>) -> Self {
-        let mut list_state = ListState::default();
+        let mut table_state = TableState::default();
         if !sessions.is_empty() {
-            list_state.select(Some(0));
+            table_state.select(Some(0));
         }
-        Self { sessions, list_state }
+        Self { sessions, table_state }
     }
 
     fn selected(&self) -> Option<&vigil_core::session::SessionSummary> {
-        self.list_state.selected().and_then(|i| self.sessions.get(i))
+        self.table_state.selected().and_then(|i| self.sessions.get(i))
     }
 
     fn move_up(&mut self) {
         if self.sessions.is_empty() { return; }
-        let i = self.list_state.selected().unwrap_or(0);
-        self.list_state.select(Some(if i == 0 { self.sessions.len() - 1 } else { i - 1 }));
+        let i = self.table_state.selected().unwrap_or(0);
+        self.table_state.select(Some(if i == 0 { self.sessions.len() - 1 } else { i - 1 }));
     }
 
     fn move_down(&mut self) {
         if self.sessions.is_empty() { return; }
-        let i = self.list_state.selected().unwrap_or(0);
-        self.list_state.select(Some((i + 1) % self.sessions.len()));
+        let i = self.table_state.selected().unwrap_or(0);
+        self.table_state.select(Some((i + 1) % self.sessions.len()));
     }
 }
 
@@ -1149,38 +1174,32 @@ pub async fn run_session_browser(
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = BrowserState::new(sessions);
-    let mut action: Option<BrowseAction> = None;
 
-    loop {
+    let action = loop {
         terminal.draw(|f| draw_browser(f, &mut state))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press { continue; }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        action = Some(BrowseAction::Quit);
-                        break;
-                    }
+                    KeyCode::Char('q') | KeyCode::Esc => break Some(BrowseAction::Quit),
                     KeyCode::Up | KeyCode::Char('k') => state.move_up(),
                     KeyCode::Down | KeyCode::Char('j') => state.move_down(),
                     KeyCode::Enter | KeyCode::Char('r') => {
                         if let Some(s) = state.selected() {
-                            action = Some(BrowseAction::Replay(s.id));
-                            break;
+                            break Some(BrowseAction::Replay(s.id));
                         }
                     }
                     KeyCode::Char('d') => {
                         if let Some(s) = state.selected() {
-                            action = Some(BrowseAction::Delete(s.id));
-                            break;
+                            break Some(BrowseAction::Delete(s.id));
                         }
                     }
                     _ => {}
                 }
             }
         }
-    }
+    };
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -1196,43 +1215,53 @@ fn draw_browser(frame: &mut Frame, state: &mut BrowserState) {
         .constraints([Constraint::Min(5), Constraint::Length(12), Constraint::Length(1)])
         .split(area);
 
-    // Session list
-    let items: Vec<ListItem> = state.sessions.iter().map(|s| {
+    // Column widths: Name(20), Agent(12), Started(16), Cost(10), Tokens(10), Events(7)
+    let col_widths = [
+        Constraint::Length(20),
+        Constraint::Length(12),
+        Constraint::Length(16),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(7),
+    ];
+
+    let header_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let header = Row::new([
+        Cell::from("NAME / ID").style(header_style),
+        Cell::from("AGENT").style(header_style),
+        Cell::from("STARTED").style(header_style),
+        Cell::from("COST").style(header_style),
+        Cell::from("TOKENS").style(header_style),
+        Cell::from("EVENTS").style(header_style),
+    ]);
+
+    let rows: Vec<Row> = state.sessions.iter().map(|s| {
         let label = s.name.clone().unwrap_or_else(|| s.id.to_string()[..8].to_string());
         let tokens = s.total_input_tokens + s.total_output_tokens;
-        let _duration = s.ended_at
-            .map(|e| format_dur(e - s.started_at))
-            .unwrap_or_else(|| "running".to_string());
-        let line = format!(
-            " {:<20}  {:<10}  {}  ${:.4}  {:>5}tok  {:>4}ev",
-            truncate_str(&label, 20),
-            truncate_str(&s.agent, 10),
-            s.started_at.format("%Y-%m-%d %H:%M"),
-            s.total_cost_usd,
-            tokens,
-            s.event_count,
-        );
-        ListItem::new(Line::from(Span::raw(line)))
+        Row::new([
+            Cell::from(truncate_str(&label, 20)),
+            Cell::from(truncate_str(&s.agent, 12)),
+            Cell::from(s.started_at.format("%Y-%m-%d %H:%M").to_string()),
+            Cell::from(format!("${:.4}", s.total_cost_usd)),
+            Cell::from(format!("{}", tokens)),
+            Cell::from(format!("{}", s.event_count)),
+        ])
     }).collect();
 
-    let header = format!(
-        " {:<20}  {:<10}  {:<16}  {:>7}  {:>8}  {:>6}",
-        "NAME / ID", "AGENT", "STARTED", "COST", "TOKENS", "EVENTS"
-    );
-
-    let list = List::new(items)
+    let table = Table::new(rows, col_widths)
+        .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(
-                    format!(" vigil sessions — {} total  |  header: {} ", state.sessions.len(), header),
+                    format!(" vigil sessions ({}) ", state.sessions.len()),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 )),
         )
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("▶ ");
 
-    frame.render_stateful_widget(list, chunks[0], &mut state.list_state);
+    frame.render_stateful_widget(table, chunks[0], &mut state.table_state);
 
     // Detail panel
     let detail_text = if let Some(s) = state.selected() {

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use vigil_core::{session::Session, store::SessionStore, AlertLabel, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, LoopDetector, PluginHost, PluginContext, PluginDecision};
+use vigil_core::{session::Session, store::SessionStore, AlertLabel, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision};
 use vigil_proxy::Proxy;
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
@@ -141,13 +141,19 @@ enum Commands {
         session_id: String,
     },
 
-    /// Export a session to NDJSON with PII redacted
+    /// Export session(s) to NDJSON with PII redacted
     Export {
-        /// Session ID (UUID) to export
-        session_id: String,
-        /// Output file path (default: stdout)
+        /// Session ID (UUID) to export (omit when using --all)
+        session_id: Option<String>,
+        /// Output file path for single-session export (default: stdout)
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Export all sessions to an output directory (one file per session)
+        #[arg(long)]
+        all: bool,
+        /// Directory for --all exports (default: ./vigil-export-<timestamp>)
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
     },
 
     /// Show all currently active vigil sessions
@@ -194,6 +200,23 @@ enum Commands {
         /// Human-readable label for this session
         #[arg(long)]
         name: Option<String>,
+    },
+
+    /// Delete session files older than N days
+    Prune {
+        /// Delete sessions older than this many days
+        #[arg(long, default_value = "30")]
+        older_than: u64,
+        /// Show what would be deleted without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Delete ALL session files (with confirmation prompt)
+    Clear {
+        /// Skip the confirmation prompt and delete immediately
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -466,35 +489,40 @@ async fn main() -> Result<()> {
             vigil_init(output, force).await?;
         }
         Some(Commands::Browse) => {
-            let summaries = Session::list_all()?;
-            match vigil_tui::run_session_browser(summaries).await? {
-                Some(BrowseAction::Replay(id)) => {
-                    let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
-                    let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
-                    let envelopes_clone = envelopes.clone();
-                    tokio::spawn(async move {
-                        for (i, env) in envelopes_clone.iter().enumerate() {
-                            if i > 0 {
-                                let prev_ts = envelopes_clone[i - 1].timestamp;
-                                let delta = env.timestamp.signed_duration_since(prev_ts);
-                                let ms = delta.num_milliseconds().max(0).min(500) as u64;
-                                if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
+            loop {
+                let summaries = Session::list_all()?;
+                match vigil_tui::run_session_browser(summaries).await? {
+                    Some(BrowseAction::Replay(id)) => {
+                        let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
+                        let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                        let envelopes_clone = envelopes.clone();
+                        tokio::spawn(async move {
+                            for (i, env) in envelopes_clone.iter().enumerate() {
+                                if i > 0 {
+                                    let prev_ts = envelopes_clone[i - 1].timestamp;
+                                    let delta = env.timestamp.signed_duration_since(prev_ts);
+                                    let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                                    if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
+                                }
+                                if tx.send(env.clone()).await.is_err() { break; }
                             }
-                            if tx.send(env.clone()).await.is_err() { break; }
-                        }
-                    });
-                    let meta = vigil_core::store::SessionStore::load_meta(&id).ok();
-                    let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
-                    let mut session = vigil_core::session::Session::new(agent);
-                    session.id = id;
-                    let mut app = App::new(session);
-                    app.is_replay = true;
-                    vigil_tui::run_tui(app, rx).await?;
+                        });
+                        let meta = vigil_core::store::SessionStore::load_meta(&id).ok();
+                        let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
+                        let mut session = vigil_core::session::Session::new(agent);
+                        session.id = id;
+                        session.name = meta.as_ref().and_then(|m| m.name.clone());
+                        let mut app = App::new(session);
+                        app.is_replay = true;
+                        vigil_tui::run_tui(app, rx).await?;
+                        // Return to the browser after replay ends.
+                    }
+                    Some(BrowseAction::Delete(id)) => {
+                        confirm_delete_session(&id)?;
+                        // Return to the browser after deletion.
+                    }
+                    Some(BrowseAction::Quit) | None => break,
                 }
-                Some(BrowseAction::Delete(id)) => {
-                    confirm_delete_session(&id)?;
-                }
-                Some(BrowseAction::Quit) | None => {}
             }
         }
         Some(Commands::Tag { session_id, name }) => {
@@ -538,8 +566,13 @@ async fn main() -> Result<()> {
         Some(Commands::Verify { session_id }) => {
             run_verify(&session_id)?;
         }
-        Some(Commands::Export { session_id, output }) => {
-            run_export(&session_id, output.as_deref())?;
+        Some(Commands::Export { session_id, output, all, output_dir }) => {
+            if all {
+                run_export_all(output_dir.as_deref())?;
+            } else {
+                let id = session_id.context("Provide a session ID or use --all")?;
+                run_export(&id, output.as_deref())?;
+            }
         }
         Some(Commands::Ps) => {
             run_ps()?;
@@ -592,6 +625,7 @@ async fn main() -> Result<()> {
                 let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
                 let mut session = vigil_core::session::Session::new(agent);
                 session.id = uuid;
+                session.name = meta.as_ref().and_then(|m| m.name.clone());
                 let mut app = App::new(session);
                 app.is_replay = true;
                 vigil_tui::run_tui(app, rx).await?;
@@ -607,6 +641,12 @@ async fn main() -> Result<()> {
                 app.is_replay = true;
                 vigil_tui::run_tui(app, rx).await?;
             }
+        }
+        Some(Commands::Prune { older_than, dry_run }) => {
+            run_prune(older_than, dry_run)?;
+        }
+        Some(Commands::Clear { yes }) => {
+            run_clear(yes)?;
         }
     }
 
@@ -796,6 +836,103 @@ fn run_export(session_id: &str, output: Option<&std::path::Path>) -> Result<()> 
         print!("{}", content);
     }
 
+    Ok(())
+}
+
+fn run_export_all(output_dir: Option<&std::path::Path>) -> Result<()> {
+    use vigil_core::store::sessions_dir;
+
+    let dir = sessions_dir()?;
+    if !dir.exists() {
+        anyhow::bail!("No sessions directory found.");
+    }
+
+    // Collect all session UUIDs from .ndjson files
+    let mut session_ids: Vec<uuid::Uuid> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if let Ok(uuid) = uuid::Uuid::parse_str(stem) {
+                    session_ids.push(uuid);
+                }
+            }
+        }
+    }
+
+    if session_ids.is_empty() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+
+    // Determine output directory
+    let out_dir = if let Some(p) = output_dir {
+        p.to_path_buf()
+    } else {
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        std::path::PathBuf::from(format!("vigil-export-{}", ts))
+    };
+    std::fs::create_dir_all(&out_dir)?;
+
+    let mut exported = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    for uuid in &session_ids {
+        let envelopes = match vigil_core::store::SessionStore::load_envelopes(uuid) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Warning: skipping {} (cannot read): {}", uuid, e);
+                failed += 1;
+                continue;
+            }
+        };
+        if envelopes.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Build redacted export object: {meta, events:[...]}
+        // Meta is redacted too — it may contain OS username, git remote URLs with
+        // embedded tokens, or agent command-line strings with API keys.
+        let meta_val = vigil_core::store::SessionStore::load_meta(uuid)
+            .ok()
+            .and_then(|m| serde_json::to_value(m).ok())
+            .map(|mut v| { redact_json_value(&mut v); v });
+
+        let mut events_val: Vec<serde_json::Value> = Vec::with_capacity(envelopes.len());
+        for env in &envelopes {
+            let mut val = serde_json::to_value(env)?;
+            redact_json_value(&mut val);
+            events_val.push(val);
+        }
+        let export_obj = serde_json::json!({
+            "meta": meta_val,
+            "events": events_val,
+        });
+
+        let out_path = out_dir.join(format!("{}.json", uuid));
+        if let Err(e) = std::fs::write(&out_path, serde_json::to_vec_pretty(&export_obj)?) {
+            eprintln!("Warning: failed to write {}: {}", out_path.display(), e);
+            failed += 1;
+        } else {
+            exported += 1;
+        }
+    }
+
+    if failed > 0 {
+        println!(
+            "Exported {} session(s) to {} ({} skipped empty, {} failed).",
+            exported, out_dir.display(), skipped, failed
+        );
+    } else {
+        println!(
+            "Exported {} session(s) to {} (skipped {} empty).",
+            exported, out_dir.display(), skipped
+        );
+    }
     Ok(())
 }
 
@@ -992,12 +1129,13 @@ pub async fn run_proxy_mode(
     init_logging(log_file);
 
     let label = session_name.clone().unwrap_or_else(|| "proxy".to_string());
-    let session = Session::new(label.clone());
+    let mut session = Session::new(label.clone());
     let session_id = session.id;
     let mut store = SessionStore::create(session_id, &label).ok();
     if let Some(ref n) = session_name {
         if let Some(ref mut s) = store { s.set_name(n.as_str()); }
     }
+    session.name = store.as_ref().map(|s| s.meta.name.clone()).flatten();
 
     let engine = if let Some(policy_path) = &policy {
         PolicyEngine::from_file(policy_path)?
@@ -1011,6 +1149,8 @@ pub async fn run_proxy_mode(
     let engine = Arc::new(engine);
 
     let plugin_host = Arc::new(plugins);
+    let ctx_start = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_start(&ctx_start).await;
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
 
@@ -1025,12 +1165,26 @@ pub async fn run_proxy_mode(
 
     let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel::<(uuid::Uuid, bool)>(32);
 
+    let outbound_hook: Option<vigil_proxy::OutboundHookFn> = if plugin_host.is_empty() {
+        None
+    } else {
+        let ph = plugin_host.clone();
+        let ctx = make_plugin_ctx(session_id);
+        Some(std::sync::Arc::new(move |provider: String, body: serde_json::Value| {
+            let ph = ph.clone();
+            let ctx = ctx.clone();
+            Box::pin(async move { ph.dispatch_outbound_request(&ctx, &provider, &body).await })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
+        }))
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
         upstream_override: None,
         pii_watchlist,
         write_approval_threshold,
+        outbound_hook,
     };
     let proxy = vigil_proxy::Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
@@ -1060,10 +1214,12 @@ pub async fn run_proxy_mode(
     println!();
 
     let loop_threshold = config.as_ref().and_then(|c| c.budget.loop_detect_threshold).unwrap_or(5);
+    let drift_cfg_proxy = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
     let plugin_host_filter = plugin_host.clone();
     let engine_clone = engine.clone();
     let filter_handle = tokio::spawn(async move {
         let mut loop_detector = LoopDetector::new(loop_threshold);
+        let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
         let mut cred_tracker = CredentialTracker::new();
         while let Some(event) = raw_rx.recv().await {
             if let Event::FsRead { path, .. } = &event.event {
@@ -1083,6 +1239,19 @@ pub async fn run_proxy_mode(
                     plugin_host_filter.dispatch_event(&ctx, &alert).await;
                     filtered_tx.send(alert).await.ok();
                 }
+            }
+
+            if let Some(payload) = drift_detector.check(&event.event) {
+                let detail = serde_json::json!({"signal": payload.signal.as_str(), "details": payload.details});
+                let alert = TimestampedEvent::new(Event::DriftAlert {
+                    signal: payload.signal,
+                    details: payload.details.clone(),
+                    session_id: payload.session_id,
+                });
+                let ctx = make_plugin_ctx(payload.session_id);
+                plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Drift, &detail).await;
+                plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                filtered_tx.send(alert).await.ok();
             }
 
             // Credential exfiltration detection — check child process command-line args
@@ -1140,7 +1309,7 @@ pub async fn run_proxy_mode(
                         }
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     } else {
-                        let ctx = make_plugin_ctx(session_id);
+                        let ctx = make_plugin_ctx(event.session_id);
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     }
                     filtered_tx.send(event).await.ok();
@@ -1158,6 +1327,8 @@ pub async fn run_proxy_mode(
     proxy_handle.abort();
     filter_handle.abort();
     resolver_handle.abort();
+    let ctx_end = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_end(&ctx_end).await;
     Ok(())
 }
 
@@ -1179,13 +1350,14 @@ pub async fn run_agent_with_plugins(
     }
 
     let agent_name = agent_and_args[0].clone();
-    let session = Session::new(agent_name.clone());
+    let mut session = Session::new(agent_name.clone());
     let session_id = session.id;
     let mut store = SessionStore::create(session_id, &agent_name).ok();
 
     if let Some(ref n) = session_name {
         if let Some(ref mut s) = store { s.set_name(n.as_str()); }
     }
+    session.name = store.as_ref().map(|s| s.meta.name.clone()).flatten();
 
     let active_handle = vigil_core::create_handle(&session_id).ok();
     if let Some(ref handle) = active_handle {
@@ -1199,6 +1371,7 @@ pub async fn run_agent_with_plugins(
             last_event: "starting".to_string(),
             needs_attention: false,
             pid: std::process::id(),
+            name: session.name.clone(),
         });
     }
 
@@ -1225,6 +1398,7 @@ pub async fn run_agent_with_plugins(
     let loop_threshold = config.as_ref()
         .and_then(|c| c.budget.loop_detect_threshold)
         .unwrap_or(5);
+    let drift_cfg_agent = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
     let tool_timeout_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_secs);
     let tool_timeout_kill_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_kill_secs);
     let cost_alert_usd = config.as_ref().and_then(|c| c.budget.cost_alert_usd);
@@ -1269,12 +1443,26 @@ pub async fn run_agent_with_plugins(
 
     let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel::<(uuid::Uuid, bool)>(32);
 
+    let outbound_hook: Option<vigil_proxy::OutboundHookFn> = if plugin_host.is_empty() {
+        None
+    } else {
+        let ph = plugin_host.clone();
+        let ctx = make_plugin_ctx(session_id);
+        Some(std::sync::Arc::new(move |provider: String, body: serde_json::Value| {
+            let ph = ph.clone();
+            let ctx = ctx.clone();
+            Box::pin(async move { ph.dispatch_outbound_request(&ctx, &provider, &body).await })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
+        }))
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
         upstream_override: None,
         pii_watchlist,
         write_approval_threshold,
+        outbound_hook,
     };
     let proxy = Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
@@ -1326,6 +1514,9 @@ pub async fn run_agent_with_plugins(
     };
 
     tracing::info!(pid = child_pid, "agent process started");
+
+    let ctx_start = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_start(&ctx_start).await;
 
     let watch_config = WatchConfig {
         watch_path: std::env::current_dir()?,
@@ -1429,6 +1620,7 @@ pub async fn run_agent_with_plugins(
         let mut cost_alerted = false;
         let mut burn_tracker = BurnRateTracker::new();
         let mut loop_detector = LoopDetector::new(loop_threshold);
+        let mut drift_detector = DriftDetector::with_config(drift_cfg_agent);
         let mut cred_tracker = CredentialTracker::new();
         while let Some(event) = raw_rx.recv().await {
             // Tool timeout tracking: arm on ToolCall, disarm on LlmRequest
@@ -1628,6 +1820,28 @@ pub async fn run_agent_with_plugins(
                 }
             }
 
+            if let Some(payload) = drift_detector.check(&event.event) {
+                let detail = serde_json::json!({"signal": payload.signal.as_str(), "details": payload.details});
+                let alert = TimestampedEvent::new(Event::DriftAlert {
+                    signal: payload.signal,
+                    details: payload.details.clone(),
+                    session_id: payload.session_id,
+                });
+                if let Some(ref n) = notifier_filter {
+                    n.send("DRFT", &payload.session_id.to_string(), detail.clone());
+                }
+                let ctx = make_plugin_ctx(payload.session_id);
+                plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Drift, &detail).await;
+                plugin_host_filter.dispatch_event(&ctx, &alert).await;
+                filtered_tx.send(alert).await.ok();
+                if let Some(ref path) = lock_path {
+                    vigil_core::update_active(path, |s| {
+                        s.needs_attention = true;
+                        s.last_event = "DRFT".to_string();
+                    });
+                }
+            }
+
             if let Some(ref enforcer) = budget_enforcer {
                 match enforcer.check(session_cost, session_tokens) {
                     BudgetStatus::Ok => {}
@@ -1731,7 +1945,7 @@ pub async fn run_agent_with_plugins(
                         }
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     } else {
-                        let ctx = make_plugin_ctx(session_id_for_alerts);
+                        let ctx = make_plugin_ctx(event.session_id);
                         plugin_host_filter.dispatch_event(&ctx, &event).await;
                     }
                     filtered_tx.send(event).await.ok();
@@ -1806,6 +2020,9 @@ pub async fn run_agent_with_plugins(
         println!("Agent: {}", agent_name);
     }
 
+    let ctx_end = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_end(&ctx_end).await;
+
     if let Some(ref handle) = active_handle {
         handle.remove();
     }
@@ -1820,19 +2037,21 @@ fn run_ps() -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<36}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
-        "SESSION ID", "AGENT", "TOKENS", "COST", "$/MIN", "STATUS"
+        "{:<20}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
+        "NAME", "AGENT", "TOKENS", "COST", "$/MIN", "STATUS"
     );
-    println!("{}", "-".repeat(85));
+    println!("{}", "-".repeat(75));
     for s in &sessions {
         let status = if s.needs_attention {
             "! ATTENTION".to_string()
         } else {
             s.last_event.clone()
         };
+        let label = s.name.clone()
+            .unwrap_or_else(|| s.session_id.to_string()[..8].to_string());
         println!(
-            "{:<36}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
-            s.session_id,
+            "{:<20}  {:<12}  {:>10}  {:>8}  {:>10}  {}",
+            truncate(&label, 20),
             truncate(&s.agent, 12),
             s.session_tokens,
             format!("${:.4}", s.session_cost_usd),
@@ -2514,6 +2733,124 @@ fn confirm_delete_session(id: &uuid::Uuid) -> anyhow::Result<()> {
         println!("Session {} deleted.", id);
     } else {
         println!("Cancelled.");
+    }
+    Ok(())
+}
+
+fn run_prune(older_than_days: u64, dry_run: bool) -> anyhow::Result<()> {
+    let dir = vigil_core::store::sessions_dir()?;
+    if !dir.exists() {
+        println!("No sessions directory found.");
+        return Ok(());
+    }
+
+    let cutoff = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(older_than_days * 86400);
+
+    let mut deleted = 0u64;
+    let mut freed = 0u64;
+
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
+            // Only look at .ndjson files (each session has one); meta.json is handled below
+            if ext != "ndjson" { continue }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(modified) = meta.modified() else { continue };
+            if modified >= cutoff { continue }
+
+            let size = meta.len();
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+
+            if dry_run {
+                println!("would delete: {} ({} KB)", path.file_name().unwrap_or_default().to_string_lossy(), size / 1024);
+            } else {
+                std::fs::remove_file(&path).ok();
+                // Remove companion meta file
+                let meta_path = dir.join(format!("{}.meta.json", stem));
+                if meta_path.exists() { std::fs::remove_file(&meta_path).ok(); }
+                deleted += 1;
+                freed += size;
+            }
+        }
+    }
+
+    if dry_run {
+        println!("Dry run — no files deleted. Remove --dry-run to prune.");
+    } else {
+        println!("Pruned {} session(s), freed {} KB.", deleted, freed / 1024);
+    }
+    Ok(())
+}
+
+fn run_clear(skip_confirm: bool) -> anyhow::Result<()> {
+    let dir = vigil_core::store::sessions_dir()?;
+    if !dir.exists() {
+        println!("No sessions directory found — nothing to clear.");
+        return Ok(());
+    }
+
+    // Collect all session .ndjson files and compute total size
+    let mut sessions: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    let mut total_bytes = 0u64;
+
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("ndjson") {
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            total_bytes += size;
+            sessions.push((path, size));
+        }
+    }
+
+    if sessions.is_empty() {
+        println!("No sessions found — nothing to clear.");
+        return Ok(());
+    }
+
+    let count = sessions.len();
+    let kb = total_bytes / 1024;
+    println!("Found {} session(s) using {} KB in {}.", count, kb, dir.display());
+
+    if !skip_confirm {
+        print!("Delete all {} session(s)? This cannot be undone. [y/N] ", count);
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if !line.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let mut deleted = 0u64;
+    let mut failed = 0u64;
+    for (path, _) in &sessions {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        match std::fs::remove_file(path) {
+            Ok(_) => {
+                let meta_path = dir.join(format!("{}.meta.json", stem));
+                if meta_path.exists() {
+                    std::fs::remove_file(&meta_path).ok();
+                }
+                deleted += 1;
+            }
+            Err(e) => {
+                eprintln!("Warning: could not delete {}: {}", path.display(), e);
+                failed += 1;
+            }
+        }
+    }
+
+    if failed > 0 {
+        println!("Cleared {} session(s), freed {} KB ({} failed — check permissions).", deleted, kb, failed);
+    } else {
+        println!("Cleared {} session(s), freed {} KB.", deleted, kb);
     }
     Ok(())
 }

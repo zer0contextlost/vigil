@@ -1,6 +1,8 @@
 pub mod active;
 pub mod budget;
 pub mod burn_rate;
+pub mod drift;
+pub mod namegen;
 pub mod config;
 pub mod envelope;
 pub mod event;
@@ -20,6 +22,7 @@ pub use active::{ActiveSession, ActiveSessionHandle, create_handle, list_active,
 pub use exfil::CredentialTracker;
 pub use budget::{BudgetEnforcer, BudgetStatus};
 pub use burn_rate::{BurnRateTracker, LoopDetector};
+pub use drift::{DriftAlertPayload, DriftConfig, DriftDetector, DriftSignal};
 pub use config::VigilConfig;
 pub use envelope::{Envelope, TimestampedEvent, SCHEMA_VERSION};
 pub use event::Event;
