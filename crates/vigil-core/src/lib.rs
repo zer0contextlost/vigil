@@ -17,6 +17,7 @@ pub mod provider;
 pub mod risk;
 pub mod scanner;
 pub mod session;
+pub mod replay;
 pub mod store;
 
 pub use active::{ActiveSession, ActiveSessionHandle, create_handle, list_active, update_active};
@@ -37,4 +38,5 @@ pub use scanner::{RegexScanner, Scanner, ScannerChain, WatchlistScanner};
 pub use session::{Session, SessionSummary};
 pub use notify::WebhookNotifier;
 pub use plugin::{alert, AlertDetail, AlertLabel, PluginContext, PluginDecision, PluginHost, VigilPlugin};
+pub use replay::{build_request_key, RequestKey};
 pub use store::{sessions_dir, SessionMeta, SessionStore};
