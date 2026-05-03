@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use vigil_core::{session::Session, store::SessionStore, AlertLabel, BashExfilFinding, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision, scan_bash_for_exfil};
+use vigil_mcp::run_mcp_server;
 use vigil_proxy::Proxy;
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
@@ -239,6 +240,9 @@ enum Commands {
         #[arg(long)]
         brief: bool,
     },
+
+    /// Start vigil as an MCP server (JSON-RPC over stdio for Claude Desktop / Cursor)
+    Mcp,
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +678,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Diff { session_a, session_b, brief }) => {
             run_diff(&session_a, &session_b, brief)?;
+        }
+        Some(Commands::Mcp) => {
+            run_mcp_server()?;
         }
     }
 

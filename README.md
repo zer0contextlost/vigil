@@ -298,15 +298,36 @@ output_per_million = 15.0
 
 Patterns match as case-insensitive substrings. Put more-specific patterns first.
 
-## MCP shim (planned, coming in v0.4)
+## MCP server mode (`vigil mcp`)
 
-MCP server interception via `vigil-mcp-shim` is not yet functional. When complete, you will be able to replace your MCP server command with `vigil-mcp-shim` to intercept tool calls:
+`vigil mcp` starts vigil as a self-contained MCP server, speaking JSON-RPC 2.0 over stdio. Claude Desktop, Cursor, Cline, and Continue can route through it directly — no HTTPS interception needed.
+
+Configure it in `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "vigil": {
+      "command": "vigil",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Once configured, the following tools are available to the AI assistant:
+
+`vigil_status` — active session count and proxy status.
+
+`vigil_sessions` — list recent sessions with cost, name, and timestamp. Accepts an optional `limit` integer.
+
+`vigil_policy_check` — check whether a named tool call would be allowed (allow) or require confirmation (confirm) under vigil's write-approval policy. Pass `tool_name` as a string argument.
+
+The `vigil-mcp-shim` binary remains available as a transparent proxy for wrapping existing MCP servers and logging their `tools/call` events as `McpCall` events in a vigil session:
 
 ```bash
 vigil-mcp-shim --session-id <uuid> --ndjson ~/.vigil/sessions/<uuid>.ndjson <real-server> [args]
 ```
-
-All `tools/call` requests will be PII-scanned and logged as `McpCall` events.
 
 ## Architecture
 
@@ -319,7 +340,7 @@ Seven Rust crates:
 | `vigil-core` | Event types, Envelope/hash chain, SessionStore, ed25519 signing, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner, PluginHost |
 | `vigil-tui` | ratatui dashboard, session browser, replay |
 | `vigil-watch` | Process tree monitor (sysinfo) — tracks child processes spawned by the agent |
-| `vigil-mcp` | vigil-mcp-shim binary for stdio JSON-RPC MCP servers (coming in v0.4) |
+| `vigil-mcp` | MCP server mode (`vigil mcp`) and vigil-mcp-shim proxy binary for stdio JSON-RPC MCP servers |
 | `vigil-plugin` | Plugin SDK — `VigilPlugin` trait, `declare_plugin!` macro, ABI versioning |
 
 Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in the agent's environment. The proxy forwards to the real API over TLS.
