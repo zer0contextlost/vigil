@@ -37,6 +37,29 @@ impl ProviderAdapter for OpenAiAdapter {
     }
 }
 
+pub struct GeminiAdapter;
+
+impl ProviderAdapter for GeminiAdapter {
+    fn write_tools(&self) -> &[&'static str] {
+        &["write_file", "replace"]
+    }
+    fn read_tools(&self) -> &[&'static str] {
+        &["read_file", "glob", "grep_search", "list_directory"]
+    }
+    fn canonical_tool_name<'a>(&self, name: &'a str) -> &'a str {
+        match name {
+            "write_file"        => "Write",
+            "replace"           => "Edit",
+            "read_file"         => "Read",
+            "list_directory"    => "LS",
+            "glob"              => "Glob",
+            "grep_search"       => "Grep",
+            "run_shell_command" => "Bash",
+            _                   => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderKind {
     Anthropic,
@@ -101,6 +124,27 @@ mod tests {
         assert_eq!(detect_provider_from_host("evil.com"), ProviderKind::Unknown);
         assert_eq!(detect_provider_from_host("notanthropic.com"), ProviderKind::Unknown);
         assert_eq!(detect_provider_from_host(""), ProviderKind::Unknown);
+    }
+
+    #[test]
+    fn test_gemini_adapter_write_tools() {
+        let a = GeminiAdapter;
+        assert!(a.write_tools().contains(&"write_file"));
+        assert!(a.write_tools().contains(&"replace"));
+        assert!(!a.write_tools().contains(&"run_shell_command"));
+    }
+
+    #[test]
+    fn test_gemini_adapter_canonical_names() {
+        let a = GeminiAdapter;
+        assert_eq!(a.canonical_tool_name("write_file"),        "Write");
+        assert_eq!(a.canonical_tool_name("replace"),           "Edit");
+        assert_eq!(a.canonical_tool_name("read_file"),         "Read");
+        assert_eq!(a.canonical_tool_name("list_directory"),    "LS");
+        assert_eq!(a.canonical_tool_name("glob"),              "Glob");
+        assert_eq!(a.canonical_tool_name("grep_search"),       "Grep");
+        assert_eq!(a.canonical_tool_name("run_shell_command"), "Bash");
+        assert_eq!(a.canonical_tool_name("save_memory"),       "save_memory");
     }
 }
 
