@@ -1825,7 +1825,7 @@ pub async fn run_agent_with_plugins(
             cmd.args(&agent_and_args[1..]);
         }
         cmd.env("ANTHROPIC_BASE_URL", &proxy_url);
-        let mut child = cmd.spawn()?;
+        let child = cmd.spawn()?;
         let pid = child.id().unwrap_or(0);
         (pid, child)
     };
