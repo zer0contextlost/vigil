@@ -1365,7 +1365,7 @@ async fn run_interactive() -> Result<()> {
         return Ok(());
     }
     let watchlist = load_pii_watchlist(None);
-    run_agent(8877, None, None, args, watchlist, None, None).await
+    run_agent(find_available_port(8877)?, None, None, args, watchlist, None, None).await
 }
 
 /// Load PII watchlist terms: explicit file path first, then auto-load ~/.vigil/watchlist.txt.
@@ -1532,6 +1532,8 @@ pub async fn run_proxy_mode(
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
         }))
     };
+
+    let port = find_available_port(port)?;
 
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
@@ -1942,6 +1944,8 @@ pub async fn run_agent_with_plugins(
         }))
     };
 
+    let port = find_available_port(port)?;
+
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
@@ -2321,8 +2325,8 @@ pub async fn run_agent_with_plugins(
                 }
             }
 
-            if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {
-                session_tokens = session_tokens.saturating_add(input_tokens.saturating_add(*output_tokens));
+            if let Event::LlmResponse { input_tokens: _, output_tokens, cost_usd, .. } = &event.event {
+                session_tokens = session_tokens.saturating_add(*output_tokens);
                 session_cost += cost_usd;
                 if let Some(ref path) = lock_path {
                     vigil_core::update_active(path, |s| {

@@ -5,6 +5,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.8] - 2026-05-03
+
+### Fixed
+- Running multiple concurrent sessions no longer causes proxy bind failures; all entry points (`vigil run`, `vigil proxy`, interactive launcher) now auto-scan for an available port starting from the configured value instead of failing hard when the default port is in use
+- Session token counts no longer double-count input tokens; `LlmResponse` events now accumulate only output tokens, while `LlmRequest` events account for input tokens — previously input tokens were added twice per turn
+
 ## [0.7.7] - 2026-05-03
 
 ### Fixed
