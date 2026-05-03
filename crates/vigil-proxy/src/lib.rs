@@ -41,7 +41,15 @@ pub const ALLOWED_RESP_HEADERS: &[&str] = &[
 
 pub type PendingApprovals = Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>;
 
-#[derive(Debug, Clone)]
+/// Async callback invoked before each outbound LLM request.
+/// Return `Some(modified_body)` to replace the request body, or `None` to pass through.
+pub type OutboundHookFn = Arc<
+    dyn Fn(String, Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Value>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
 pub struct ProxyConfig {
     pub port: u16,
     pub ca_cert_path: Option<PathBuf>,
@@ -52,6 +60,8 @@ pub struct ProxyConfig {
     pub pii_watchlist: Vec<String>,
     /// Gate writes at this risk level or above. None disables write approval gating.
     pub write_approval_threshold: Option<vigil_core::RiskLevel>,
+    /// Optional plugin hook called before each LLM request is forwarded upstream.
+    pub outbound_hook: Option<OutboundHookFn>,
 }
 
 pub struct Proxy {
@@ -423,10 +433,29 @@ async fn handle_reverse_proxy(
     // plain UTF-8 text that our SSE parser can process.
     req = req.header("accept-encoding", "identity");
 
-    req = req.body(body.clone());
+    // Allow plugins to inspect / modify the outbound request body before forwarding.
+    let effective_body: bytes::Bytes = if !body.is_empty() {
+        if let Some(ref hook) = config.outbound_hook {
+            if let Ok(body_value) = serde_json::from_slice::<Value>(body) {
+                if let Some(modified) = (hook)(provider.to_string(), body_value).await {
+                    serde_json::to_vec(&modified).map(bytes::Bytes::from).unwrap_or_else(|_| body.clone())
+                } else {
+                    body.clone()
+                }
+            } else {
+                body.clone()
+            }
+        } else {
+            body.clone()
+        }
+    } else {
+        body.clone()
+    };
+
+    req = req.body(effective_body.clone());
 
     let (model, last_user_message, system_prompt) =
-        serde_json::from_slice::<Value>(body)
+        serde_json::from_slice::<Value>(&effective_body)
             .map(|j| {
                 let model = j
                     .get("model")
@@ -1486,6 +1515,7 @@ mod integration {
             upstream_override,
             pii_watchlist: vec![],
             write_approval_threshold: None,
+            outbound_hook: None,
         };
         let http_client = reqwest::Client::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -476,35 +476,39 @@ async fn main() -> Result<()> {
             vigil_init(output, force).await?;
         }
         Some(Commands::Browse) => {
-            let summaries = Session::list_all()?;
-            match vigil_tui::run_session_browser(summaries).await? {
-                Some(BrowseAction::Replay(id)) => {
-                    let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
-                    let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
-                    let envelopes_clone = envelopes.clone();
-                    tokio::spawn(async move {
-                        for (i, env) in envelopes_clone.iter().enumerate() {
-                            if i > 0 {
-                                let prev_ts = envelopes_clone[i - 1].timestamp;
-                                let delta = env.timestamp.signed_duration_since(prev_ts);
-                                let ms = delta.num_milliseconds().max(0).min(500) as u64;
-                                if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
+            loop {
+                let summaries = Session::list_all()?;
+                match vigil_tui::run_session_browser(summaries).await? {
+                    Some(BrowseAction::Replay(id)) => {
+                        let envelopes = vigil_core::store::SessionStore::load_envelopes(&id)?;
+                        let (tx, rx) = tokio::sync::mpsc::channel(envelopes.len().max(1));
+                        let envelopes_clone = envelopes.clone();
+                        tokio::spawn(async move {
+                            for (i, env) in envelopes_clone.iter().enumerate() {
+                                if i > 0 {
+                                    let prev_ts = envelopes_clone[i - 1].timestamp;
+                                    let delta = env.timestamp.signed_duration_since(prev_ts);
+                                    let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                                    if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
+                                }
+                                if tx.send(env.clone()).await.is_err() { break; }
                             }
-                            if tx.send(env.clone()).await.is_err() { break; }
-                        }
-                    });
-                    let meta = vigil_core::store::SessionStore::load_meta(&id).ok();
-                    let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
-                    let mut session = vigil_core::session::Session::new(agent);
-                    session.id = id;
-                    let mut app = App::new(session);
-                    app.is_replay = true;
-                    vigil_tui::run_tui(app, rx).await?;
+                        });
+                        let meta = vigil_core::store::SessionStore::load_meta(&id).ok();
+                        let agent = meta.as_ref().map(|m| m.agent.clone()).unwrap_or_else(|| "unknown".to_string());
+                        let mut session = vigil_core::session::Session::new(agent);
+                        session.id = id;
+                        let mut app = App::new(session);
+                        app.is_replay = true;
+                        vigil_tui::run_tui(app, rx).await?;
+                        // Return to the browser after replay ends.
+                    }
+                    Some(BrowseAction::Delete(id)) => {
+                        confirm_delete_session(&id)?;
+                        // Return to the browser after deletion.
+                    }
+                    Some(BrowseAction::Quit) | None => break,
                 }
-                Some(BrowseAction::Delete(id)) => {
-                    confirm_delete_session(&id)?;
-                }
-                Some(BrowseAction::Quit) | None => {}
             }
         }
         Some(Commands::Tag { session_id, name }) => {
@@ -1040,12 +1044,26 @@ pub async fn run_proxy_mode(
 
     let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel::<(uuid::Uuid, bool)>(32);
 
+    let outbound_hook: Option<vigil_proxy::OutboundHookFn> = if plugin_host.is_empty() {
+        None
+    } else {
+        let ph = plugin_host.clone();
+        let ctx = make_plugin_ctx(session_id);
+        Some(std::sync::Arc::new(move |provider: String, body: serde_json::Value| {
+            let ph = ph.clone();
+            let ctx = ctx.clone();
+            Box::pin(async move { ph.dispatch_outbound_request(&ctx, &provider, &body).await })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
+        }))
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
         upstream_override: None,
         pii_watchlist,
         write_approval_threshold,
+        outbound_hook,
     };
     let proxy = vigil_proxy::Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
@@ -1286,12 +1304,26 @@ pub async fn run_agent_with_plugins(
 
     let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel::<(uuid::Uuid, bool)>(32);
 
+    let outbound_hook: Option<vigil_proxy::OutboundHookFn> = if plugin_host.is_empty() {
+        None
+    } else {
+        let ph = plugin_host.clone();
+        let ctx = make_plugin_ctx(session_id);
+        Some(std::sync::Arc::new(move |provider: String, body: serde_json::Value| {
+            let ph = ph.clone();
+            let ctx = ctx.clone();
+            Box::pin(async move { ph.dispatch_outbound_request(&ctx, &provider, &body).await })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
+        }))
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
         upstream_override: None,
         pii_watchlist,
         write_approval_threshold,
+        outbound_hook,
     };
     let proxy = Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
