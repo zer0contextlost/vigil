@@ -2,7 +2,7 @@
 
 Runtime observability and policy enforcement for AI coding agents.
 
-vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, and any agent that respects `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`.
+vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, Gemini CLI, and any agent that respects `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, or `GOOGLE_GEMINI_BASE_URL`.
 
 ## Quick start
 
@@ -29,19 +29,29 @@ vigil proxy --port 8877 --config vigil.toml
 
 Then point your IDE at `http://127.0.0.1:8877`. Cursor: Settings → Models → BYOK → set Override OpenAI Base URL to `http://127.0.0.1:8877/v1`.
 
+For Gemini CLI, set the base URL environment variable before running:
+
+```bash
+vigil proxy --port 8877 --config vigil.toml
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8877
+gemini
+```
+
+vigil auto-detects Gemini requests by path pattern and routes them to `https://generativelanguage.googleapis.com`. The write-approval gate, PII scanner, policy engine, and all other vigil features work identically for Gemini traffic.
+
 ## Architecture
 
 | Crate | Role |
 |-------|------|
 | `vigil-cli` | Binary entrypoint; CLI parsing, agent spawning, TUI orchestration, budget enforcement, plugin loading |
 | `vigil-core` | Event types, Envelope/hash chain, SessionStore, ed25519 signing, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner, PluginHost, drift/exfil/injection detection |
-| `vigil-proxy` | HTTP reverse proxy, SSE parser (Anthropic + OpenAI formats), write-approval gate |
+| `vigil-proxy` | HTTP reverse proxy, SSE parser (Anthropic + OpenAI + Gemini formats), write-approval gate |
 | `vigil-tui` | ratatui dashboard, session browser, replay viewer |
 | `vigil-watch` | Process tree monitor (sysinfo) — tracks child processes spawned by the agent |
 | `vigil-mcp` | MCP server mode (`vigil mcp`) and `vigil-mcp-shim` proxy binary for stdio JSON-RPC MCP servers |
 | `vigil-plugin` | Plugin SDK — `VigilPlugin` trait, `declare_plugin!` macro, ABI versioning |
 
-Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in the agent's environment. The proxy forwards to the real API over TLS.
+Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` (Claude Code / Anthropic), `OPENAI_BASE_URL=http://127.0.0.1:8877/v1` (Cursor / OpenAI-compatible), or `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8877` (Gemini CLI) in the agent's environment. The proxy forwards to the real API over TLS.
 
 ## CLI commands
 
@@ -248,7 +258,7 @@ input_per_million = 3.0
 output_per_million = 15.0
 ```
 
-Patterns match as case-insensitive substrings. Put more-specific patterns first.
+Patterns match as case-insensitive substrings. Put more-specific patterns first. Built-in defaults include entries for Claude, GPT, and Gemini models; Gemini entries are ordered so `gemini-2.5-flash-lite` appears before `gemini-2.5-flash` to prevent the shorter pattern matching the longer model name.
 
 ## vigil-slack plugin
 

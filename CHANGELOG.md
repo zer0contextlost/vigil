@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.6.0] - 2026-05-03
+
+### Added
+- Gemini CLI adapter — vigil now intercepts and observes Google Gemini API traffic in addition to Anthropic and OpenAI; set `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8877` to route Gemini CLI through the proxy
+- `GeminiAdapter` in `vigil-core::provider` — implements `ProviderAdapter` with write-approval tool list (write_file, replace) and canonical tool name mappings to vigil's internal names (write_file→Write, replace→Edit, read_file→Read, glob→Glob, grep_search→Grep, run_shell_command→Bash)
+- Gemini routing in `vigil-proxy` — detects `/v1beta/models/…:streamGenerateContent` path pattern and routes to `https://generativelanguage.googleapis.com`; model name extracted from URL path since Gemini does not include it in the request body
+- `process_gemini_sse_event()` SSE state machine — handles text parts, `functionCall` with `partialArgs` (delta concat) vs `args` (snapshot overwrite), `willContinue`, `finishReason`, `usageMetadata`, and SAFETY terminations with zero tokens
+- `flush_gemini_call()` — canonicalizes Gemini tool names, runs PII scan, triggers write-approval gate, emits `ToolCall` event
+- Built-in pricing entries for `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-flash`, `gemini-3.1-pro`; ordered most-specific first to avoid substring matching collision
+
+---
+
 ## [0.5.0] - 2026-05-03
 
 ### Added
