@@ -164,6 +164,12 @@ struct SessionEntry {
 }
 
 async fn api_sessions() -> impl IntoResponse {
+    let json = tokio::task::spawn_blocking(build_sessions_json).await
+        .unwrap_or_else(|_| "[]".to_string());
+    ([(header::CONTENT_TYPE, "application/json")], json)
+}
+
+fn build_sessions_json() -> String {
     let active = list_active();
     let mut entries: Vec<SessionEntry> = Vec::new();
 
@@ -206,10 +212,7 @@ async fn api_sessions() -> impl IntoResponse {
         }
     }
 
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string()),
-    )
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -233,34 +236,38 @@ async fn api_session_detail(Path(id): Path<String>) -> impl IntoResponse {
         return (StatusCode::BAD_REQUEST, [(header::CONTENT_TYPE, "application/json")], "\"invalid uuid\"".to_string());
     };
 
-    let envelopes = vigil_core::store::SessionStore::load_envelopes(&uuid).unwrap_or_default();
-    let meta = vigil_core::store::SessionStore::load_meta(&uuid).ok();
+    let result = tokio::task::spawn_blocking(move || build_session_detail_json(&uuid)).await;
+    let (status, json) = match result {
+        Ok(Some(json)) => (StatusCode::OK, json),
+        Ok(None) => (StatusCode::NOT_FOUND, "\"not found\"".to_string()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "\"error\"".to_string()),
+    };
+    (status, [(header::CONTENT_TYPE, "application/json")], json)
+}
+
+fn build_session_detail_json(uuid: &uuid::Uuid) -> Option<String> {
+    let meta = vigil_core::store::SessionStore::load_meta(uuid).ok()?;
+    let envelopes = vigil_core::store::SessionStore::load_envelopes(uuid).unwrap_or_default();
 
     let events: Vec<serde_json::Value> = envelopes.iter()
         .filter_map(|e| serde_json::to_value(e).ok())
         .collect();
 
-    let detail = if let Some(m) = meta {
-        SessionDetail {
-            id: m.session_id.to_string(),
-            name: m.name.clone(),
-            agent: m.agent.clone(),
-            status: if m.ended_at.is_some() { "completed".to_string() } else { "live".to_string() },
-            started_at: m.started_at.to_rfc3339(),
-            ended_at: m.ended_at.map(|t| t.to_rfc3339()),
-            cost_usd: m.total_cost_usd,
-            total_input_tokens: m.total_input_tokens,
-            total_output_tokens: m.total_output_tokens,
-            policy_violations: m.policy_violations,
-            event_count: events.len(),
-            events,
-        }
-    } else {
-        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "application/json")], "\"not found\"".to_string());
+    let detail = SessionDetail {
+        id: meta.session_id.to_string(),
+        name: meta.name.clone(),
+        agent: meta.agent.clone(),
+        status: if meta.ended_at.is_some() { "completed".to_string() } else { "live".to_string() },
+        started_at: meta.started_at.to_rfc3339(),
+        ended_at: meta.ended_at.map(|t| t.to_rfc3339()),
+        cost_usd: meta.total_cost_usd,
+        total_input_tokens: meta.total_input_tokens,
+        total_output_tokens: meta.total_output_tokens,
+        policy_violations: meta.policy_violations,
+        event_count: events.len(),
+        events,
     };
-
-    let json = serde_json::to_string(&detail).unwrap_or_else(|_| "{}".to_string());
-    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json)
+    serde_json::to_string(&detail).ok()
 }
 
 async fn api_session_events(
@@ -393,5 +400,165 @@ async fn api_approval_submit(
             (StatusCode::OK, if body.approved { "approved" } else { "rejected" }).into_response()
         }
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    fn test_state() -> (DashboardState, broadcast::Sender<TimestampedEvent>) {
+        let (tx, _) = broadcast::channel(16);
+        let approvals: PendingApprovals = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let token = "test-token-abc123".to_string();
+        let state = DashboardState { event_tx: tx.clone(), pending_approvals: approvals, token, port: 9999 };
+        (state, tx)
+    }
+
+    fn test_app(state: DashboardState) -> axum::Router {
+        let static_routes = Router::new()
+            .route("/", get(serve_index))
+            .route("/style.css", get(serve_css))
+            .route("/app.js", get(serve_js));
+
+        let api_routes = Router::new()
+            .route("/api/sessions", get(api_sessions))
+            .route("/api/events", get(api_events))
+            .route("/api/approvals", get(api_approvals_list))
+            .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+        Router::new()
+            .merge(static_routes)
+            .merge(api_routes)
+            .with_state(state)
+            .layer(middleware::from_fn(security_headers_middleware))
+    }
+
+    #[tokio::test]
+    async fn api_requires_token() {
+        let (state, _) = test_state();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(Request::get("/api/sessions").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_accepts_bearer_token() {
+        let (state, _) = test_state();
+        let token = state.token.clone();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/sessions")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Host", "127.0.0.1:9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn api_accepts_query_token() {
+        let (state, _) = test_state();
+        let token = state.token.clone();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::get(format!("/api/sessions?token={}", token))
+                    .header("Host", "127.0.0.1:9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn static_assets_no_token_required() {
+        let (state, _) = test_state();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn security_headers_present() {
+        let (state, _) = test_state();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("X-Frame-Options").unwrap(), "DENY");
+        assert_eq!(resp.headers().get("X-Content-Type-Options").unwrap(), "nosniff");
+        assert!(resp.headers().contains_key("Content-Security-Policy"));
+    }
+
+    #[tokio::test]
+    async fn wrong_host_rejected() {
+        let (state, _) = test_state();
+        let token = state.token.clone();
+        let app = test_app(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/sessions")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Host", "evil.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_returns_event_stream_content_type() {
+        use vigil_core::{Event, TimestampedEvent};
+
+        let (state, tx) = test_state();
+        let token = state.token.clone();
+        let app = test_app(state);
+
+        let session_id = uuid::Uuid::new_v4();
+        let _ = tx.send(TimestampedEvent::new(Event::FsRead {
+            path: "/tmp/test".to_string(),
+            session_id,
+        }));
+
+        let resp = app
+            .oneshot(
+                Request::get(format!("/api/events?token={}", token))
+                    .header("Host", "127.0.0.1:9999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap().to_str().unwrap(),
+            "text/event-stream"
+        );
     }
 }
