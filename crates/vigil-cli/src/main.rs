@@ -228,6 +228,17 @@ enum Commands {
         #[arg(long)]
         branch: Option<String>,
     },
+
+    /// Compare tool-call sequences of two sessions
+    Diff {
+        /// First session ID (UUID prefix or full)
+        session_a: String,
+        /// Second session ID (UUID prefix or full)
+        session_b: String,
+        /// Show only lines that differ (default: show context too)
+        #[arg(long)]
+        brief: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +671,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::CostReport { days, branch }) => {
             run_cost_report(days, branch.as_deref())?;
+        }
+        Some(Commands::Diff { session_a, session_b, brief }) => {
+            run_diff(&session_a, &session_b, brief)?;
         }
     }
 
@@ -3169,6 +3183,222 @@ fn run_cost_report(days: u64, branch_filter: Option<&str>) -> anyhow::Result<()>
         "  Total across {} session(s): ${:.4}",
         rows.len(),
         grand_total
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil diff
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct TraceEntry {
+    seq: usize,
+    tool_name: String,
+    input_digest: String,
+}
+
+enum DiffLine {
+    Same(TraceEntry),
+    OnlyA(TraceEntry),
+    OnlyB(TraceEntry),
+}
+
+fn lcs_diff(a: &[TraceEntry], b: &[TraceEntry]) -> Vec<DiffLine> {
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            if a[i - 1].tool_name == b[j - 1].tool_name
+                && a[i - 1].input_digest == b[j - 1].input_digest
+            {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        if i > 0
+            && j > 0
+            && a[i - 1].tool_name == b[j - 1].tool_name
+            && a[i - 1].input_digest == b[j - 1].input_digest
+        {
+            result.push(DiffLine::Same(a[i - 1].clone()));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            result.push(DiffLine::OnlyB(b[j - 1].clone()));
+            j -= 1;
+        } else {
+            result.push(DiffLine::OnlyA(a[i - 1].clone()));
+            i -= 1;
+        }
+    }
+    result.reverse();
+    result
+}
+
+/// Resolve a session ID that may be a full UUID, a UUID prefix, or a name label.
+/// Prefix matching scans Session::list_all() and matches id.to_string().starts_with(prefix).
+fn resolve_session_id_or_prefix(s: &str) -> anyhow::Result<uuid::Uuid> {
+    // Try full UUID parse first.
+    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+        return Ok(uuid);
+    }
+    // Scan all sessions for prefix or name match.
+    let summaries = Session::list_all()?;
+    let lower = s.to_lowercase();
+    // Prefix match on the UUID string
+    let prefix_matches: Vec<_> = summaries
+        .iter()
+        .filter(|ss| ss.id.to_string().starts_with(s))
+        .collect();
+    if prefix_matches.len() == 1 {
+        return Ok(prefix_matches[0].id);
+    }
+    if prefix_matches.len() > 1 {
+        anyhow::bail!(
+            "Ambiguous session prefix {:?} — {} sessions match. Use more characters.",
+            s,
+            prefix_matches.len()
+        );
+    }
+    // Name match (case-insensitive)
+    let name_matches: Vec<_> = summaries
+        .iter()
+        .filter(|ss| {
+            ss.name
+                .as_deref()
+                .map(|n| n.to_lowercase() == lower)
+                .unwrap_or(false)
+        })
+        .collect();
+    if name_matches.len() == 1 {
+        return Ok(name_matches[0].id);
+    }
+    anyhow::bail!("No session found with ID, prefix, or name {:?}", s);
+}
+
+fn run_diff(a_arg: &str, b_arg: &str, brief: bool) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::IsTerminal;
+    use vigil_core::event::Event;
+
+    // Resolve session IDs (full UUID, prefix, or name).
+    let uuid_a = resolve_session_id_or_prefix(a_arg)?;
+    let uuid_b = resolve_session_id_or_prefix(b_arg)?;
+
+    // Load metadata for header display.
+    let meta_a = vigil_core::store::SessionStore::load_meta(&uuid_a).ok();
+    let meta_b = vigil_core::store::SessionStore::load_meta(&uuid_b).ok();
+
+    let label_a = meta_a
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| {
+            meta_a
+                .as_ref()
+                .map(|m| m.started_at.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| uuid_a.to_string())
+        });
+    let label_b = meta_b
+        .as_ref()
+        .and_then(|m| m.name.clone())
+        .unwrap_or_else(|| {
+            meta_b
+                .as_ref()
+                .map(|m| m.started_at.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| uuid_b.to_string())
+        });
+
+    let id_short_a = &uuid_a.to_string()[..8];
+    let id_short_b = &uuid_b.to_string()[..8];
+
+    // Load envelopes and build traces.
+    let envs_a = vigil_core::store::SessionStore::load_envelopes(&uuid_a)
+        .with_context(|| format!("Cannot load session {}", uuid_a))?;
+    let envs_b = vigil_core::store::SessionStore::load_envelopes(&uuid_b)
+        .with_context(|| format!("Cannot load session {}", uuid_b))?;
+
+    let build_trace = |envs: &[vigil_core::envelope::Envelope]| -> Vec<TraceEntry> {
+        let mut seq = 0usize;
+        envs.iter()
+            .filter_map(|env| {
+                if let Event::ToolCall { tool_name, input, .. } = &env.event {
+                    let input_bytes = serde_json::to_vec(input).unwrap_or_default();
+                    let digest = hex::encode(Sha256::digest(&input_bytes));
+                    let entry = TraceEntry {
+                        seq,
+                        tool_name: tool_name.clone(),
+                        input_digest: digest[..8].to_string(),
+                    };
+                    seq += 1;
+                    Some(entry)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let trace_a = build_trace(&envs_a);
+    let trace_b = build_trace(&envs_b);
+
+    let diff = lcs_diff(&trace_a, &trace_b);
+
+    // Determine colour support.
+    let use_color = std::io::stdout().is_terminal();
+    let red = if use_color { "\x1b[31m" } else { "" };
+    let green = if use_color { "\x1b[32m" } else { "" };
+    let reset = if use_color { "\x1b[0m" } else { "" };
+
+    // Print header.
+    println!("--- session-a: {} ({})", id_short_a, label_a);
+    println!("+++ session-b: {} ({})", id_short_b, label_b);
+
+    // Counters for summary.
+    let mut same_count = 0usize;
+    let mut only_a = 0usize;
+    let mut only_b = 0usize;
+
+    for line in &diff {
+        match line {
+            DiffLine::Same(e) => {
+                same_count += 1;
+                if !brief {
+                    println!("  [{}] {} ({})", e.seq, e.tool_name, e.input_digest);
+                }
+            }
+            DiffLine::OnlyA(e) => {
+                only_a += 1;
+                println!(
+                    "{}- [{}] {} ({}){}",
+                    red, e.seq, e.tool_name, e.input_digest, reset
+                );
+            }
+            DiffLine::OnlyB(e) => {
+                only_b += 1;
+                println!(
+                    "{}+ [{}] {} ({}){}",
+                    green, e.seq, e.tool_name, e.input_digest, reset
+                );
+            }
+        }
+    }
+
+    // Footer summary.
+    println!(
+        "--- {} tool calls in session-a, {} in session-b, {} in common, {} added, {} removed",
+        trace_a.len(),
+        trace_b.len(),
+        same_count,
+        only_b,
+        only_a,
     );
 
     Ok(())
