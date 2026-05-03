@@ -23,6 +23,8 @@ pub struct VigilConfig {
     pub notify: NotifySection,
     #[serde(default)]
     pub drift: DriftSection,
+    #[serde(default)]
+    pub report: Option<ReportConfig>,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -124,6 +126,22 @@ pub struct DriftSection {
     pub stall_threshold: Option<usize>,
     #[serde(default)]
     pub debounce_events: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct ReportConfig {
+    /// Turns before first FsWrite to warn (default: 5)
+    pub turn_to_first_write_warn: Option<u32>,
+    /// Turns before first FsWrite to flag (default: 15)
+    pub turn_to_first_write_flag: Option<u32>,
+    /// Input token growth multiplier to warn (default: 1.5)
+    pub input_growth_warn_multiplier: Option<f64>,
+    /// Input token growth multiplier to flag (default: 2.0)
+    pub input_growth_flag_multiplier: Option<f64>,
+    /// Re-read count per path to warn (default: 2)
+    pub reread_warn_count: Option<u32>,
+    /// Re-read count per path to flag (default: 3)
+    pub reread_flag_count: Option<u32>,
 }
 
 impl DriftSection {
