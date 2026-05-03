@@ -17,3 +17,4 @@ vigil-core = { path = "../vigil-core" }
 tracing = "0.1"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
