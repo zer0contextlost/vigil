@@ -26,3 +26,4 @@ vigil-core = { path = "../vigil-core" }
 tracing = { workspace = true }
 flate2 = "1.0"
 base64 = "0.22"
+similar = "2.0"

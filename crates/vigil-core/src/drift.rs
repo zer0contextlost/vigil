@@ -317,6 +317,7 @@ mod tests {
             last_user_message: None,
             system_prompt: None,
             raw_request: None,
+            turn_number: 0,
         }
     }
 
@@ -332,6 +333,7 @@ mod tests {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             raw_response: None,
+            stop_reason: None,
         }
     }
 
@@ -401,7 +403,7 @@ mod tests {
         let sid = Uuid::new_v4();
         let mut d = DriftDetector::new();
         for _ in 0..4 { d.check(&req(sid)); }
-        d.check(&Event::FsWrite { path: "src/x.rs".into(), bytes: 10, session_id: sid });
+        d.check(&Event::FsWrite { path: "src/x.rs".into(), bytes: 10, session_id: sid, lines_added: 0, lines_removed: 0, hunk_count: 0 });
         assert!(d.check(&req(sid)).is_none());
     }
 
@@ -409,7 +411,7 @@ mod tests {
     fn self_contradiction_fires_on_negated_written_path() {
         let sid = Uuid::new_v4();
         let mut d = DriftDetector::new();
-        d.check(&Event::FsWrite { path: "src/drift.rs".into(), bytes: 10, session_id: sid });
+        d.check(&Event::FsWrite { path: "src/drift.rs".into(), bytes: 10, session_id: sid, lines_added: 0, lines_removed: 0, hunk_count: 0 });
         let text = "I haven't created drift.rs yet, would you like me to?".to_string();
         let alert = d.check(&resp(sid, 50, Some(text))).expect("contradiction must fire");
         assert_eq!(alert.signal, DriftSignal::SelfContradiction);
@@ -419,7 +421,7 @@ mod tests {
     fn self_contradiction_no_false_positive_on_unrelated_negation() {
         let sid = Uuid::new_v4();
         let mut d = DriftDetector::new();
-        d.check(&Event::FsWrite { path: "src/drift.rs".into(), bytes: 10, session_id: sid });
+        d.check(&Event::FsWrite { path: "src/drift.rs".into(), bytes: 10, session_id: sid, lines_added: 0, lines_removed: 0, hunk_count: 0 });
         let text = "I haven't tested edge cases yet.".to_string();
         assert!(d.check(&resp(sid, 50, Some(text))).is_none());
     }
@@ -448,6 +450,7 @@ mod tests {
             input: json!({}),
             session_id: sid,
             tool_use_id: None,
+            correlation_id: None,
         });
         let text = "I never used WebFetch in this session.".to_string();
         let alert = d.check(&resp(sid, 50, Some(text))).expect("must fire on tool contradiction");
@@ -518,7 +521,7 @@ mod tests {
 
         // FsWrite resets the counter (debounce tick happens inside each check call,
         // so after 1 event the stall debounce is back to 0).
-        d.check(&Event::FsWrite { path: "src/new.rs".into(), bytes: 100, session_id: sid });
+        d.check(&Event::FsWrite { path: "src/new.rs".into(), bytes: 100, session_id: sid, lines_added: 0, lines_removed: 0, hunk_count: 0 });
 
         // Re-accumulate: 3 more consecutive requests should re-fire the stall.
         d.check(&req(sid));

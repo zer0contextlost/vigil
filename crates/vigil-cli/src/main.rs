@@ -1538,6 +1538,7 @@ pub async fn run_proxy_mode(
                         let blocked = TimestampedEvent::new(Event::ToolCallResult {
                             agent: agent.clone(), tool_name: tool_name.clone(),
                             blocked: true, session_id: *session_id,
+                            correlation_id: None, duration_ms: None, is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
                         filtered_tx.send(blocked).await.ok();
@@ -1561,6 +1562,7 @@ pub async fn run_proxy_mode(
                             let blocked = TimestampedEvent::new(Event::ToolCallResult {
                                 agent: agent.clone(), tool_name: tool_name.clone(),
                                 blocked: true, session_id: *session_id,
+                                correlation_id: None, duration_ms: None, is_error: false,
                             });
                             plugin_host_filter.dispatch_event(&ctx, &blocked).await;
                             filtered_tx.send(blocked).await.ok();
@@ -2253,6 +2255,9 @@ pub async fn run_agent_with_plugins(
                             tool_name: tool_name.clone(),
                             blocked: true,
                             session_id: *session_id,
+                            correlation_id: None,
+                            duration_ms: None,
+                            is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
                         filtered_tx.send(blocked).await.ok();
@@ -2287,6 +2292,9 @@ pub async fn run_agent_with_plugins(
                                 tool_name: tool_name.clone(),
                                 blocked: true,
                                 session_id: *session_id,
+                                correlation_id: None,
+                                duration_ms: None,
+                                is_error: false,
                             });
                             plugin_host_filter.dispatch_event(&ctx, &blocked).await;
                             filtered_tx.send(blocked).await.ok();
