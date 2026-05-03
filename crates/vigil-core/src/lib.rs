@@ -33,7 +33,7 @@ pub use pii::{scan as scan_pii, scan_watchlist, PiiMatch};
 pub use policy::{Policy, PolicyAction, PolicyConfig, PolicyDecision, PolicyEngine, PolicyMatcher};
 pub use pricing::PricingTable;
 pub use risk::{RiskLevel, RiskScore, score_write};
-pub use provider::{ProviderKind, cost_usd, detect_provider_from_host, ProviderAdapter, AnthropicAdapter, OpenAiAdapter};
+pub use provider::{ProviderKind, cost_usd, detect_provider_from_host, ProviderAdapter, AnthropicAdapter, GeminiAdapter, OpenAiAdapter};
 pub use scanner::{RegexScanner, Scanner, ScannerChain, WatchlistScanner};
 pub use session::{Session, SessionSummary};
 pub use notify::WebhookNotifier;

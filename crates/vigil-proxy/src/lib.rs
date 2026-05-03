@@ -9,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
-use vigil_core::{scan_for_injection, scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host, AnthropicAdapter, ProviderAdapter};
+use vigil_core::{scan_for_injection, scan_pii, scan_watchlist, Event, TimestampedEvent, ProviderKind, detect_provider_from_host, AnthropicAdapter, GeminiAdapter, ProviderAdapter};
 
 const MAX_HEADER_SIZE: usize = 65536;
 const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
@@ -352,6 +352,14 @@ async fn handle_http_request(
     Ok(())
 }
 
+/// Extract the model name from a Gemini request path.
+/// e.g. "/v1beta/models/gemini-3-flash:streamGenerateContent" → "gemini-3-flash"
+fn extract_gemini_model_from_path(path: &str) -> Option<String> {
+    let after = path.split("/models/").nth(1)?;
+    let model = after.split(':').next()?;
+    if model.is_empty() { None } else { Some(model.to_string()) }
+}
+
 /// Reverse proxy: forward request to upstream Anthropic/OpenAI over HTTPS,
 /// stream the response back to the client, and emit vigil events.
 async fn handle_reverse_proxy(
@@ -369,8 +377,16 @@ async fn handle_reverse_proxy(
     // Determine upstream base URL and provider label.
     // upstream_override routes all requests to a test/custom server.
     let routing = if let Some(ov) = &config.upstream_override {
-        let p = if path.contains("/messages") { "anthropic" } else { "openai" };
+        let p = if path.contains("/messages") {
+            "anthropic"
+        } else if path.contains("/v1beta/models/") && (path.contains(":streamGenerateContent") || path.contains(":generateContent")) {
+            "gemini"
+        } else {
+            "openai"
+        };
         Some((ov.as_str(), p))
+    } else if path.contains("/v1beta/models/") && (path.contains(":streamGenerateContent") || path.contains(":generateContent")) {
+        Some(("https://generativelanguage.googleapis.com", "gemini"))
     } else if path.contains("/messages") || path.contains("/v1/messages") {
         Some(("https://api.anthropic.com", "anthropic"))
     } else if path.contains("/chat/completions") || path.contains("/v1/chat") {
@@ -474,13 +490,29 @@ async fn handle_reverse_proxy(
                 let model = j
                     .get("model")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        // For Gemini, extract model from the path if not in body
+                        if provider == "gemini" {
+                            extract_gemini_model_from_path(&clean_path)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
                 let last_user_message = extract_last_user_message(&j);
                 let system_prompt = extract_system_prompt(&j);
                 (model, last_user_message, system_prompt)
             })
-            .unwrap_or_else(|_| ("unknown".to_string(), None, None));
+            .unwrap_or_else(|_| {
+                // If body parsing fails and we're Gemini, still try to extract from path
+                let model = if provider == "gemini" {
+                    extract_gemini_model_from_path(&clean_path).unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    "unknown".to_string()
+                };
+                (model, None, None)
+            });
 
     // Scan the outgoing user message and system prompt for PII.
     {
@@ -605,6 +637,12 @@ struct SseState {
     holding_tool_idx: Option<usize>,
     /// Set at content_block_stop when the completed tool is a write tool.
     pending_approval_data: Option<(String, Value)>,
+    /// Gemini: synthetic block index counter (Gemini has no native block index).
+    gemini_next_block_idx: usize,
+    /// Gemini: index of the currently open function-call block, if any.
+    gemini_active_call_idx: Option<usize>,
+    /// Gemini: set to true when finishReason is non-empty, indicating stream end.
+    gemini_finished: bool,
 }
 
 async fn stream_sse_response(
@@ -667,6 +705,13 @@ async fn stream_sse_response(
                                 if let Ok(event_json) = serde_json::from_str::<Value>(&data) {
                                     match provider {
                                         "openai" | "openrouter" => process_openai_sse_event(
+                                            &event_json,
+                                            &mut state,
+                                            session_id,
+                                            event_tx,
+                                            pii_watchlist,
+                                        ),
+                                        "gemini" => process_gemini_sse_event(
                                             &event_json,
                                             &mut state,
                                             session_id,
@@ -848,7 +893,7 @@ async fn stream_sse_response(
         let _ = client_conn.flush().await;
     }
 
-    if state.output_tokens > 0 || state.input_tokens > 0 {
+    if state.output_tokens > 0 || state.input_tokens > 0 || state.gemini_finished {
         let cost = cost_usd_with_cache(&state.model, state.input_tokens, state.output_tokens, state.cache_read_input_tokens, state.cache_creation_input_tokens);
         tracing::info!(
             model = %state.model,
@@ -1103,6 +1148,142 @@ fn process_openai_sse_event(
             state.output_tokens = ct as u32;
         }
     }
+}
+
+fn process_gemini_sse_event(
+    event_json: &Value,
+    state: &mut SseState,
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<TimestampedEvent>,
+    pii_watchlist: &[String],
+) {
+    // Token counts: last-write-wins; only present on final chunk.
+    if let Some(usage) = event_json.get("usageMetadata") {
+        if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
+            state.input_tokens = pt as u32;
+        }
+        if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
+            state.output_tokens = ct as u32;
+        }
+    }
+
+    let candidate = match event_json
+        .get("candidates")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+    {
+        Some(c) => c,
+        None => return,
+    };
+
+    if let Some(parts) = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+    {
+        for part in parts {
+            // Skip thinking/reasoning text (Gemini 2.5+ chain-of-thought).
+            if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+
+            // Text part.
+            if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                const MAX_RESPONSE_TEXT: usize = 1024 * 1024;
+                if state.response_text_bytes + text.len() <= MAX_RESPONSE_TEXT {
+                    state.response_text.push_str(text);
+                    state.response_text_bytes += text.len();
+                }
+                continue;
+            }
+
+            // Function call part.
+            if let Some(fc) = part.get("functionCall") {
+                let idx = match state.gemini_active_call_idx {
+                    Some(i) => i,
+                    None => {
+                        let i = state.gemini_next_block_idx;
+                        state.gemini_next_block_idx += 1;
+                        state.gemini_active_call_idx = Some(i);
+                        let name = fc
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        state.block_name.insert(i, name);
+                        state.block_type.insert(i, "tool_use".to_string());
+                        state.block_input.insert(i, String::new());
+                        i
+                    }
+                };
+
+                // partialArgs is a streaming delta (concat); args is a snapshot (overwrite).
+                if let Some(partial) = fc.get("partialArgs").and_then(|v| v.as_str()) {
+                    state.block_input.entry(idx).or_default().push_str(partial);
+                } else if let Some(args) = fc.get("args") {
+                    let s = serde_json::to_string(args).unwrap_or_default();
+                    state.block_input.insert(idx, s);
+                }
+
+                let will_continue = fc
+                    .get("willContinue")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !will_continue {
+                    flush_gemini_call(state, idx, session_id, event_tx, pii_watchlist);
+                    state.gemini_active_call_idx = None;
+                }
+            }
+        }
+    }
+
+    // End-of-stream signal.
+    if let Some(reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
+        if !reason.is_empty() {
+            // Defensive flush: close any still-open call.
+            if let Some(idx) = state.gemini_active_call_idx.take() {
+                flush_gemini_call(state, idx, session_id, event_tx, pii_watchlist);
+            }
+            state.gemini_finished = true;
+        }
+    }
+}
+
+fn flush_gemini_call(
+    state: &mut SseState,
+    idx: usize,
+    session_id: Uuid,
+    event_tx: &mpsc::Sender<TimestampedEvent>,
+    pii_watchlist: &[String],
+) {
+    let raw_name = state.block_name.remove(&idx).unwrap_or_else(|| "unknown".to_string());
+    let input_str = state.block_input.remove(&idx).unwrap_or_default();
+    let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
+    state.block_type.remove(&idx);
+
+    // Canonicalize Gemini tool names so downstream pipeline (fs-events, drift, exfil)
+    // sees the same names it expects from Claude Code ("Write", "Edit", "Read", etc.).
+    let tool_name = GeminiAdapter.canonical_tool_name(&raw_name).to_string();
+
+    emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
+    emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
+
+    // Write-approval gate: set hold if this is a write tool.
+    // NOTE: unlike Anthropic, the current SSE chunk has already been forwarded
+    // by the time we detect the tool name here. Subsequent chunks are held.
+    if GeminiAdapter.write_tools().iter().any(|t| raw_name.eq_ignore_ascii_case(t)) {
+        state.pending_approval_data = Some((tool_name.clone(), input.clone()));
+        state.holding = true;
+        state.holding_tool_idx = Some(idx);
+    }
+
+    let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
+        agent: "gemini".to_string(),
+        tool_name,
+        input,
+        session_id,
+        tool_use_id: None,
+    }));
 }
 
 fn emit_pii_alert_if_found(
@@ -1596,6 +1777,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_extract_gemini_model_from_path() {
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/gemini-3-flash:streamGenerateContent"),
+            Some("gemini-3-flash".to_string())
+        );
+        assert_eq!(
+            extract_gemini_model_from_path("/v1beta/models/gemini-2.5-flash-lite:generateContent"),
+            Some("gemini-2.5-flash-lite".to_string())
+        );
+        assert_eq!(extract_gemini_model_from_path("/v1/messages"), None);
+        assert_eq!(extract_gemini_model_from_path(""), None);
+    }
+
+    #[test]
     fn test_detect_provider_anthropic() {
         assert_eq!(detect_provider("api.anthropic.com"), Some("anthropic"));
     }
@@ -1676,6 +1871,123 @@ mod tests {
                 h
             );
         }
+    }
+
+    // ── Gemini SSE state machine tests ─────────────────────────────────────
+
+    fn make_gemini_text_chunk(text: &str) -> Value {
+        json!({
+            "candidates": [{
+                "content": {"parts": [{"text": text}], "role": "model"}
+            }]
+        })
+    }
+
+    fn make_gemini_tool_chunk(name: &str, args: Value, will_continue: bool) -> Value {
+        json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"functionCall": {"name": name, "args": args, "willContinue": will_continue}}],
+                    "role": "model"
+                }
+            }]
+        })
+    }
+
+    fn make_gemini_final_chunk(finish_reason: &str, prompt_tokens: u32, candidate_tokens: u32) -> Value {
+        json!({
+            "candidates": [{"content": {"parts": [], "role": "model"}, "finishReason": finish_reason}],
+            "usageMetadata": {"promptTokenCount": prompt_tokens, "candidatesTokenCount": candidate_tokens}
+        })
+    }
+
+    #[test]
+    fn gemini_text_accumulates_in_response_text() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        process_gemini_sse_event(&make_gemini_text_chunk("hello "), &mut state, sid, &tx, &[]);
+        process_gemini_sse_event(&make_gemini_text_chunk("world"), &mut state, sid, &tx, &[]);
+        assert_eq!(state.response_text, "hello world");
+    }
+
+    #[test]
+    fn gemini_token_counts_extracted_from_final_chunk() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        process_gemini_sse_event(&make_gemini_text_chunk("hello"), &mut state, sid, &tx, &[]);
+        process_gemini_sse_event(&make_gemini_final_chunk("STOP", 10, 5), &mut state, sid, &tx, &[]);
+        assert_eq!(state.input_tokens, 10);
+        assert_eq!(state.output_tokens, 5);
+        assert!(state.gemini_finished);
+    }
+
+    #[test]
+    fn gemini_tool_call_emits_event() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let chunk = make_gemini_tool_chunk("read_file", json!({"path": "/foo.rs"}), false);
+        process_gemini_sse_event(&chunk, &mut state, sid, &tx, &[]);
+        drop(tx);
+        // Should have emitted a ToolCall event with canonical name "Read"
+        let mut events = vec![];
+        let mut rx = rx;
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        assert!(events.iter().any(|e| matches!(&e.event, Event::ToolCall { tool_name, .. } if tool_name == "Read")));
+    }
+
+    #[test]
+    fn gemini_tool_call_canonical_write_file_sets_hold() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let chunk = make_gemini_tool_chunk("write_file", json!({"path": "/out.rs", "content": "fn main(){}"}), false);
+        process_gemini_sse_event(&chunk, &mut state, sid, &tx, &[]);
+        assert!(state.holding, "write_file should set state.holding");
+        assert!(state.pending_approval_data.is_some());
+    }
+
+    #[test]
+    fn gemini_safety_finish_sets_gemini_finished_with_zero_tokens() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        process_gemini_sse_event(&make_gemini_final_chunk("SAFETY", 0, 0), &mut state, sid, &tx, &[]);
+        assert!(state.gemini_finished);
+        assert_eq!(state.input_tokens, 0);
+    }
+
+    #[test]
+    fn gemini_thought_parts_not_added_to_response_text() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-2.5-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let chunk = json!({
+            "candidates": [{"content": {"parts": [
+                {"thought": true, "text": "reasoning..."},
+                {"text": "answer"}
+            ], "role": "model"}}]
+        });
+        process_gemini_sse_event(&chunk, &mut state, sid, &tx, &[]);
+        assert_eq!(state.response_text, "answer");
+        assert!(!state.response_text.contains("reasoning"));
+    }
+
+    #[test]
+    fn gemini_two_sequential_tool_calls_get_distinct_indices() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut state = SseState { model: "gemini-3-flash".to_string(), ..Default::default() };
+        let sid = Uuid::new_v4();
+        let c1 = make_gemini_tool_chunk("read_file",  json!({"path": "/a.rs"}), false);
+        let c2 = make_gemini_tool_chunk("write_file", json!({"path": "/b.rs", "content": "x"}), false);
+        process_gemini_sse_event(&c1, &mut state, sid, &tx, &[]);
+        process_gemini_sse_event(&c2, &mut state, sid, &tx, &[]);
+        assert_eq!(state.gemini_next_block_idx, 2);
+        assert!(state.gemini_active_call_idx.is_none());
     }
 }
 
