@@ -142,4 +142,12 @@ pub enum Event {
         details: String,
         session_id: Uuid,
     },
+    /// Emitted when a Task tool call is observed, incrementing the session-level
+    /// sub-agent depth counter. Depth is the total Task invocation count so far
+    /// (not a true call-stack depth — vigil doesn't track returns).
+    SubAgentSpawned {
+        session_id: Uuid,
+        depth: u32,
+        tool_name: String,
+    },
 }

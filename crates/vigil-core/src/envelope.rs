@@ -84,6 +84,7 @@ fn extract_session_id(event: &Event) -> Uuid {
         | Event::ToolTimeout { session_id, .. }
         | Event::CostAlert { session_id, .. }
         | Event::SessionDurationAlert { session_id, .. }
-        | Event::DriftAlert { session_id, .. } => *session_id,
+        | Event::DriftAlert { session_id, .. }
+        | Event::SubAgentSpawned { session_id, .. } => *session_id,
     }
 }

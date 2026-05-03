@@ -95,7 +95,7 @@ vigil export <session-id> --output redacted.ndjson
 | `DENY / OK` | Policy decisions on tool calls |
 | `READ / WRIT` | File reads and writes inferred from tool call parameters |
 | `PROC` | Child processes spawned by the agent |
-| `MCP` | MCP server tool calls via vigil-mcp-shim |
+| `MCP` | MCP server tool calls via vigil-mcp-shim (planned) |
 | `PII!` | PII detections (regex + custom watchlist) |
 | `BURN` | Burn-rate alarm: $/min exceeded threshold |
 | `LOOP` | Loop detection: same tool+input repeated N times |
@@ -298,15 +298,15 @@ output_per_million = 15.0
 
 Patterns match as case-insensitive substrings. Put more-specific patterns first.
 
-## MCP shim
+## MCP shim (planned, coming in v0.4)
 
-To intercept MCP server tool calls, replace your MCP server command with `vigil-mcp-shim`:
+MCP server interception via `vigil-mcp-shim` is not yet functional. When complete, you will be able to replace your MCP server command with `vigil-mcp-shim` to intercept tool calls:
 
 ```bash
 vigil-mcp-shim --session-id <uuid> --ndjson ~/.vigil/sessions/<uuid>.ndjson <real-server> [args]
 ```
 
-All `tools/call` requests are PII-scanned and logged as `McpCall` events.
+All `tools/call` requests will be PII-scanned and logged as `McpCall` events.
 
 ## Architecture
 
@@ -319,7 +319,7 @@ Seven Rust crates:
 | `vigil-core` | Event types, Envelope/hash chain, SessionStore, ed25519 signing, VigilConfig, BudgetEnforcer, PricingTable, PolicyEngine, PII scanner, PluginHost |
 | `vigil-tui` | ratatui dashboard, session browser, replay |
 | `vigil-watch` | Process tree monitor (sysinfo) — tracks child processes spawned by the agent |
-| `vigil-mcp` | vigil-mcp-shim binary for stdio JSON-RPC MCP servers |
+| `vigil-mcp` | vigil-mcp-shim binary for stdio JSON-RPC MCP servers (coming in v0.4) |
 | `vigil-plugin` | Plugin SDK — `VigilPlugin` trait, `declare_plugin!` macro, ABI versioning |
 
 Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877` in the agent's environment. The proxy forwards to the real API over TLS.

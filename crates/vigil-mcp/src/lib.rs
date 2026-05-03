@@ -1,3 +1,9 @@
+//! vigil-mcp — MCP proxy server (work in progress, not yet functional).
+//!
+//! This crate will become an MCP server that intercepts tool calls for
+//! Claude Desktop and other MCP-aware clients. See DESIGN_NOTES.md for
+//! the architecture plan.
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

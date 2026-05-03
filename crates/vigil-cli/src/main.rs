@@ -218,6 +218,16 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Show cost breakdown by branch and day
+    CostReport {
+        /// Only show sessions newer than this many days (default: 30)
+        #[arg(long, default_value = "30")]
+        days: u64,
+        /// Filter by branch name (substring match)
+        #[arg(long)]
+        branch: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +657,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Clear { yes }) => {
             run_clear(yes)?;
+        }
+        Some(Commands::CostReport { days, branch }) => {
+            run_cost_report(days, branch.as_deref())?;
         }
     }
 
@@ -1113,6 +1126,43 @@ async fn run_agent(
     run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None).await
 }
 
+/// Read a user-scoped (non-inherited) environment variable from the Windows registry.
+/// Falls back to the process env on non-Windows or if registry read fails.
+fn get_user_env_var(name: &str) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Read from HKCU\Environment — the user-level persistent env vars
+        // Use the winreg crate if available, otherwise shell out to reg.exe
+        let output = std::process::Command::new("reg")
+            .args(["query", r"HKCU\Environment", "/v", name])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // reg query output format: "    NAME    REG_SZ    value"
+            for line in stdout.lines() {
+                let line = line.trim();
+                if line.starts_with(name) {
+                    let parts: Vec<&str> = line.splitn(3, "    ").collect();
+                    if parts.len() >= 3 {
+                        return Some(parts[2].trim().to_string());
+                    }
+                    // Sometimes it's tab-separated
+                    let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                    if parts.len() >= 3 {
+                        return Some(parts[2].trim().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var(name).ok()
+    }
+}
+
 /// Start the proxy and TUI without spawning an agent process.
 /// Use this with IDEs (Cursor, etc.) that connect to vigil via their own
 /// "Override Base URL" setting rather than being launched by vigil.
@@ -1209,11 +1259,33 @@ pub async fn run_proxy_mode(
     println!("  Anthropic: ANTHROPIC_BASE_URL=http://127.0.0.1:{}", port);
     println!("  OpenAI:    OPENAI_BASE_URL=http://127.0.0.1:{}", port);
     println!("  Cursor:    Settings > Models > Override OpenAI Base URL = http://127.0.0.1:{}/v1", port);
+    println!("  Permanent (Claude Desktop): setx ANTHROPIC_BASE_URL http://127.0.0.1:{}", port);
     println!();
+
+    // Claude Desktop / system-level routing hint
+    let user_base_url = get_user_env_var("ANTHROPIC_BASE_URL");
+    match user_base_url.as_deref() {
+        Some(url) if url.contains(&port.to_string()) => {
+            println!("[vigil] ANTHROPIC_BASE_URL is set system-wide → Claude Desktop should route here.");
+            println!("[vigil] If Desktop is already running, restart it to pick up the change.");
+        }
+        Some(url) => {
+            println!("[vigil] ANTHROPIC_BASE_URL is set to {} (not this proxy). Override it:", url);
+            println!("[vigil]   setx ANTHROPIC_BASE_URL http://127.0.0.1:{}", port);
+        }
+        None => {
+            println!("[vigil] To route Claude Desktop here, run (then restart Desktop):");
+            println!("[vigil]   setx ANTHROPIC_BASE_URL http://127.0.0.1:{}", port);
+            println!("[vigil] To clear it later: setx ANTHROPIC_BASE_URL \"\"");
+        }
+    }
+    println!();
+
     println!("Press 'q' in the dashboard to stop.");
     println!();
 
     let loop_threshold = config.as_ref().and_then(|c| c.budget.loop_detect_threshold).unwrap_or(5);
+    let sub_agent_depth_limit_proxy = config.as_ref().and_then(|c| c.budget.max_sub_agent_depth);
     let drift_cfg_proxy = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
     let plugin_host_filter = plugin_host.clone();
     let engine_clone = engine.clone();
@@ -1221,6 +1293,7 @@ pub async fn run_proxy_mode(
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
         let mut cred_tracker = CredentialTracker::new();
+        let mut sub_agent_depth: u32 = 0;
         while let Some(event) = raw_rx.recv().await {
             if let Event::FsRead { path, .. } = &event.event {
                 if let Ok(content) = std::fs::read_to_string(path) {
@@ -1238,6 +1311,24 @@ pub async fn run_proxy_mode(
                     plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Loop, &detail).await;
                     plugin_host_filter.dispatch_event(&ctx, &alert).await;
                     filtered_tx.send(alert).await.ok();
+                }
+                if tool_name == "Task" {
+                    sub_agent_depth = sub_agent_depth.saturating_add(1);
+                    let spawn_event = TimestampedEvent::new(Event::SubAgentSpawned {
+                        session_id: *sid,
+                        depth: sub_agent_depth,
+                        tool_name: tool_name.clone(),
+                    });
+                    let ctx = make_plugin_ctx(*sid);
+                    plugin_host_filter.dispatch_event(&ctx, &spawn_event).await;
+                    filtered_tx.send(spawn_event).await.ok();
+                    if let Some(max) = sub_agent_depth_limit_proxy {
+                        if sub_agent_depth > max {
+                            tracing::warn!(depth = sub_agent_depth, max, "sub-agent depth limit exceeded");
+                            eprintln!("[SUB-AGENT] Depth {} exceeds limit {} — stopping", sub_agent_depth, max);
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1398,6 +1489,7 @@ pub async fn run_agent_with_plugins(
     let loop_threshold = config.as_ref()
         .and_then(|c| c.budget.loop_detect_threshold)
         .unwrap_or(5);
+    let sub_agent_depth_limit_agent = config.as_ref().and_then(|c| c.budget.max_sub_agent_depth);
     let drift_cfg_agent = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
     let tool_timeout_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_secs);
     let tool_timeout_kill_secs = config.as_ref().and_then(|c| c.proxy.tool_timeout_kill_secs);
@@ -1622,6 +1714,7 @@ pub async fn run_agent_with_plugins(
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_agent);
         let mut cred_tracker = CredentialTracker::new();
+        let mut sub_agent_depth: u32 = 0;
         while let Some(event) = raw_rx.recv().await {
             // Tool timeout tracking: arm on ToolCall, disarm on LlmRequest
             if let Event::ToolCall { tool_name, .. } = &event.event {
@@ -1816,6 +1909,24 @@ pub async fn run_agent_with_plugins(
                             s.needs_attention = true;
                             s.last_event = "LOOP".to_string();
                         });
+                    }
+                }
+                if tool_name == "Task" {
+                    sub_agent_depth = sub_agent_depth.saturating_add(1);
+                    let spawn_event = TimestampedEvent::new(Event::SubAgentSpawned {
+                        session_id: *sid,
+                        depth: sub_agent_depth,
+                        tool_name: tool_name.clone(),
+                    });
+                    let ctx = make_plugin_ctx(*sid);
+                    plugin_host_filter.dispatch_event(&ctx, &spawn_event).await;
+                    filtered_tx.send(spawn_event).await.ok();
+                    if let Some(max) = sub_agent_depth_limit_agent {
+                        if sub_agent_depth > max {
+                            tracing::warn!(depth = sub_agent_depth, max, "sub-agent depth limit exceeded");
+                            eprintln!("[SUB-AGENT] Depth {} exceeds limit {} — stopping", sub_agent_depth, max);
+                            break;
+                        }
                     }
                 }
             }
@@ -2852,6 +2963,123 @@ fn run_clear(skip_confirm: bool) -> anyhow::Result<()> {
     } else {
         println!("Cleared {} session(s), freed {} KB.", deleted, kb);
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil cost-report
+// ---------------------------------------------------------------------------
+
+fn run_cost_report(days: u64, branch_filter: Option<&str>) -> anyhow::Result<()> {
+    use chrono::Duration;
+    use std::collections::HashMap;
+    use vigil_core::store::SessionMeta;
+
+    let summaries = vigil_core::session::Session::list_all().unwrap_or_default();
+    if summaries.is_empty() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+
+    let cutoff = chrono::Utc::now() - Duration::days(days as i64);
+
+    // Collect (started_at, cost, branch) for matching sessions.
+    // Row: (date_str, branch_str, cost)
+    let mut rows: Vec<(String, String, f64)> = Vec::new();
+
+    for s in &summaries {
+        if s.started_at < cutoff {
+            continue;
+        }
+
+        // Load meta to get branch (and to apply branch filter if set).
+        let meta_path = vigil_core::store::sessions_dir()?
+            .join(format!("{}.meta.json", s.id));
+        let meta: Option<SessionMeta> = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|txt| serde_json::from_str(&txt).ok());
+
+        let branch = meta
+            .as_ref()
+            .and_then(|m| m.git_branch.clone())
+            .unwrap_or_else(|| "(no branch)".to_string());
+
+        if let Some(filter) = branch_filter {
+            if !branch.contains(filter) {
+                continue;
+            }
+        }
+
+        let date = s.started_at.format("%Y-%m-%d").to_string();
+        let cost = meta.as_ref().map(|m| m.total_cost_usd).unwrap_or(s.total_cost_usd);
+        rows.push((date, branch, cost));
+    }
+
+    if rows.is_empty() {
+        println!("No sessions matched the filter.");
+        return Ok(());
+    }
+
+    // Group by (date, branch).
+    let mut groups: HashMap<(String, String), (u64, f64)> = HashMap::new();
+    for (date, branch, cost) in &rows {
+        let entry = groups.entry((date.clone(), branch.clone())).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += cost;
+    }
+
+    // Sort by date desc, then branch asc.
+    let mut sorted: Vec<((String, String), (u64, f64))> = groups.into_iter().collect();
+    sorted.sort_by(|a, b| b.0.0.cmp(&a.0.0).then(a.0.1.cmp(&b.0.1)));
+
+    // Compute column widths.
+    let date_w = "Date".len().max(sorted.iter().map(|r| r.0.0.len()).max().unwrap_or(0));
+    let branch_w = "Branch".len().max(sorted.iter().map(|r| r.0.1.len()).max().unwrap_or(0));
+    let sessions_w = "Sessions".len();
+    let total_w = "Total Cost".len();
+    let avg_w = "Avg Cost".len();
+
+    let sep = format!(
+        "+-{}-+-{}-+-{}-+-{}-+-{}-+",
+        "-".repeat(date_w),
+        "-".repeat(branch_w),
+        "-".repeat(sessions_w),
+        "-".repeat(total_w),
+        "-".repeat(avg_w),
+    );
+
+    println!("{}", sep);
+    println!(
+        "| {:<date_w$} | {:<branch_w$} | {:<sessions_w$} | {:<total_w$} | {:<avg_w$} |",
+        "Date", "Branch", "Sessions", "Total Cost", "Avg Cost",
+        date_w = date_w, branch_w = branch_w,
+        sessions_w = sessions_w, total_w = total_w, avg_w = avg_w,
+    );
+    println!("{}", sep);
+
+    let mut grand_total = 0.0f64;
+    for ((date, branch), (count, total_cost)) in &sorted {
+        let avg = if *count > 0 { total_cost / *count as f64 } else { 0.0 };
+        grand_total += total_cost;
+        println!(
+            "| {:<date_w$} | {:<branch_w$} | {:>sessions_w$} | {:>total_w$} | {:>avg_w$} |",
+            date,
+            branch,
+            count,
+            format!("${:.4}", total_cost),
+            format!("${:.4}", avg),
+            date_w = date_w, branch_w = branch_w,
+            sessions_w = sessions_w, total_w = total_w, avg_w = avg_w,
+        );
+    }
+
+    println!("{}", sep);
+    println!(
+        "  Total across {} session(s): ${:.4}",
+        rows.len(),
+        grand_total
+    );
+
     Ok(())
 }
 
