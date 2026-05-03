@@ -109,7 +109,7 @@ Pass with `vigil run --config vigil.toml -- <agent>`.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `port` | `u16` | `8877` | Proxy listen port |
-| `metrics_port` | `u16` | — | Optional metrics endpoint port |
+| `dashboard_port` | `u16` | — | Bind the browser dashboard on `127.0.0.1:<port>`. Omit to disable. Example: `8878` |
 | `blocked_commands` | `[string]` | `["rm -rf", "dd if=", "mkfs", ":(){ :\|:& };:"]` | Bash command substrings to block (case-sensitive substring match) |
 | `write_approval_threshold` | `string` | — | Gate writes at this risk level or above: `"Low"`, `"Medium"`, or `"High"`. Omit to disable |
 | `tool_timeout_secs` | `u64` | — | Emit a TOUT alert if no LLM response follows a tool call within N seconds |

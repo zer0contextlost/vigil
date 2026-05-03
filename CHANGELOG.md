@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.0] - 2026-05-03
+
+### Added
+- `vigil-web` crate — embedded single-binary browser dashboard served from `[proxy] dashboard_port` in `vigil.toml`; bind address is always `127.0.0.1` (never exposed to the network)
+- Sessions list view — live table of active and completed sessions with cost, token count, burn rate, and attention indicator; auto-refreshes every 30 seconds and updates in real time via SSE
+- Session detail view — click any session row to load full event timeline with per-event type formatting (tool calls, writes, alerts, approvals)
+- `GET /api/events` SSE stream — broadcasts all `TimestampedEvent` values for the global event feed
+- `GET /api/sessions/:id/events` SSE stream — filtered per-session event stream
+- `GET /api/sessions` — merged list of live (`list_active()`) and completed (`Session::list_all()`) sessions
+- `GET /api/sessions/:id` — full session detail with envelopes loaded from `SessionStore`
+- `GET /api/approvals` + `POST /api/approvals/:id` — write approval banner: lists pending approvals and accepts approve/reject decisions from the browser
+- Event fan-out refactored from `mpsc` to `tokio::sync::broadcast::channel` so both the TUI and the web dashboard can subscribe to the same event stream simultaneously
+
+---
+
 ## [0.6.1] - 2026-05-03
 
 ### Added
