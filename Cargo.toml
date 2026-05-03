@@ -15,7 +15,7 @@ resolver = "2"
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-authors = ["Cliff Harsey"]
+authors = ["zer0contextlost"]
 license = "MIT"
 repository = "https://github.com/zer0contextlost/vigil"
 
