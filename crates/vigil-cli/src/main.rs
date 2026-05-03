@@ -8,6 +8,8 @@ use vigil_proxy::{Proxy, DenialRecord, PendingDenials};
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
 
+mod report;
+
 #[derive(Parser)]
 #[command(name = "vigil")]
 #[command(about = "Runtime observability and policy enforcement for AI coding agents", long_about = None)]
@@ -246,6 +248,27 @@ enum Commands {
         /// Show only lines that differ (default: show context too)
         #[arg(long)]
         brief: bool,
+    },
+
+    /// Generate a session audit report with hygiene scorecard
+    Report {
+        /// Session ID (UUID prefix or full)
+        session_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Output as self-contained HTML file
+        #[arg(long)]
+        html: bool,
+        /// Output as HTML fragment (no <html>/<head> wrapper, for embedding)
+        #[arg(long)]
+        html_fragment: bool,
+        /// Include raw model payloads in output (raw_request/raw_response). Off by default.
+        #[arg(long)]
+        include_payloads: bool,
+        /// vigil.toml config file (for report thresholds)
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Start vigil as an MCP server (JSON-RPC over stdio for Claude Desktop / Cursor)
@@ -695,6 +718,36 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Diff { session_a, session_b, brief }) => {
             run_diff(&session_a, &session_b, brief)?;
+        }
+        Some(Commands::Report { session_id, json, html, html_fragment, include_payloads, config }) => {
+            let uuid = uuid::Uuid::parse_str(&session_id)
+                .context("Invalid session ID — use the full UUID from 'vigil sessions'")?;
+            let envelopes = SessionStore::load_envelopes(&uuid)?;
+            let meta = SessionStore::load_meta(&uuid)?;
+
+            let session = Session {
+                id: meta.session_id,
+                agent: meta.agent,
+                started_at: meta.started_at,
+                ended_at: meta.ended_at,
+                total_input_tokens: meta.total_input_tokens,
+                total_output_tokens: meta.total_output_tokens,
+                total_cost_usd: meta.total_cost_usd,
+                policy_violations: meta.policy_violations,
+                pii_detections: meta.pii_detections,
+                events: envelopes,
+                name: meta.name,
+            };
+
+            let args = report::ReportArgs {
+                session_id: session_id.clone(),
+                json,
+                html,
+                html_fragment,
+                include_payloads,
+                config,
+            };
+            report::run(session, args).await?;
         }
         Some(Commands::Mcp) => {
             run_mcp_server()?;
