@@ -1153,38 +1153,32 @@ pub async fn run_session_browser(
     let mut terminal = Terminal::new(backend)?;
 
     let mut state = BrowserState::new(sessions);
-    let mut action: Option<BrowseAction> = None;
 
-    loop {
+    let action = loop {
         terminal.draw(|f| draw_browser(f, &mut state))?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press { continue; }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        action = Some(BrowseAction::Quit);
-                        break;
-                    }
+                    KeyCode::Char('q') | KeyCode::Esc => break Some(BrowseAction::Quit),
                     KeyCode::Up | KeyCode::Char('k') => state.move_up(),
                     KeyCode::Down | KeyCode::Char('j') => state.move_down(),
                     KeyCode::Enter | KeyCode::Char('r') => {
                         if let Some(s) = state.selected() {
-                            action = Some(BrowseAction::Replay(s.id));
-                            break;
+                            break Some(BrowseAction::Replay(s.id));
                         }
                     }
                     KeyCode::Char('d') => {
                         if let Some(s) = state.selected() {
-                            action = Some(BrowseAction::Delete(s.id));
-                            break;
+                            break Some(BrowseAction::Delete(s.id));
                         }
                     }
                     _ => {}
                 }
             }
         }
-    }
+    };
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
