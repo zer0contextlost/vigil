@@ -286,6 +286,7 @@ enum Commands {
 #[cfg(windows)]
 mod fake_upstream;
 
+#[cfg(windows)]
 mod win_console {
     use anyhow::{anyhow, Result};
     use std::ffi::OsStr;
