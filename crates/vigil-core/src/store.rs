@@ -36,6 +36,47 @@ pub struct SessionMeta {
     /// ed25519 verifying (public) key, hex-encoded.
     #[serde(default)]
     pub verifying_key: Option<String>,
+    /// Developer/username from $USER or $USERNAME env var.
+    #[serde(default)]
+    pub developer: Option<String>,
+    /// Remote origin URL of the git repository, best-effort.
+    #[serde(default)]
+    pub git_repo: Option<String>,
+    /// Current git branch name.
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    /// Current git HEAD commit hash (7 characters).
+    #[serde(default)]
+    pub git_commit: Option<String>,
+}
+
+fn capture_git_context() -> (Option<String>, Option<String>, Option<String>) {
+    // returns (repo, branch, commit)
+    let branch = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let repo = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    (repo, branch, commit)
 }
 
 pub struct SessionStore {
@@ -66,6 +107,11 @@ impl SessionStore {
         let mut session_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut session_key);
 
+        let developer = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .ok();
+        let (git_repo, git_branch, git_commit) = capture_git_context();
+
         let meta = SessionMeta {
             session_id,
             agent: agent.to_string(),
@@ -81,6 +127,10 @@ impl SessionStore {
             chain_root_hash: String::new(),
             chain_signature: None,
             verifying_key: None,
+            developer,
+            git_repo,
+            git_branch,
+            git_commit,
         };
 
         Ok(Self {
@@ -290,6 +340,10 @@ mod tests {
             chain_root_hash: String::new(),
             chain_signature: None,
             verifying_key: None,
+            developer: None,
+            git_repo: None,
+            git_branch: None,
+            git_commit: None,
         };
         // No signature stored → verify must succeed (backward compat)
         SessionStore::verify_signature(&meta, "anyhash").unwrap();

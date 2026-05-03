@@ -5,7 +5,7 @@ use crate::envelope::Envelope;
 
 /// ABI version. Bump whenever `VigilPlugin`, `PluginContext`, `AlertLabel`,
 /// `AlertDetail`, `PluginDecision`, `Envelope`, or the FFI contract changes.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// rustc version vigil-core was compiled with, baked in by build.rs.
 pub const RUSTC_VERSION: &str = env!("VIGIL_RUSTC_VERSION");
@@ -238,6 +238,12 @@ pub trait VigilPlugin: Send + Sync {
     /// derive the per-plugin config directory.
     fn name(&self) -> &str { "unnamed" }
 
+    /// Called once when a session starts, before any events are dispatched.
+    async fn on_session_start(&self, _ctx: &PluginContext) {}
+
+    /// Called once when a session ends (clean exit or TUI quit).
+    async fn on_session_end(&self, _ctx: &PluginContext) {}
+
     /// Called for every event that passes the filter (post-policy).
     async fn on_event(&self, _ctx: &PluginContext, _envelope: &Envelope) {}
 
@@ -254,6 +260,18 @@ pub trait VigilPlugin: Send + Sync {
         _input: &Value,
     ) -> PluginDecision {
         PluginDecision::Allow
+    }
+
+    /// Called for every outbound LLM request before it is forwarded upstream.
+    /// Return `Some(modified_body)` to replace the request body, or `None` to
+    /// pass it through unchanged. First non-None response wins.
+    async fn on_outbound_request(
+        &self,
+        _ctx: &PluginContext,
+        _provider: &str,
+        _body: &Value,
+    ) -> Option<Value> {
+        None
     }
 }
 
@@ -291,6 +309,22 @@ impl PluginHost {
     pub fn is_empty(&self) -> bool { self.plugins.is_empty() }
     pub fn len(&self) -> usize { self.plugins.len() }
 
+    /// Fan out session start to every plugin.
+    pub async fn dispatch_session_start(&self, ctx: &PluginContext) {
+        for lp in &self.plugins {
+            let pctx = per_plugin_ctx(ctx, lp.plugin.name());
+            lp.plugin.on_session_start(&pctx).await;
+        }
+    }
+
+    /// Fan out session end to every plugin.
+    pub async fn dispatch_session_end(&self, ctx: &PluginContext) {
+        for lp in &self.plugins {
+            let pctx = per_plugin_ctx(ctx, lp.plugin.name());
+            lp.plugin.on_session_end(&pctx).await;
+        }
+    }
+
     /// Fan out an event to every plugin. Each plugin receives a context with
     /// `config_dir` pointing to its own per-plugin subdirectory.
     pub async fn dispatch_event(&self, ctx: &PluginContext, envelope: &Envelope) {
@@ -324,6 +358,22 @@ impl PluginHost {
             }
         }
         PluginDecision::Allow
+    }
+
+    /// Fan out to all plugins; returns the first modified body or None.
+    pub async fn dispatch_outbound_request(
+        &self,
+        ctx: &PluginContext,
+        provider: &str,
+        body: &Value,
+    ) -> Option<Value> {
+        for lp in &self.plugins {
+            let pctx = per_plugin_ctx(ctx, lp.plugin.name());
+            if let Some(modified) = lp.plugin.on_outbound_request(&pctx, provider, body).await {
+                return Some(modified);
+            }
+        }
+        None
     }
 
     /// Load a plugin from a shared library (.dll / .so / .dylib).

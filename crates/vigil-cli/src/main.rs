@@ -195,6 +195,16 @@ enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
+
+    /// Delete session files older than N days
+    Prune {
+        /// Delete sessions older than this many days
+        #[arg(long, default_value = "30")]
+        older_than: u64,
+        /// Show what would be deleted without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -608,6 +618,9 @@ async fn main() -> Result<()> {
                 vigil_tui::run_tui(app, rx).await?;
             }
         }
+        Some(Commands::Prune { older_than, dry_run }) => {
+            run_prune(older_than, dry_run)?;
+        }
     }
 
     Ok(())
@@ -1011,6 +1024,8 @@ pub async fn run_proxy_mode(
     let engine = Arc::new(engine);
 
     let plugin_host = Arc::new(plugins);
+    let ctx_start = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_start(&ctx_start).await;
     let (raw_tx, mut raw_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
     let (filtered_tx, filtered_rx) = tokio::sync::mpsc::channel::<TimestampedEvent>(1000);
 
@@ -1158,6 +1173,8 @@ pub async fn run_proxy_mode(
     proxy_handle.abort();
     filter_handle.abort();
     resolver_handle.abort();
+    let ctx_end = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_end(&ctx_end).await;
     Ok(())
 }
 
@@ -1326,6 +1343,9 @@ pub async fn run_agent_with_plugins(
     };
 
     tracing::info!(pid = child_pid, "agent process started");
+
+    let ctx_start = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_start(&ctx_start).await;
 
     let watch_config = WatchConfig {
         watch_path: std::env::current_dir()?,
@@ -1805,6 +1825,9 @@ pub async fn run_agent_with_plugins(
         println!("Session complete: {}", session_id);
         println!("Agent: {}", agent_name);
     }
+
+    let ctx_end = make_plugin_ctx(session_id);
+    plugin_host.dispatch_session_end(&ctx_end).await;
 
     if let Some(ref handle) = active_handle {
         handle.remove();
@@ -2514,6 +2537,53 @@ fn confirm_delete_session(id: &uuid::Uuid) -> anyhow::Result<()> {
         println!("Session {} deleted.", id);
     } else {
         println!("Cancelled.");
+    }
+    Ok(())
+}
+
+fn run_prune(older_than_days: u64, dry_run: bool) -> anyhow::Result<()> {
+    let dir = vigil_core::store::sessions_dir()?;
+    if !dir.exists() {
+        println!("No sessions directory found.");
+        return Ok(());
+    }
+
+    let cutoff = std::time::SystemTime::now()
+        - std::time::Duration::from_secs(older_than_days * 86400);
+
+    let mut deleted = 0u64;
+    let mut freed = 0u64;
+
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else { continue };
+            // Only look at .ndjson files (each session has one); meta.json is handled below
+            if ext != "ndjson" { continue }
+            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(modified) = meta.modified() else { continue };
+            if modified >= cutoff { continue }
+
+            let size = meta.len();
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+
+            if dry_run {
+                println!("would delete: {} ({} KB)", path.file_name().unwrap_or_default().to_string_lossy(), size / 1024);
+            } else {
+                std::fs::remove_file(&path).ok();
+                // Remove companion meta file
+                let meta_path = dir.join(format!("{}.meta.json", stem));
+                if meta_path.exists() { std::fs::remove_file(&meta_path).ok(); }
+                deleted += 1;
+                freed += size;
+            }
+        }
+    }
+
+    if dry_run {
+        println!("Dry run — no files deleted. Remove --dry-run to prune.");
+    } else {
+        println!("Pruned {} session(s), freed {} KB.", deleted, freed / 1024);
     }
     Ok(())
 }
