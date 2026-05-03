@@ -1,9 +1,9 @@
 use axum::{
-    Router,
+    Json, Router,
     extract::{Path, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response, sse::{Event as SseEvent, KeepAlive, Sse}},
-    routing::get,
+    routing::{get, post},
 };
 use futures::stream::{self, Stream};
 use rust_embed::RustEmbed;
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, net::SocketAddr};
 use tokio::sync::broadcast;
 use vigil_core::{TimestampedEvent, list_active};
+use vigil_proxy::PendingApprovals;
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
@@ -19,13 +20,15 @@ struct Assets;
 #[derive(Clone)]
 pub struct DashboardState {
     event_tx: broadcast::Sender<TimestampedEvent>,
+    pending_approvals: PendingApprovals,
 }
 
 pub async fn run_dashboard(
     addr: SocketAddr,
     event_tx: broadcast::Sender<TimestampedEvent>,
+    pending_approvals: PendingApprovals,
 ) -> anyhow::Result<()> {
-    let state = DashboardState { event_tx };
+    let state = DashboardState { event_tx, pending_approvals };
     let app = Router::new()
         .route("/", get(serve_index))
         .route("/style.css", get(serve_css))
@@ -34,6 +37,8 @@ pub async fn run_dashboard(
         .route("/api/sessions/{id}", get(api_session_detail))
         .route("/api/events", get(api_events))
         .route("/api/sessions/{id}/events", get(api_session_events))
+        .route("/api/approvals", get(api_approvals_list))
+        .route("/api/approvals/{id}", post(api_approval_submit))
         .with_state(state);
 
     tracing::info!(%addr, "vigil dashboard listening");
@@ -226,4 +231,45 @@ async fn api_events(State(state): State<DashboardState>) -> Sse<impl Stream<Item
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Debug, Serialize)]
+struct PendingApprovalEntry {
+    id: String,
+}
+
+async fn api_approvals_list(State(state): State<DashboardState>) -> impl IntoResponse {
+    let ids: Vec<PendingApprovalEntry> = state.pending_approvals
+        .lock()
+        .unwrap()
+        .keys()
+        .map(|id| PendingApprovalEntry { id: id.to_string() })
+        .collect();
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&ids).unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalBody {
+    approved: bool,
+}
+
+async fn api_approval_submit(
+    Path(id): Path<String>,
+    State(state): State<DashboardState>,
+    Json(body): Json<ApprovalBody>,
+) -> impl IntoResponse {
+    let Ok(uuid) = uuid::Uuid::parse_str(&id) else {
+        return (StatusCode::BAD_REQUEST, "invalid uuid");
+    };
+    let sender = state.pending_approvals.lock().unwrap().remove(&uuid);
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(body.approved);
+            (StatusCode::OK, if body.approved { "approved" } else { "rejected" })
+        }
+        None => (StatusCode::NOT_FOUND, "not found"),
+    }
 }

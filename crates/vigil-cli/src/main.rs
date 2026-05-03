@@ -1537,6 +1537,7 @@ pub async fn run_proxy_mode(
     };
     let proxy = vigil_proxy::Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
+    let pending_approvals_for_dashboard = pending_approvals_for_resolver.clone();
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = proxy.run().await {
             tracing::error!(err = %e, "proxy error");
@@ -1594,8 +1595,9 @@ pub async fn run_proxy_mode(
     if let Some(dashboard_port) = config.as_ref().and_then(|c| c.proxy.dashboard_port) {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], dashboard_port));
         let tx = filtered_tx.clone();
+        let approvals = pending_approvals_for_dashboard;
         tokio::spawn(async move {
-            if let Err(e) = vigil_web::run_dashboard(addr, tx).await {
+            if let Err(e) = vigil_web::run_dashboard(addr, tx, approvals).await {
                 tracing::warn!(err = %e, "dashboard error");
             }
         });
@@ -1933,6 +1935,7 @@ pub async fn run_agent_with_plugins(
     };
     let proxy = Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
+    let pending_approvals_for_dashboard = pending_approvals_for_resolver.clone();
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = proxy.run().await {
             tracing::error!(err = %e, "proxy error");
@@ -2132,8 +2135,9 @@ pub async fn run_agent_with_plugins(
     if let Some(dashboard_port) = config.as_ref().and_then(|c| c.proxy.dashboard_port) {
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], dashboard_port));
         let tx = filtered_tx.clone();
+        let approvals = pending_approvals_for_dashboard;
         tokio::spawn(async move {
-            if let Err(e) = vigil_web::run_dashboard(addr, tx).await {
+            if let Err(e) = vigil_web::run_dashboard(addr, tx, approvals).await {
                 tracing::warn!(err = %e, "dashboard error");
             }
         });
