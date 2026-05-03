@@ -65,6 +65,7 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 | `vigil sessions` | Print a text table of all recorded sessions |
 | `vigil browse` | Interactive TUI session browser (arrow keys / j·k, Enter to replay, d to delete) |
 | `vigil replay <session-id>` | Replay a session in the TUI |
+| `vigil replay <session-id> --mock [--on-miss error\|stub]` | Replay against a fake upstream — no real API calls, cost-free regression testing |
 | `vigil fork <session-id> [--prefix-events N] -- <agent>` | Replay a session prefix, then continue live |
 | `vigil tag <session-id> <name>` | Assign a human-readable label to a session |
 | `vigil clear [-y]` | Delete all session files (prompts for confirmation unless `-y`) |
@@ -78,6 +79,7 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 
 | Command | Description |
 |---------|-------------|
+| `vigil report <session-id> [--json] [--html] [--html-fragment]` | Generate session audit report with hygiene scorecard |
 | `vigil verify <session-id>` | Verify hash chain and ed25519 signature; exits 0 (PASS) or 1 (FAIL) |
 | `vigil audit <session-id>` | Legacy audit: hash chain, ULID order, meta count |
 
@@ -145,6 +147,48 @@ Pass with `vigil run --config vigil.toml -- <agent>`.
 |-------|------|---------|-------------|
 | `webhook` | `string` | — | HTTP endpoint to POST alert events to (3 retries, exponential backoff) |
 | `webhook_events` | `[string]` | all alerts | Alert codes to forward. Valid: `BURN`, `TOUT`, `EXFL`, `LOOP`, `WAPPR`, `COST`, `DURA`, `DENY`, `DRFT`, `PINJ`, `PII` |
+
+### [report]
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `turn_to_first_write_warn` | `u32` | `5` | Turns before first FsWrite to show WATCH verdict |
+| `turn_to_first_write_flag` | `u32` | `15` | Turns before first FsWrite to show FLAG verdict |
+| `input_growth_warn_multiplier` | `f64` | `1.5` | Input token growth multiplier (last third vs first third) to warn |
+| `input_growth_flag_multiplier` | `f64` | `2.0` | Input token growth multiplier to flag |
+| `reread_warn_count` | `u32` | `2` | Paths read more than this many times to warn |
+| `reread_flag_count` | `u32` | `3` | Paths read more than this many times to flag |
+
+### [window]
+
+Auto-position the vigil TUI and agent windows at launch. All fields optional — omit to keep current behavior (no repositioning). Values are in pixels.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tui_x` | `i32` | vigil TUI window X position |
+| `tui_y` | `i32` | vigil TUI window Y position |
+| `tui_width` | `u32` | vigil TUI window width |
+| `tui_height` | `u32` | vigil TUI window height |
+| `agent_x` | `i32` | Agent window X position |
+| `agent_y` | `i32` | Agent window Y position |
+| `agent_width` | `u32` | Agent window width |
+| `agent_height` | `u32` | Agent window height |
+
+Example split-screen layout (1920×1080 monitor):
+
+```toml
+[window]
+tui_x = 0
+tui_y = 0
+tui_width = 960
+tui_height = 1080
+agent_x = 960
+agent_y = 0
+agent_width = 960
+agent_height = 1080
+```
+
+Linux: requires `xterm` (agent window) and optionally `wmctrl` (vigil window). Windows: uses native `CreateProcessW` and `SetWindowPos`.
 
 ### [drift]
 

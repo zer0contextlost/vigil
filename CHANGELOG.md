@@ -5,6 +5,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.6.1] - 2026-05-03
+
+### Added
+- `vigil report <session-id>` — session audit report with five sections (headline, hygiene scorecard, alert timeline, files touched, tool heatmap) and three output formats (`--json`, `--html`, `--html-fragment`); scorecard grades 8 independent signals (input token growth, re-read rate, tool retry/thrash, turn-to-first-write, policy friction, sub-agent fan-out, late-session alert clustering, write approval rejection rate)
+- `[report]` config section in `vigil.toml` — configurable scorecard thresholds
+- `[window]` config section in `vigil.toml` — auto-position vigil TUI and agent windows at launch (pixel coordinates, all optional); Windows uses `SetWindowPos`; Linux uses xterm geometry flags + `wmctrl`
+- Session report data model enrichment: `turn_number` on `LlmRequest`, `stop_reason` on `LlmResponse`, `correlation_id` linking `ToolCall` to `ToolCallResult`, `duration_ms` and `is_error` on `ToolCallResult`, `lines_added`/`lines_removed`/`hunk_count` on `FsWrite`
+- Linux install script (`install-linux.sh`) — one-shot installer for Ubuntu/Debian covering build toolchain, Rust, Claude Code, xterm, wmctrl, and vigil itself
+- Linux terminal window support — agent spawned in new xterm/alacritty/kitty window on Unix so vigil TUI and agent TUI don't share the same console
+
+### Fixed
+- Linux build: `mod win_console` was missing `#[cfg(windows)]` gate
+- Linux build: `mod fake_upstream` was incorrectly gated to `#[cfg(windows)]` — replay mock now works on all platforms
+- Linux build: spurious `mut` on `child` in non-windows spawn path
+
+---
+
 ## [0.6.0] - 2026-05-03
 
 ### Added
