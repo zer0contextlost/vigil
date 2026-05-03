@@ -25,6 +25,8 @@ pub struct VigilConfig {
     pub drift: DriftSection,
     #[serde(default)]
     pub report: Option<ReportConfig>,
+    #[serde(default)]
+    pub window: Option<WindowConfig>,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -142,6 +144,27 @@ pub struct ReportConfig {
     pub reread_warn_count: Option<u32>,
     /// Re-read count per path to flag (default: 3)
     pub reread_flag_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WindowConfig {
+    /// vigil TUI window X position in pixels
+    pub tui_x: Option<i32>,
+    /// vigil TUI window Y position in pixels
+    pub tui_y: Option<i32>,
+    /// vigil TUI window width in pixels
+    pub tui_width: Option<u32>,
+    /// vigil TUI window height in pixels
+    pub tui_height: Option<u32>,
+    /// Agent window X position in pixels
+    pub agent_x: Option<i32>,
+    /// Agent window Y position in pixels
+    pub agent_y: Option<i32>,
+    /// Agent window width in pixels
+    pub agent_width: Option<u32>,
+    /// Agent window height in pixels
+    pub agent_height: Option<u32>,
 }
 
 impl DriftSection {

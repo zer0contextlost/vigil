@@ -25,7 +25,7 @@ pub use exfil::{BashExfilFinding, CredentialTracker, scan_bash_for_exfil};
 pub use budget::{BudgetEnforcer, BudgetStatus};
 pub use burn_rate::{BurnRateTracker, LoopDetector};
 pub use drift::{DriftAlertPayload, DriftConfig, DriftDetector, DriftSignal};
-pub use config::{VigilConfig, ReportConfig};
+pub use config::{VigilConfig, ReportConfig, WindowConfig};
 pub use envelope::{Envelope, TimestampedEvent, SCHEMA_VERSION};
 pub use event::Event;
 pub use injection::scan_for_injection;

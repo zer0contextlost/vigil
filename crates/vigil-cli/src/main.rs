@@ -297,39 +297,90 @@ mod unix_console {
     use anyhow::Result;
     use tokio::process::Command;
 
-    const TERMINALS: &[(&str, &[&str])] = &[
-        ("xterm",        &["-e"]),
-        ("alacritty",    &["-e"]),
-        ("kitty",        &[]),
-        ("xfce4-terminal", &["-e"]),
-        ("konsole",      &["-e"]),
-    ];
+    // (terminal binary, flags to introduce the command to run)
+    const TERMINALS: &[&str] = &["xterm", "alacritty", "kitty", "xfce4-terminal", "konsole"];
 
-    fn find_terminal() -> Option<(&'static str, &'static [&'static str])> {
-        TERMINALS.iter().find_map(|(term, flags)| {
+    fn find_terminal() -> Option<&'static str> {
+        TERMINALS.iter().find_map(|term| {
             std::process::Command::new("which")
                 .arg(term)
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
-                .map(|_| (*term, *flags))
+                .map(|_| *term)
         })
     }
 
+    /// Build geometry/position args for a given terminal.
+    /// pos is (x, y, width_px, height_px).
+    pub fn geometry_args(term: &str, pos: (i32, i32, u32, u32)) -> Vec<String> {
+        let (x, y, w, h) = pos;
+        // xterm uses character cells for size, pixels for position.
+        // Approximate: 8px/col, 16px/row.
+        let cols = (w / 8).max(40);
+        let rows = (h / 16).max(10);
+        match term {
+            "xterm" => vec![
+                "-geometry".to_string(),
+                format!("{}x{}+{}+{}", cols, rows, x, y),
+            ],
+            "alacritty" => vec![
+                "--option".to_string(), format!("window.position.x={}", x),
+                "--option".to_string(), format!("window.position.y={}", y),
+                "--option".to_string(), format!("window.dimensions.columns={}", cols),
+                "--option".to_string(), format!("window.dimensions.lines={}", rows),
+            ],
+            "kitty" => vec![
+                "--override".to_string(), format!("initial_window_width={}px", w),
+                "--override".to_string(), format!("initial_window_height={}px", h),
+            ],
+            "xfce4-terminal" | "konsole" => vec![
+                "--geometry".to_string(),
+                format!("{}x{}+{}+{}", cols, rows, x, y),
+            ],
+            _ => vec![],
+        }
+    }
+
+    /// Attempt to reposition vigil's own terminal window using wmctrl.
+    /// Silent no-op if wmctrl is not installed.
+    pub fn position_own_window(x: i32, y: i32, width: u32, height: u32) {
+        // wmctrl -r :ACTIVE: -e 0,x,y,w,h
+        let _ = std::process::Command::new("wmctrl")
+            .args([
+                "-r", ":ACTIVE:",
+                "-e", &format!("0,{},{},{},{}", x, y, width, height),
+            ])
+            .output();
+    }
+
     /// Spawn `program args` in a new terminal window with extra env vars set.
+    /// pos is optional (x, y, width_px, height_px) for window positioning.
     /// Returns None if no suitable terminal was found (caller falls back to
     /// same-terminal spawn).
     pub fn spawn(
         program: &str,
         args: &[String],
         extra_env: &[(&str, &str)],
+        pos: Option<(i32, i32, u32, u32)>,
     ) -> Result<Option<tokio::process::Child>> {
-        let Some((term, flags)) = find_terminal() else {
+        let Some(term) = find_terminal() else {
             return Ok(None);
         };
 
         let mut cmd = Command::new(term);
-        cmd.args(flags);
+
+        // Geometry/position flags come before the -e / command separator.
+        if let Some(p) = pos {
+            cmd.args(geometry_args(term, p));
+        }
+
+        // Flag that separates terminal options from the command to run.
+        match term {
+            "kitty" => {}  // kitty passes command directly with no separator flag
+            _ => { cmd.arg("-e"); }
+        }
+
         // Use `env KEY=VAL ... program args` so the extra vars are set inside
         // the new terminal without affecting vigil's own environment.
         cmd.arg("env");
@@ -354,8 +405,23 @@ mod win_console {
         CreateProcessW, WaitForSingleObject, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
         CREATE_NEW_CONSOLE,
     };
+    use windows_sys::Win32::System::Console::GetConsoleWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOZORDER, SWP_NOACTIVATE};
 
     const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+    const STARTF_USEPOSITION: u32 = 0x0000_0004;
+    const STARTF_USESIZE: u32 = 0x0000_0002;
+
+    /// Reposition vigil's own console window.
+    pub fn position_own_window(x: i32, y: i32, width: u32, height: u32) {
+        unsafe {
+            let hwnd = GetConsoleWindow();
+            if hwnd != 0 {
+                SetWindowPos(hwnd, 0, x, y, width as i32, height as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+    }
 
     pub struct WinChild {
         pub pid: u32,
@@ -431,25 +497,36 @@ mod win_console {
         block
     }
 
-    pub fn spawn(program: &str, args: &[String], extra_env: &[(&str, &str)]) -> Result<WinChild> {
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        extra_env: &[(&str, &str)],
+        pos: Option<(i32, i32, u32, u32)>,
+    ) -> Result<WinChild> {
         let mut cmdline = build_cmdline(program, args);
         let env_block = build_env_block(extra_env);
+
+        let (dw_flags, dx, dy, dw, dh): (u32, u32, u32, u32, u32) = if let Some((x, y, w, h)) = pos {
+            (STARTF_USEPOSITION | STARTF_USESIZE, x as u32, y as u32, w, h)
+        } else {
+            (0, 0, 0, 0, 0)
+        };
 
         let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             lpReserved: std::ptr::null_mut(),
             lpDesktop: std::ptr::null_mut(),
             lpTitle: std::ptr::null_mut(),
-            dwX: 0,
-            dwY: 0,
-            dwXSize: 0,
-            dwYSize: 0,
+            dwX: dx,
+            dwY: dy,
+            dwXSize: dw,
+            dwYSize: dh,
             dwXCountChars: 0,
             dwYCountChars: 0,
             dwFillAttribute: 0,
-            // KEY: dwFlags = 0 means STARTF_USESTDHANDLES is NOT set.
+            // KEY: STARTF_USESTDHANDLES must NOT be set.
             // Windows then assigns the new console's stdin/stdout/stderr to the child.
-            dwFlags: 0,
+            dwFlags: dw_flags,
             wShowWindow: 0,
             cbReserved2: 0,
             lpReserved2: std::ptr::null_mut(),
@@ -1861,16 +1938,40 @@ pub async fn run_agent_with_plugins(
         }
     });
 
+    // Extract window layout config if present.
+    let window_cfg = config.as_ref().and_then(|c| c.window.clone());
+    let tui_pos = window_cfg.as_ref().and_then(|w| {
+        Some((w.tui_x?, w.tui_y?, w.tui_width?, w.tui_height?))
+    });
+    let agent_pos = window_cfg.as_ref().and_then(|w| {
+        Some((w.agent_x?, w.agent_y?, w.agent_width?, w.agent_height?))
+    });
+
+    // Position vigil's own window first (before spawning agent).
+    #[cfg(windows)]
+    if let Some((x, y, w, h)) = tui_pos {
+        win_console::position_own_window(x, y, w, h);
+    }
+    #[cfg(not(windows))]
+    if let Some((x, y, w, h)) = tui_pos {
+        unix_console::position_own_window(x, y, w, h);
+    }
+
     // Spawn the agent process.
     // On Windows: CreateProcessW with bInheritHandles=FALSE + CREATE_NEW_CONSOLE
     //   → Claude gets its own console window with proper stdin/stdout/stderr.
-    // On other platforms: tokio Command in the same terminal (no TUI collision there).
+    // On other platforms: spawn in a new terminal window via unix_console.
     tracing::info!(cmd = %agent_name, "spawning agent");
 
     #[cfg(windows)]
     let (child_pid, child_wait_handle) = {
         let extra_env = [("ANTHROPIC_BASE_URL", proxy_url.as_str())];
-        let child = win_console::spawn(&agent_and_args[0], &agent_and_args[1..], &extra_env)?;
+        let child = win_console::spawn(
+            &agent_and_args[0],
+            &agent_and_args[1..],
+            &extra_env,
+            agent_pos,
+        )?;
         let pid = child.pid();
         let wait_handle = win_console::wait_task(child);
         (pid, wait_handle)
@@ -1883,6 +1984,7 @@ pub async fn run_agent_with_plugins(
             &agent_and_args[0],
             &agent_and_args[1..],
             &extra_env,
+            agent_pos,
         )?;
 
         if let Some(child) = maybe_child {
@@ -3713,5 +3815,41 @@ fn truncate(s: &str, n: usize) -> String {
         format!("{}...", &s[..n.saturating_sub(3)])
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(windows))]
+    use super::unix_console::geometry_args;
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_xterm_geometry_string() {
+        let args = geometry_args("xterm", (960, 0, 960, 1080));
+        assert_eq!(args, vec!["-geometry", "120x67+960+0"]);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_alacritty_geometry_args() {
+        let args = geometry_args("alacritty", (0, 0, 960, 1080));
+        assert!(args.iter().any(|a| a.contains("window.position.x=0")));
+        assert!(args.iter().any(|a| a.contains("window.dimensions.columns=120")));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_kitty_geometry_args() {
+        let args = geometry_args("kitty", (100, 200, 800, 600));
+        assert!(args.iter().any(|a| a.contains("initial_window_width=800px")));
+        assert!(args.iter().any(|a| a.contains("initial_window_height=600px")));
+    }
+
+    #[test]
+    fn test_window_config_defaults_no_position() {
+        let cfg = vigil_core::WindowConfig::default();
+        assert!(cfg.tui_x.is_none());
+        assert!(cfg.agent_x.is_none());
     }
 }
