@@ -285,6 +285,65 @@ enum Commands {
 // ---------------------------------------------------------------------------
 mod fake_upstream;
 
+// ---------------------------------------------------------------------------
+// Unix: spawn agent in a new terminal window so its TUI doesn't corrupt vigil's.
+// Preferred terminals (process stays alive until inner command exits, giving us
+// a wait handle and a stable PID): xterm, alacritty, kitty.
+// gnome-terminal is intentionally skipped — it forks and exits immediately.
+// Falls back to same-terminal if none are found (TUI may flicker).
+// ---------------------------------------------------------------------------
+#[cfg(not(windows))]
+mod unix_console {
+    use anyhow::Result;
+    use tokio::process::Command;
+
+    const TERMINALS: &[(&str, &[&str])] = &[
+        ("xterm",        &["-e"]),
+        ("alacritty",    &["-e"]),
+        ("kitty",        &[]),
+        ("xfce4-terminal", &["-e"]),
+        ("konsole",      &["-e"]),
+    ];
+
+    fn find_terminal() -> Option<(&'static str, &'static [&'static str])> {
+        TERMINALS.iter().find_map(|(term, flags)| {
+            std::process::Command::new("which")
+                .arg(term)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|_| (*term, *flags))
+        })
+    }
+
+    /// Spawn `program args` in a new terminal window with extra env vars set.
+    /// Returns None if no suitable terminal was found (caller falls back to
+    /// same-terminal spawn).
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Option<tokio::process::Child>> {
+        let Some((term, flags)) = find_terminal() else {
+            return Ok(None);
+        };
+
+        let mut cmd = Command::new(term);
+        cmd.args(flags);
+        // Use `env KEY=VAL ... program args` so the extra vars are set inside
+        // the new terminal without affecting vigil's own environment.
+        cmd.arg("env");
+        for (k, v) in extra_env {
+            cmd.arg(format!("{}={}", k, v));
+        }
+        cmd.arg(program);
+        cmd.args(args);
+
+        let child = cmd.spawn()?;
+        Ok(Some(child))
+    }
+}
+
 #[cfg(windows)]
 mod win_console {
     use anyhow::{anyhow, Result};
@@ -1819,15 +1878,35 @@ pub async fn run_agent_with_plugins(
 
     #[cfg(not(windows))]
     let (child_pid, mut tokio_child) = {
-        use tokio::process::Command;
-        let mut cmd = Command::new(&agent_and_args[0]);
-        if agent_and_args.len() > 1 {
-            cmd.args(&agent_and_args[1..]);
+        let extra_env = [("ANTHROPIC_BASE_URL", proxy_url.as_str())];
+        let maybe_child = unix_console::spawn(
+            &agent_and_args[0],
+            &agent_and_args[1..],
+            &extra_env,
+        )?;
+
+        if let Some(child) = maybe_child {
+            // Spawned in a new terminal window. The terminal process itself
+            // is our wait handle — it exits when the inner command exits for
+            // xterm/alacritty/kitty. PID refers to the terminal process, not
+            // claude directly (process tree watching is best-effort).
+            let pid = child.id().unwrap_or(0);
+            tracing::info!(pid, "agent spawned in new terminal window");
+            (pid, child)
+        } else {
+            // No terminal emulator found — fall back to same terminal.
+            // vigil's TUI and the agent's TUI will share the console.
+            eprintln!("vigil: no terminal emulator found (xterm/alacritty/kitty) — running in same terminal");
+            use tokio::process::Command;
+            let mut cmd = Command::new(&agent_and_args[0]);
+            if agent_and_args.len() > 1 {
+                cmd.args(&agent_and_args[1..]);
+            }
+            cmd.env("ANTHROPIC_BASE_URL", &proxy_url);
+            let child = cmd.spawn()?;
+            let pid = child.id().unwrap_or(0);
+            (pid, child)
         }
-        cmd.env("ANTHROPIC_BASE_URL", &proxy_url);
-        let child = cmd.spawn()?;
-        let pid = child.id().unwrap_or(0);
-        (pid, child)
     };
 
     tracing::info!(pid = child_pid, "agent process started");
