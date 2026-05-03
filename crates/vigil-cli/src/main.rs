@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use vigil_core::{session::Session, store::SessionStore, AlertLabel, BashExfilFinding, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision, scan_bash_for_exfil};
 use vigil_mcp::run_mcp_server;
-use vigil_proxy::Proxy;
+use vigil_proxy::{Proxy, DenialRecord, PendingDenials};
 use vigil_tui::{App, BrowseAction};
 use vigil_watch::{WatchConfig, Watcher};
 
@@ -1249,6 +1249,7 @@ pub async fn run_proxy_mode(
         }))
     };
 
+    let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -1256,6 +1257,7 @@ pub async fn run_proxy_mode(
         pii_watchlist,
         write_approval_threshold,
         outbound_hook,
+        pending_denials: pending_denials.clone(),
     };
     let proxy = vigil_proxy::Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
@@ -1310,6 +1312,7 @@ pub async fn run_proxy_mode(
     let drift_cfg_proxy = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
     let plugin_host_filter = plugin_host.clone();
     let engine_clone = engine.clone();
+    let pending_denials_filter = pending_denials.clone();
     let filter_handle = tokio::spawn(async move {
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
@@ -1432,7 +1435,17 @@ pub async fn run_proxy_mode(
             let decision = engine_clone.evaluate(&event.event, 0);
             match decision.action {
                 vigil_core::PolicyAction::Deny => {
-                    if let Event::ToolCall { agent, tool_name, session_id, .. } = &event.event {
+                    if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
+                        let input_summary = input.to_string().chars().take(200).collect::<String>();
+                        // Record denial so the proxy can inject a typed error into the next tool_result.
+                        if let Some(id) = tool_use_id {
+                            pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                                tool_name: tool_name.clone(),
+                                policy_name: decision.policy_name.clone(),
+                                reason: decision.reason.clone(),
+                                input_summary,
+                            });
+                        }
                         let detail = serde_json::json!({"tool_name": tool_name, "policy": decision.policy_name, "reason": decision.reason});
                         let ctx = make_plugin_ctx(*session_id);
                         plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
@@ -1445,9 +1458,18 @@ pub async fn run_proxy_mode(
                     }
                 }
                 _ => {
-                    if let Event::ToolCall { tool_name, input, agent, session_id, .. } = &event.event {
+                    if let Event::ToolCall { tool_name, input, agent, session_id, tool_use_id, .. } = &event.event {
                         let ctx = make_plugin_ctx(*session_id);
                         if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input).await {
+                            let input_summary = input.to_string().chars().take(200).collect::<String>();
+                            if let Some(id) = tool_use_id {
+                                pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                                    tool_name: tool_name.clone(),
+                                    policy_name: Some("plugin".to_string()),
+                                    reason: Some(reason.clone()),
+                                    input_summary,
+                                });
+                            }
                             let detail = serde_json::json!({"tool_name": tool_name, "policy": "plugin", "reason": reason});
                             plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
                             let blocked = TimestampedEvent::new(Event::ToolCallResult {
@@ -1608,6 +1630,7 @@ pub async fn run_agent_with_plugins(
         }))
     };
 
+    let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -1615,6 +1638,7 @@ pub async fn run_agent_with_plugins(
         pii_watchlist,
         write_approval_threshold,
         outbound_hook,
+        pending_denials: pending_denials.clone(),
     };
     let proxy = Proxy::new(proxy_config, raw_tx.clone());
     let pending_approvals_for_resolver = proxy.pending_approvals.clone();
@@ -1766,6 +1790,7 @@ pub async fn run_agent_with_plugins(
     let last_tool_call_filter = last_tool_call.clone();
     let notifier_filter = webhook_notifier.clone();
     let plugin_host_filter = plugin_host.clone();
+    let pending_denials_filter = pending_denials.clone();
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
@@ -2110,10 +2135,23 @@ pub async fn run_agent_with_plugins(
                     if let Event::ToolCall {
                         agent,
                         tool_name,
+                        input,
                         session_id,
+                        tool_use_id,
                         ..
                     } = &event.event
                     {
+                        let input_summary = input.to_string().chars().take(200).collect::<String>();
+                        // Record the denial so the proxy rewrites the matching tool_result
+                        // with a structured error, letting the agent continue on safe work.
+                        if let Some(id) = tool_use_id {
+                            pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                                tool_name: tool_name.clone(),
+                                policy_name: decision.policy_name.clone(),
+                                reason: decision.reason.clone(),
+                                input_summary,
+                            });
+                        }
                         let detail = serde_json::json!({
                             "tool_name": tool_name,
                             "policy": decision.policy_name,
@@ -2136,10 +2174,19 @@ pub async fn run_agent_with_plugins(
                 }
                 _ => {
                     // After policy allows, consult plugins for tool calls.
-                    if let Event::ToolCall { tool_name, input, agent, session_id, .. } = &event.event {
+                    if let Event::ToolCall { tool_name, input, agent, session_id, tool_use_id, .. } = &event.event {
                         let ctx = make_plugin_ctx(*session_id);
                         if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input).await {
                             eprintln!("[PLUGIN DENY] {} — {}", tool_name, reason);
+                            let input_summary = input.to_string().chars().take(200).collect::<String>();
+                            if let Some(id) = tool_use_id {
+                                pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                                    tool_name: tool_name.clone(),
+                                    policy_name: Some("plugin".to_string()),
+                                    reason: Some(reason.clone()),
+                                    input_summary,
+                                });
+                            }
                             let detail = serde_json::json!({
                                 "tool_name": tool_name,
                                 "policy": "plugin",

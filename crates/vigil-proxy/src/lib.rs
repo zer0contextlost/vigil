@@ -39,6 +39,18 @@ pub const ALLOWED_RESP_HEADERS: &[&str] = &[
 
 pub type PendingApprovals = Arc<Mutex<HashMap<Uuid, oneshot::Sender<bool>>>>;
 
+/// Denial record written by main.rs when policy fires Deny on a tool call.
+/// Keyed by the LLM's tool_use_id so the proxy can rewrite the matching tool_result.
+#[derive(Clone, Debug)]
+pub struct DenialRecord {
+    pub tool_name: String,
+    pub policy_name: Option<String>,
+    pub reason: Option<String>,
+    pub input_summary: String,
+}
+
+pub type PendingDenials = Arc<Mutex<HashMap<String, DenialRecord>>>;
+
 /// Async callback invoked before each outbound LLM request.
 /// Return `Some(modified_body)` to replace the request body, or `None` to pass through.
 pub type OutboundHookFn = Arc<
@@ -60,6 +72,10 @@ pub struct ProxyConfig {
     pub write_approval_threshold: Option<vigil_core::RiskLevel>,
     /// Optional plugin hook called before each LLM request is forwarded upstream.
     pub outbound_hook: Option<OutboundHookFn>,
+    /// Denials written by the policy engine in main.rs. The proxy rewrites the
+    /// matching tool_result blocks before forwarding to the LLM so the agent
+    /// receives a structured error and can continue on safe work.
+    pub pending_denials: PendingDenials,
 }
 
 pub struct Proxy {
@@ -478,6 +494,12 @@ async fn handle_reverse_proxy(
         }
     }
 
+    // Rewrite tool_result blocks for any tools denied by the policy engine.
+    // This lets the LLM receive a structured "policy denied" error instead of
+    // a real tool result, so the agent can adapt and continue on safe work.
+    let effective_body = rewrite_denied_tool_results(effective_body, &config.pending_denials);
+    req = req.body(effective_body.clone());
+
     // Scan tool_result content blocks in the request body for prompt injection.
     if let Ok(body_json) = serde_json::from_slice::<Value>(&effective_body) {
         scan_tool_results_for_injection(&body_json, session_id, event_tx);
@@ -565,6 +587,8 @@ struct SseState {
     block_type: HashMap<usize, String>,
     block_name: HashMap<usize, String>,
     block_input: HashMap<usize, String>,
+    /// The `id` field from the LLM's content_block_start for tool_use blocks.
+    block_id: HashMap<usize, String>,
     response_text: String,
     response_text_bytes: usize,
     /// True when we are buffering a Write/Edit block for potential approval.
@@ -888,12 +912,20 @@ fn process_sse_event(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if AnthropicAdapter.write_tools().iter().any(|t| name.eq_ignore_ascii_case(t)) {
                         state.holding = true;
                         state.holding_tool_idx = Some(idx);
                     }
                     state.block_name.insert(idx, name);
                     state.block_input.insert(idx, String::new());
+                    if !id.is_empty() {
+                        state.block_id.insert(idx, id);
+                    }
                 }
                 state.block_type.insert(idx, bt);
             }
@@ -932,6 +964,7 @@ fn process_sse_event(
                     .unwrap_or_else(|| "unknown".to_string());
                 let input_str = state.block_input.remove(&idx).unwrap_or_default();
                 let input: Value = serde_json::from_str(&input_str).unwrap_or(json!({}));
+                let tool_use_id = state.block_id.remove(&idx);
                 tracing::info!(tool = %tool_name, "tool call detected in stream");
                 emit_pii_alert_if_found(&tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                 emit_fs_events_for_tool(&tool_name, &input, session_id, event_tx);
@@ -943,6 +976,7 @@ fn process_sse_event(
                     tool_name,
                     input,
                     session_id,
+                    tool_use_id,
                 }));
             }
             state.block_type.remove(&idx);
@@ -1020,6 +1054,7 @@ fn process_openai_sse_event(
                             tool_name,
                             input,
                             session_id,
+                            tool_use_id: None,
                         }));
                     }
                     state.block_name.clear();
@@ -1064,6 +1099,70 @@ fn emit_pii_alert_if_found(
         kinds,
         session_id,
     }));
+}
+
+/// Rewrite `tool_result` content blocks whose `tool_use_id` is in `pending_denials`.
+/// Returns the (possibly modified) body. Removes matched entries from the map.
+/// The rewritten content tells the LLM the tool was denied by policy so it can
+/// continue on safe work rather than waiting for a result that will never arrive.
+fn rewrite_denied_tool_results(body: bytes::Bytes, pending_denials: &PendingDenials) -> bytes::Bytes {
+    let mut denials = pending_denials.lock().unwrap();
+    if denials.is_empty() {
+        return body;
+    }
+    let mut json: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return body,
+    };
+    let messages = match json.get_mut("messages").and_then(|v| v.as_array_mut()) {
+        Some(m) => m,
+        None => return body,
+    };
+    let mut rewrote = false;
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+            continue;
+        }
+        let content = match msg.get_mut("content").and_then(|v| v.as_array_mut()) {
+            Some(c) => c,
+            None => continue,
+        };
+        for block in content.iter_mut() {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                continue;
+            }
+            let id = match block.get("tool_use_id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            if let Some(denial) = denials.remove(&id) {
+                let msg = format!(
+                    "vigil policy denial: {}\nPolicy: {}\nAttempted tool: {}\nAttempted input: {}\n\
+                     This operation was blocked. You may continue with other safe work.",
+                    denial.reason.as_deref().unwrap_or("operation not permitted"),
+                    denial.policy_name.as_deref().unwrap_or("unnamed-policy"),
+                    denial.tool_name,
+                    denial.input_summary,
+                );
+                *block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "is_error": true,
+                    "content": msg,
+                });
+                rewrote = true;
+                tracing::info!(tool_use_id = %id, tool = %denial.tool_name, "injected policy denial into tool_result");
+            }
+        }
+    }
+    if rewrote {
+        match serde_json::to_vec(&json) {
+            Ok(b) => bytes::Bytes::from(b),
+            Err(_) => body,
+        }
+    } else {
+        body
+    }
 }
 
 /// Scan all `tool_result` content blocks in an outbound request body for prompt
@@ -1349,6 +1448,7 @@ fn emit_anthropic_response(
             if item.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
                 if let Some(tool_name) = item.get("name").and_then(|v| v.as_str()) {
                     let input = item.get("input").cloned().unwrap_or(json!({}));
+                    let tool_use_id = item.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
                     emit_pii_alert_if_found(tool_name, &input.to_string(), pii_watchlist, session_id, event_tx);
                     emit_fs_events_for_tool(tool_name, &input, session_id, event_tx);
                     let _ = event_tx.try_send(TimestampedEvent::new(Event::ToolCall {
@@ -1356,6 +1456,7 @@ fn emit_anthropic_response(
                         tool_name: tool_name.to_string(),
                         input,
                         session_id,
+                        tool_use_id,
                     }));
                 }
             }
@@ -1427,6 +1528,7 @@ fn emit_openai_response(
                                     tool_name: tool_name.to_string(),
                                     input,
                                     session_id,
+                                    tool_use_id: None,
                                 }));
                             }
                         }
@@ -1590,6 +1692,7 @@ mod integration {
             pii_watchlist: vec![],
             write_approval_threshold: None,
             outbound_hook: None,
+            pending_denials: Arc::new(Mutex::new(HashMap::new())),
         };
         let http_client = reqwest::Client::new();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

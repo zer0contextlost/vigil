@@ -39,6 +39,10 @@ pub enum Event {
         tool_name: String,
         input: Value,
         session_id: Uuid,
+        /// The `id` field from the LLM's tool_use block. Used to inject a
+        /// structured denial message into the next tool_result if policy denies.
+        #[serde(default)]
+        tool_use_id: Option<String>,
     },
     ToolCallResult {
         agent: String,
