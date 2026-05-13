@@ -229,6 +229,25 @@ enum Commands {
         name: Option<String>,
     },
 
+    /// Run a recorded session through a policy engine and report which events would be blocked.
+    /// Exits 0 if no events would be blocked, 1 if any would be blocked.
+    Test {
+        /// Session ID (UUID, prefix, or name) to test, OR path to an NDJSON file
+        session: String,
+        /// Policy YAML file (legacy format)
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// vigil.toml configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Exit 0 even when events would be blocked (report only, no failure)
+        #[arg(long)]
+        no_fail: bool,
+    },
+
     /// Delete session files older than N days
     Prune {
         /// Delete sessions older than this many days
@@ -894,6 +913,20 @@ async fn main() -> Result<()> {
         Some(Commands::RepairMeta { dry_run }) => {
             run_repair_meta(dry_run)?;
         }
+        Some(Commands::Test { session, policy, config, format, no_fail }) => {
+            let vigil_config = if let Some(ref p) = config {
+                let content = std::fs::read_to_string(p)
+                    .with_context(|| format!("Cannot read config file: {}", p.display()))?;
+                Some(toml::from_str::<vigil_core::VigilConfig>(&content)
+                    .with_context(|| format!("Invalid TOML in: {}", p.display()))?)
+            } else {
+                None
+            };
+            let exit_blocked = run_policy_test(&session, policy.as_deref(), vigil_config.as_ref(), &format)?;
+            if exit_blocked && !no_fail {
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Prune { older_than, dry_run }) => {
             run_prune(older_than, dry_run)?;
         }
@@ -948,6 +981,151 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil test
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct TestEventResult {
+    event_index: usize,
+    event_type: String,
+    tool_name: Option<String>,
+    action: String,
+    policy_name: Option<String>,
+    reason: Option<String>,
+}
+
+/// Runs a recorded session through the policy engine. Returns true if any events would be blocked.
+fn run_policy_test(
+    session: &str,
+    policy_path: Option<&std::path::Path>,
+    config: Option<&vigil_core::VigilConfig>,
+    format: &str,
+) -> Result<bool> {
+    // Load events — from an NDJSON file path or a stored session ID.
+    let envelopes: Vec<vigil_core::envelope::Envelope> = if std::path::Path::new(session).exists() {
+        let content = std::fs::read_to_string(session)
+            .with_context(|| format!("Cannot read file: {}", session))?;
+        content.lines()
+            .filter(|l| !l.trim().is_empty())
+            .enumerate()
+            .map(|(i, line)| {
+                serde_json::from_str::<vigil_core::envelope::Envelope>(line)
+                    .with_context(|| format!("Invalid NDJSON on line {}", i + 1))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let uuid = resolve_session_id_or_prefix(session)?;
+        vigil_core::store::SessionStore::load_envelopes(&uuid)?
+    };
+
+    if envelopes.is_empty() {
+        anyhow::bail!("No events found for: {}", session);
+    }
+
+    let engine = build_engine(&policy_path.map(PathBuf::from), &config.cloned())?;
+    let policy_count = engine.policy_count();
+    let format_json = format.eq_ignore_ascii_case("json");
+
+    if !format_json {
+        println!("vigil test — {} events, {} policies", envelopes.len(), policy_count);
+        println!();
+    }
+
+    let mut results: Vec<TestEventResult> = Vec::new();
+    let mut session_tokens: u32 = 0;
+    let mut blocked_count = 0usize;
+
+    for (i, env) in envelopes.iter().enumerate() {
+        let event = &env.event;
+        if let vigil_core::Event::LlmResponse { input_tokens, output_tokens, .. } = event {
+            session_tokens = session_tokens.saturating_add(input_tokens + output_tokens);
+        }
+
+        let decision = engine.evaluate(event, session_tokens);
+
+        // Skip purely informational events that trivially Allow.
+        if matches!(decision.action, vigil_core::PolicyAction::Allow)
+            && matches!(
+                event,
+                vigil_core::Event::LlmResponse { .. }
+                    | vigil_core::Event::PolicyReloaded { .. }
+                    | vigil_core::Event::WriteApprovalDecision { .. }
+                    | vigil_core::Event::ConfirmApprovalDecision { .. }
+            )
+        {
+            continue;
+        }
+
+        let blocked = matches!(decision.action, vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm);
+        if blocked { blocked_count += 1; }
+
+        let tool_name = if let vigil_core::Event::ToolCall { ref tool_name, .. } = event {
+            Some(tool_name.clone())
+        } else {
+            None
+        };
+
+        let event_label = {
+            let s = format!("{:?}", event);
+            s.split(|c: char| c == '{' || c == ' ').next().unwrap_or("Event").to_string()
+        };
+
+        let action_str = match &decision.action {
+            vigil_core::PolicyAction::Allow   => "allow",
+            vigil_core::PolicyAction::Deny    => "DENY",
+            vigil_core::PolicyAction::Confirm => "CONFIRM",
+            vigil_core::PolicyAction::LogOnly => "log",
+        };
+
+        if !format_json {
+            let status = if blocked { "FAIL" } else if matches!(decision.action, vigil_core::PolicyAction::LogOnly) { "LOG " } else { "pass" };
+            let tool_suffix = tool_name.as_deref().map(|t| format!(" ({})", t)).unwrap_or_default();
+            let block_suffix = if blocked {
+                format!("  ← {} by '{}'", action_str, decision.policy_name.as_deref().unwrap_or("unnamed"))
+            } else {
+                String::new()
+            };
+            println!("[{}]  #{:>4}  {}{}{}", status, i + 1, event_label, tool_suffix, block_suffix);
+        }
+
+        results.push(TestEventResult {
+            event_index: i + 1,
+            event_type: event_label,
+            tool_name,
+            action: action_str.to_string(),
+            policy_name: decision.policy_name,
+            reason: decision.reason,
+        });
+    }
+
+    if format_json {
+        let blocked_results: Vec<&TestEventResult> = results.iter()
+            .filter(|r| r.action == "DENY" || r.action == "CONFIRM")
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "events_total": envelopes.len(),
+            "policies": policy_count,
+            "blocked": blocked_count,
+            "blocked_events": blocked_results,
+        }))?);
+    } else {
+        println!();
+        println!("── Summary ──────────────────────────────────");
+        println!("  Total events:  {}", envelopes.len());
+        println!("  Policies:      {}", policy_count);
+        println!("  Would block:   {}", blocked_count);
+        println!();
+        if blocked_count == 0 {
+            println!("  PASS — policy would not have blocked anything.");
+        } else {
+            println!("  FAIL — {} event(s) would have been blocked.", blocked_count);
+        }
+    }
+
+    Ok(blocked_count > 0)
 }
 
 // ---------------------------------------------------------------------------
