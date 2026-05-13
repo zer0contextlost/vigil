@@ -235,7 +235,7 @@ Linux: requires `xterm` (agent window) and optionally `wmctrl` (vigil window). W
 
 ### [[policies]]
 
-Policies are evaluated in order; first match wins. Actions: `Deny`, `Confirm`, `LogOnly`.
+Policies are evaluated in order; first match wins. Actions: `Deny`, `LogOnly`, `Allow`. `Confirm` is reserved — currently treated as `Deny` with a console warning; interactive approval per tool call is planned for a future release.
 
 ```toml
 [[policies]]

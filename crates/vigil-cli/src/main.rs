@@ -1791,7 +1791,13 @@ pub async fn run_proxy_mode(
 
             let decision = engine_clone.evaluate(&event.event, 0);
             match decision.action {
-                vigil_core::PolicyAction::Deny => {
+                vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm => {
+                    if matches!(decision.action, vigil_core::PolicyAction::Confirm) {
+                        eprintln!(
+                            "[POLICY CONFIRM] {} — interactive gate not yet available; denying to be safe",
+                            decision.policy_name.as_deref().unwrap_or("unnamed")
+                        );
+                    }
                     if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
                         let input_summary = input.to_string().chars().take(200).collect::<String>();
                         // Record denial so the proxy can inject a typed error into the next tool_result.
@@ -2552,17 +2558,24 @@ pub async fn run_agent_with_plugins(
             );
 
             match decision.action {
-                vigil_core::PolicyAction::Deny => {
+                vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm => {
                     tracing::warn!(
                         policy = ?decision.policy_name,
                         reason = ?decision.reason,
                         "event denied by policy"
                     );
-                    eprintln!(
-                        "[POLICY DENY] {} — {}",
-                        decision.policy_name.as_deref().unwrap_or("hardcoded"),
-                        decision.reason.as_deref().unwrap_or("")
-                    );
+                    if matches!(decision.action, vigil_core::PolicyAction::Confirm) {
+                        eprintln!(
+                            "[POLICY CONFIRM] {} — interactive gate not yet available; denying to be safe",
+                            decision.policy_name.as_deref().unwrap_or("unnamed")
+                        );
+                    } else {
+                        eprintln!(
+                            "[POLICY DENY] {} — {}",
+                            decision.policy_name.as_deref().unwrap_or("hardcoded"),
+                            decision.reason.as_deref().unwrap_or("")
+                        );
+                    }
                     if let Event::ToolCall {
                         agent,
                         tool_name,
@@ -2852,7 +2865,7 @@ policies:
     matcher:
       type: ToolCall
       tool_name_pattern: "Bash"
-    action: Confirm
+    action: Deny
 
   # Warn when token spend is high
   - name: token-budget-1m
@@ -2881,12 +2894,12 @@ policies:
       path_pattern: ".env"
     action: LogOnly
 
-  # Don't let agent modify CI config without confirmation
-  - name: confirm-ci-changes
+  # Deny writes to CI config (use LogOnly if you want visibility without blocking)
+  - name: deny-ci-changes
     matcher:
       type: FsPath
       path_pattern: ".github"
-    action: Confirm
+    action: Deny
 "#
         ),
         "node" => format!(

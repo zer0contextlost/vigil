@@ -20,6 +20,8 @@ pub struct Policy {
 pub enum PolicyAction {
     Allow,
     Deny,
+    /// Reserved for future interactive approval gate. Currently treated as Deny
+    /// with a console warning. Do not use in production policies expecting approval prompts.
     Confirm,
     LogOnly,
 }
