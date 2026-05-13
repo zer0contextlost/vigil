@@ -635,6 +635,9 @@ fn extract_alerts(events: &[vigil_core::envelope::TimestampedEvent]) -> Vec<Aler
             Event::PromptInjectionAlert { snippet, .. } => {
                 ("PINJ".to_string(), snippet.chars().take(80).collect())
             }
+            Event::PolicyReloaded { policy_count, sources, .. } => {
+                ("RLOD".to_string(), format!("Policy reload: {} policies from {}", policy_count, sources.chars().take(50).collect::<String>()))
+            }
             _ => continue,
         };
 
@@ -803,7 +806,8 @@ fn generate_timeline(events: &[vigil_core::envelope::TimestampedEvent]) -> Strin
             | Event::CostAlert { .. }
             | Event::SessionDurationAlert { .. }
             | Event::DriftAlert { .. }
-            | Event::PromptInjectionAlert { .. } => {
+            | Event::PromptInjectionAlert { .. }
+            | Event::PolicyReloaded { .. } => {
                 if current_turn > 0 {
                     turn_markers.insert(current_turn, '!');
                 }

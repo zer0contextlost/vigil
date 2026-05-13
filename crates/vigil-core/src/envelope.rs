@@ -86,6 +86,9 @@ fn extract_session_id(event: &Event) -> Uuid {
         | Event::SessionDurationAlert { session_id, .. }
         | Event::DriftAlert { session_id, .. }
         | Event::SubAgentSpawned { session_id, .. }
-        | Event::PromptInjectionAlert { session_id, .. } => *session_id,
+        | Event::PromptInjectionAlert { session_id, .. }
+        | Event::PolicyReloaded { session_id, .. }
+        | Event::ConfirmApprovalRequired { session_id, .. }
+        | Event::ConfirmApprovalDecision { session_id, .. } => *session_id,
     }
 }

@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use vigil_core::{session::Session, store::SessionStore, AlertLabel, BashExfilFinding, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision, scan_bash_for_exfil};
+use vigil_fleet;
 use vigil_mcp::run_mcp_server;
 use vigil_proxy::{Proxy, DenialRecord, PendingDenials};
 use vigil_tui::{App, BrowseAction};
@@ -92,6 +94,10 @@ enum Commands {
         /// Human-readable label for this session (shown in vigil sessions / browse)
         #[arg(long)]
         name: Option<String>,
+
+        /// Fleet hub address to forward events to (e.g. 127.0.0.1:9900)
+        #[arg(long)]
+        hub: Option<String>,
 
         /// Agent command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -226,6 +232,48 @@ enum Commands {
         /// Human-readable label for this session
         #[arg(long)]
         name: Option<String>,
+
+        /// Fleet hub address to forward events to (e.g. 127.0.0.1:9900)
+        #[arg(long)]
+        hub: Option<String>,
+
+        /// Suppress the local TUI when reporting to a fleet hub
+        #[arg(long)]
+        no_tui: bool,
+    },
+
+    /// Start a fleet hub — aggregates events from multiple agent proxies into a single TUI
+    Hub {
+        /// Address to listen on (default: 127.0.0.1:9900)
+        #[arg(long, default_value = "127.0.0.1:9900")]
+        bind: String,
+
+        /// Policy configuration file (optional — hub can also enforce policy)
+        #[arg(long)]
+        policy: Option<PathBuf>,
+
+        /// vigil.toml configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+
+    /// Run a recorded session through a policy engine and report which events would be blocked.
+    /// Exits 0 if no events would be blocked, 1 if any would be blocked.
+    Test {
+        /// Session ID (UUID, prefix, or name) to test, OR path to an NDJSON file
+        session: String,
+        /// Policy YAML file (legacy format)
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// vigil.toml configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Exit 0 even when events would be blocked (report only, no failure)
+        #[arg(long)]
+        no_fail: bool,
     },
 
     /// Delete session files older than N days
@@ -692,6 +740,7 @@ async fn main() -> Result<()> {
             pii_watchlist,
             plugins,
             name,
+            hub,
             agent_and_args,
         }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
@@ -709,7 +758,7 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("Warning: {}", e),
                 }
             }
-            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host, name).await?;
+            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host, name, hub).await?;
         }
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
@@ -808,7 +857,7 @@ async fn main() -> Result<()> {
         Some(Commands::Fork { session_id, prefix_events, agent_and_args }) => {
             run_fork(&session_id, prefix_events, agent_and_args).await?;
         }
-        Some(Commands::Proxy { port, policy, config, log_file, pii_watchlist, plugins, name }) => {
+        Some(Commands::Proxy { port, policy, config, log_file, pii_watchlist, plugins, name, hub, no_tui }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
             let config_path_str = config.as_deref().map(|p| p.display().to_string());
             let vigil_config = config.as_deref()
@@ -823,7 +872,14 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("Warning: {}", e),
                 }
             }
-            run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name, None).await?;
+            run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name, None, hub, no_tui).await?;
+        }
+        Some(Commands::Hub { bind, policy, config }) => {
+            let bind_addr: std::net::SocketAddr = bind.parse()
+                .context("invalid --bind address (expected host:port, e.g. 127.0.0.1:9900)")?;
+            let vigil_config = config.as_deref()
+                .and_then(|p| vigil_core::VigilConfig::load(p).ok());
+            vigil_fleet::run_hub(bind_addr, policy, vigil_config).await?;
         }
         Some(Commands::Replay { session_id, mock, on_miss, speed }) => {
             let speed = speed.max(0.01);
@@ -893,6 +949,20 @@ async fn main() -> Result<()> {
         Some(Commands::RepairMeta { dry_run }) => {
             run_repair_meta(dry_run)?;
         }
+        Some(Commands::Test { session, policy, config, format, no_fail }) => {
+            let vigil_config = if let Some(ref p) = config {
+                let content = std::fs::read_to_string(p)
+                    .with_context(|| format!("Cannot read config file: {}", p.display()))?;
+                Some(toml::from_str::<vigil_core::VigilConfig>(&content)
+                    .with_context(|| format!("Invalid TOML in: {}", p.display()))?)
+            } else {
+                None
+            };
+            let exit_blocked = run_policy_test(&session, policy.as_deref(), vigil_config.as_ref(), &format)?;
+            if exit_blocked && !no_fail {
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Prune { older_than, dry_run }) => {
             run_prune(older_than, dry_run)?;
         }
@@ -947,6 +1017,151 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// vigil test
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct TestEventResult {
+    event_index: usize,
+    event_type: String,
+    tool_name: Option<String>,
+    action: String,
+    policy_name: Option<String>,
+    reason: Option<String>,
+}
+
+/// Runs a recorded session through the policy engine. Returns true if any events would be blocked.
+fn run_policy_test(
+    session: &str,
+    policy_path: Option<&std::path::Path>,
+    config: Option<&vigil_core::VigilConfig>,
+    format: &str,
+) -> Result<bool> {
+    // Load events — from an NDJSON file path or a stored session ID.
+    let envelopes: Vec<vigil_core::envelope::Envelope> = if std::path::Path::new(session).exists() {
+        let content = std::fs::read_to_string(session)
+            .with_context(|| format!("Cannot read file: {}", session))?;
+        content.lines()
+            .filter(|l| !l.trim().is_empty())
+            .enumerate()
+            .map(|(i, line)| {
+                serde_json::from_str::<vigil_core::envelope::Envelope>(line)
+                    .with_context(|| format!("Invalid NDJSON on line {}", i + 1))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let uuid = resolve_session_id_or_prefix(session)?;
+        vigil_core::store::SessionStore::load_envelopes(&uuid)?
+    };
+
+    if envelopes.is_empty() {
+        anyhow::bail!("No events found for: {}", session);
+    }
+
+    let engine = build_engine(&policy_path.map(PathBuf::from), &config.cloned())?;
+    let policy_count = engine.policy_count();
+    let format_json = format.eq_ignore_ascii_case("json");
+
+    if !format_json {
+        println!("vigil test — {} events, {} policies", envelopes.len(), policy_count);
+        println!();
+    }
+
+    let mut results: Vec<TestEventResult> = Vec::new();
+    let mut session_tokens: u32 = 0;
+    let mut blocked_count = 0usize;
+
+    for (i, env) in envelopes.iter().enumerate() {
+        let event = &env.event;
+        if let vigil_core::Event::LlmResponse { input_tokens, output_tokens, .. } = event {
+            session_tokens = session_tokens.saturating_add(input_tokens + output_tokens);
+        }
+
+        let decision = engine.evaluate(event, session_tokens);
+
+        // Skip purely informational events that trivially Allow.
+        if matches!(decision.action, vigil_core::PolicyAction::Allow)
+            && matches!(
+                event,
+                vigil_core::Event::LlmResponse { .. }
+                    | vigil_core::Event::PolicyReloaded { .. }
+                    | vigil_core::Event::WriteApprovalDecision { .. }
+                    | vigil_core::Event::ConfirmApprovalDecision { .. }
+            )
+        {
+            continue;
+        }
+
+        let blocked = matches!(decision.action, vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm);
+        if blocked { blocked_count += 1; }
+
+        let tool_name = if let vigil_core::Event::ToolCall { ref tool_name, .. } = event {
+            Some(tool_name.clone())
+        } else {
+            None
+        };
+
+        let event_label = {
+            let s = format!("{:?}", event);
+            s.split(|c: char| c == '{' || c == ' ').next().unwrap_or("Event").to_string()
+        };
+
+        let action_str = match &decision.action {
+            vigil_core::PolicyAction::Allow   => "allow",
+            vigil_core::PolicyAction::Deny    => "DENY",
+            vigil_core::PolicyAction::Confirm => "CONFIRM",
+            vigil_core::PolicyAction::LogOnly => "log",
+        };
+
+        if !format_json {
+            let status = if blocked { "FAIL" } else if matches!(decision.action, vigil_core::PolicyAction::LogOnly) { "LOG " } else { "pass" };
+            let tool_suffix = tool_name.as_deref().map(|t| format!(" ({})", t)).unwrap_or_default();
+            let block_suffix = if blocked {
+                format!("  ← {} by '{}'", action_str, decision.policy_name.as_deref().unwrap_or("unnamed"))
+            } else {
+                String::new()
+            };
+            println!("[{}]  #{:>4}  {}{}{}", status, i + 1, event_label, tool_suffix, block_suffix);
+        }
+
+        results.push(TestEventResult {
+            event_index: i + 1,
+            event_type: event_label,
+            tool_name,
+            action: action_str.to_string(),
+            policy_name: decision.policy_name,
+            reason: decision.reason,
+        });
+    }
+
+    if format_json {
+        let blocked_results: Vec<&TestEventResult> = results.iter()
+            .filter(|r| r.action == "DENY" || r.action == "CONFIRM")
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "events_total": envelopes.len(),
+            "policies": policy_count,
+            "blocked": blocked_count,
+            "blocked_events": blocked_results,
+        }))?);
+    } else {
+        println!();
+        println!("── Summary ──────────────────────────────────");
+        println!("  Total events:  {}", envelopes.len());
+        println!("  Policies:      {}", policy_count);
+        println!("  Would block:   {}", blocked_count);
+        println!();
+        if blocked_count == 0 {
+            println!("  PASS — policy would not have blocked anything.");
+        } else {
+            println!("  FAIL — {} event(s) would have been blocked.", blocked_count);
+        }
+    }
+
+    Ok(blocked_count > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1520,8 @@ async fn run_replay_mock(session_id_str: &str, on_miss: fake_upstream::OnMiss) -
         PluginHost::new(),
         Some(session_name),
         Some(fake_url),
+        None,
+        false,
     ).await?;
 
     let h = hits.load(Ordering::Relaxed);
@@ -1472,7 +1689,7 @@ async fn run_agent(
     config: Option<vigil_core::VigilConfig>,
     config_path: Option<String>,
 ) -> Result<()> {
-    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None).await
+    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None, None).await
 }
 
 /// Read a user-scoped (non-inherited) environment variable from the Windows registry.
@@ -1515,6 +1732,99 @@ fn get_user_env_var(name: &str) -> Option<String> {
 /// Start the proxy and TUI without spawning an agent process.
 /// Use this with IDEs (Cursor, etc.) that connect to vigil via their own
 /// "Override Base URL" setting rather than being launched by vigil.
+/// Build a PolicyEngine from an optional --policy file or VigilConfig.
+fn build_engine(
+    policy: &Option<PathBuf>,
+    config: &Option<vigil_core::VigilConfig>,
+) -> Result<PolicyEngine> {
+    if let Some(p) = policy {
+        Ok(PolicyEngine::from_file(p)?)
+    } else if let Some(cfg) = config {
+        let policies = cfg.to_policies();
+        if policies.is_empty() {
+            Ok(PolicyEngine::default())
+        } else {
+            Ok(PolicyEngine::new(vigil_core::PolicyConfig { policies })?)
+        }
+    } else {
+        Ok(PolicyEngine::default())
+    }
+}
+
+/// Watch config files for changes and hot-reload the policy engine.
+/// Uses notify's file-system watcher; emits PolicyReloaded events to the TUI.
+fn spawn_config_watcher(
+    policy_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    engine: Arc<ArcSwap<PolicyEngine>>,
+    filtered_tx: tokio::sync::broadcast::Sender<TimestampedEvent>,
+    session_id: uuid::Uuid,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let watched = vigil_core::VigilConfig::find_config_paths(config_path.as_deref());
+        if watched.is_empty() && policy_path.is_none() {
+            return;
+        }
+
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(32);
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = notify_tx.blocking_send(res);
+        }) {
+            Ok(w) => w,
+            Err(e) => { tracing::warn!(err=%e, "config watcher init failed"); return; }
+        };
+
+        use notify::Watcher;
+        for path in &watched {
+            let _ = watcher.watch(path, notify::RecursiveMode::NonRecursive);
+        }
+        if let Some(ref p) = policy_path {
+            if p.exists() { let _ = watcher.watch(p, notify::RecursiveMode::NonRecursive); }
+        }
+
+        let sources_label = watched.iter()
+            .map(|p| p.display().to_string())
+            .chain(policy_path.iter().map(|p| p.display().to_string()))
+            .collect::<Vec<_>>()
+            .join(";");
+
+        while let Some(event) = notify_rx.recv().await {
+            match event {
+                Ok(e) if matches!(
+                    e.kind,
+                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                ) => {
+                    // Debounce: editors often write via temp file rename
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    // Drain any further events that piled up during the debounce
+                    while notify_rx.try_recv().is_ok() {}
+
+                    let new_config = config_path.as_deref().and_then(|p| {
+                        vigil_core::VigilConfig::load(p).ok()
+                    });
+                    match build_engine(&policy_path, &new_config) {
+                        Ok(new_engine) => {
+                            let count = new_engine.policy_count();
+                            engine.store(Arc::new(new_engine));
+                            let reload_event = TimestampedEvent::new(Event::PolicyReloaded {
+                                session_id,
+                                policy_count: count,
+                                sources: sources_label.clone(),
+                            });
+                            filtered_tx.send(reload_event).ok();
+                            eprintln!("[vigil] Policy hot-reloaded: {} rules active", count);
+                        }
+                        Err(err) => {
+                            eprintln!("[vigil] Policy reload failed (keeping previous rules): {}", err);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
 pub async fn run_proxy_mode(
     port: u16,
     policy: Option<PathBuf>,
@@ -1525,6 +1835,8 @@ pub async fn run_proxy_mode(
     plugins: PluginHost,
     session_name: Option<String>,
     upstream_override: Option<String>,
+    hub: Option<String>,
+    no_tui: bool,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -1537,16 +1849,7 @@ pub async fn run_proxy_mode(
     }
     session.name = store.as_ref().map(|s| s.meta.name.clone()).flatten();
 
-    let engine = if let Some(policy_path) = &policy {
-        PolicyEngine::from_file(policy_path)?
-    } else if let Some(cfg) = &config {
-        let policies = cfg.to_policies();
-        if policies.is_empty() { PolicyEngine::default() }
-        else { PolicyEngine::new(vigil_core::PolicyConfig { policies })? }
-    } else {
-        PolicyEngine::default()
-    };
-    let engine = Arc::new(engine);
+    let engine = Arc::new(ArcSwap::from_pointee(build_engine(&policy, &config)?));
 
     let plugin_host = Arc::new(plugins);
     let ctx_start = make_plugin_ctx(session_id);
@@ -1581,6 +1884,36 @@ pub async fn run_proxy_mode(
     let port = find_available_port(port)?;
 
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Maps confirm approval_id → tool_use_id. Filter task inserts on Confirm match;
+    // resolver removes and clears pending_denials on approval, or leaves for timeout denial.
+    let confirm_approvals: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Fleet hub integration — forward events and pipe confirm decisions back.
+    let fleet_tx_opt: Option<tokio::sync::mpsc::Sender<vigil_fleet::FleetMsg>> = if let Some(ref hub_addr_str) = hub {
+        match hub_addr_str.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let (ftx, mut frx) = vigil_fleet::spawn_fleet_client(addr, session_id, label.clone());
+                let dtx = decision_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = frx.recv().await {
+                        if let vigil_fleet::FleetMsg::ConfirmDecision { approval_id, approved } = msg {
+                            dtx.send((approval_id, approved)).await.ok();
+                        }
+                    }
+                });
+                eprintln!("[vigil] Reporting to fleet hub at {}", addr);
+                Some(ftx)
+            }
+            Err(e) => {
+                eprintln!("[vigil] Warning: invalid --hub address '{}': {} — running standalone", hub_addr_str, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -1602,19 +1935,44 @@ pub async fn run_proxy_mode(
         }
     });
 
+    let confirm_approvals_resolver = confirm_approvals.clone();
+    let pending_denials_resolver = pending_denials.clone();
+    let filtered_tx_resolver = filtered_tx.clone();
+    let resolver_session_id = session_id;
     let resolver_handle = tokio::spawn(async move {
         while let Some((approval_id, approved)) = decision_rx.recv().await {
-            let tx = { pending_approvals_for_resolver.lock().unwrap().remove(&approval_id) };
-            match tx {
-                Some(tx) => {
-                    if tx.send(approved).is_err() {
-                        tracing::warn!(%approval_id, "approval receiver dropped before decision reached proxy");
-                    }
+            // Write approval: proxy is awaiting a oneshot — forward the decision.
+            let write_tx = { pending_approvals_for_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(tx) = write_tx {
+                if tx.send(approved).is_err() {
+                    tracing::warn!(%approval_id, "write approval receiver dropped before decision reached proxy");
                 }
-                None => tracing::warn!(%approval_id, "approval ID not found in pending map"),
+                continue;
+            }
+            // Policy Confirm approval: remove from confirm_approvals; if approved clear pending_denials.
+            let tool_use_id = { confirm_approvals_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(ref id) = tool_use_id {
+                if approved {
+                    pending_denials_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                }
+                filtered_tx_resolver.send(vigil_core::TimestampedEvent::new(vigil_core::Event::ConfirmApprovalDecision {
+                    approval_id,
+                    approved,
+                    session_id: resolver_session_id,
+                })).ok();
+            } else {
+                tracing::warn!(%approval_id, "approval ID not found in any pending map");
             }
         }
     });
+
+    let _watcher_handle = spawn_config_watcher(
+        policy.clone(),
+        config_path.as_ref().map(PathBuf::from),
+        engine.clone(),
+        filtered_tx.clone(),
+        session_id,
+    );
 
     println!("vigil v{} — proxy mode", env!("CARGO_PKG_VERSION"));
     println!("Session ID: {}", session_id);
@@ -1652,9 +2010,11 @@ pub async fn run_proxy_mode(
     let loop_threshold = config.as_ref().and_then(|c| c.budget.loop_detect_threshold).unwrap_or(5);
     let sub_agent_depth_limit_proxy = config.as_ref().and_then(|c| c.budget.max_sub_agent_depth);
     let drift_cfg_proxy = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
+    let confirm_timeout_secs_proxy = config.as_ref().map(|c| c.confirm.timeout_secs).unwrap_or(30);
     let plugin_host_filter = plugin_host.clone();
     let engine_clone = engine.clone();
     let pending_denials_filter = pending_denials.clone();
+    let confirm_approvals_filter = confirm_approvals.clone();
     let tui_rx = filtered_tx.subscribe();
 
     if let Some(dashboard_port) = config.as_ref().and_then(|c| c.web.port)
@@ -1670,12 +2030,18 @@ pub async fn run_proxy_mode(
         println!("Dashboard: http://127.0.0.1:{}", dashboard_port);
     }
 
+    let fleet_tx_filter = fleet_tx_opt;
     let filter_handle = tokio::spawn(async move {
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
         let mut cred_tracker = CredentialTracker::new();
         let mut sub_agent_depth: u32 = 0;
+
         while let Some(event) = raw_rx.recv().await {
+            // Forward raw events to fleet hub.
+            if let Some(ref ftx) = fleet_tx_filter {
+                ftx.try_send(vigil_fleet::fleet_event(session_id, event.clone())).ok();
+            }
             if let Event::FsRead { path, .. } = &event.event {
                 if let Ok(content) = std::fs::read_to_string(path) {
                     cred_tracker.ingest_file(&content, path);
@@ -1789,20 +2155,87 @@ pub async fn run_proxy_mode(
                 continue;
             }
 
-            let decision = engine_clone.evaluate(&event.event, 0);
+            let decision = engine_clone.load().evaluate(&event.event, 0);
             match decision.action {
-                vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm => {
-                    if matches!(decision.action, vigil_core::PolicyAction::Confirm) {
-                        eprintln!(
-                            "[POLICY CONFIRM] {} — interactive gate not yet available; denying to be safe",
-                            decision.policy_name.as_deref().unwrap_or("unnamed")
-                        );
+                vigil_core::PolicyAction::Confirm => {
+                    if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
+                        let input_summary = input.to_string().chars().take(200).collect::<String>();
+                        let policy_name = decision.policy_name.clone().unwrap_or_else(|| "unnamed".to_string());
+                        // Pre-populate denial (default deny while awaiting human decision).
+                        if let Some(id) = tool_use_id {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
+                                tool_name: tool_name.clone(),
+                                policy_name: Some(policy_name.clone()),
+                                reason: Some(format!("Awaiting human approval (policy: {})", policy_name)),
+                                input_summary,
+                            });
+                            // Register in confirm_approvals so the resolver can clear the denial on approval.
+                            let approval_id = uuid::Uuid::new_v4();
+                            confirm_approvals_filter.lock().unwrap_or_else(|e| e.into_inner())
+                                .insert(approval_id, id.clone());
+                            // Notify TUI.
+                            eprintln!("[POLICY CONFIRM] {} — waiting for human approval ({timeout_secs}s)", policy_name, timeout_secs = confirm_timeout_secs_proxy);
+                            let confirm_event = TimestampedEvent::new(Event::ConfirmApprovalRequired {
+                                approval_id,
+                                tool_name: tool_name.clone(),
+                                policy_name: policy_name.clone(),
+                                timeout_secs: confirm_timeout_secs_proxy,
+                                session_id: *session_id,
+                            });
+                            filtered_tx.send(confirm_event.clone()).ok();
+                            // If reporting to a fleet hub, delegate the confirm prompt there.
+                            // Use .send().await (not try_send) — control-plane messages must not drop.
+                            if let Some(ref ftx) = fleet_tx_filter {
+                                ftx.send(vigil_fleet::FleetMsg::ConfirmRequest {
+                                    agent_id: *session_id,
+                                    approval_id,
+                                    tool_name: tool_name.clone(),
+                                    policy_name: policy_name.clone(),
+                                    timeout_secs: confirm_timeout_secs_proxy,
+                                }).await.ok();
+                            }
+                            // Spawn timeout task — auto-denies if no decision arrives in time.
+                            let ca = confirm_approvals_filter.clone();
+                            let ftx2 = filtered_tx.clone();
+                            let sid = *session_id;
+                            let tout = confirm_timeout_secs_proxy;
+                            let pn = policy_name.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(tout as u64)).await;
+                                // Only emit if still unresolved.
+                                let still_pending = ca.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id).is_some();
+                                if still_pending {
+                                    eprintln!("[POLICY CONFIRM] {} — timed out after {}s, denying", pn, tout);
+                                    ftx2.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
+                                        approval_id,
+                                        approved: false,
+                                        session_id: sid,
+                                    })).ok();
+                                }
+                            });
+                        }
+                        // Emit a blocked ToolCallResult so the TUI shows it blocked.
+                        let detail = serde_json::json!({"tool_name": tool_name, "policy": &policy_name, "reason": "awaiting confirmation"});
+                        let ctx = make_plugin_ctx(*session_id);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
+                        let blocked = TimestampedEvent::new(Event::ToolCallResult {
+                            agent: agent.clone(), tool_name: tool_name.clone(),
+                            blocked: true, session_id: *session_id,
+                            correlation_id: None, duration_ms: None, is_error: false,
+                        });
+                        plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
+                        filtered_tx.send(blocked).ok();
                     }
+                }
+                vigil_core::PolicyAction::Deny => {
                     if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
                         let input_summary = input.to_string().chars().take(200).collect::<String>();
                         // Record denial so the proxy can inject a typed error into the next tool_result.
                         if let Some(id) = tool_use_id {
-                            pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
                                 tool_name: tool_name.clone(),
                                 policy_name: decision.policy_name.clone(),
                                 reason: decision.reason.clone(),
@@ -1818,6 +2251,9 @@ pub async fn run_proxy_mode(
                             correlation_id: None, duration_ms: None, is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
                         filtered_tx.send(blocked).ok();
                     }
                 }
@@ -1827,7 +2263,7 @@ pub async fn run_proxy_mode(
                         if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input).await {
                             let input_summary = input.to_string().chars().take(200).collect::<String>();
                             if let Some(id) = tool_use_id {
-                                pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                                pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
                                     tool_name: tool_name.clone(),
                                     policy_name: Some("plugin".to_string()),
                                     reason: Some(reason.clone()),
@@ -1856,11 +2292,17 @@ pub async fn run_proxy_mode(
         }
     });
 
-    let mut app = App::new(session);
-    app.store = store;
-    app.config_path = config_path;
-    app.decision_tx = Some(decision_tx);
-    vigil_tui::run_tui(app, tui_rx).await?;
+    if no_tui {
+        // Fleet mode without local TUI — wait for Ctrl+C.
+        eprintln!("[vigil] Running headless (--no-tui). Press Ctrl+C to stop.");
+        tokio::signal::ctrl_c().await.ok();
+    } else {
+        let mut app = App::new(session);
+        app.store = store;
+        app.config_path = config_path;
+        app.decision_tx = Some(decision_tx);
+        vigil_tui::run_tui(app, tui_rx).await?;
+    }
 
     proxy_handle.abort();
     filter_handle.abort();
@@ -1880,6 +2322,7 @@ pub async fn run_agent_with_plugins(
     config_path: Option<String>,
     plugins: PluginHost,
     session_name: Option<String>,
+    hub: Option<String>,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -1913,23 +2356,11 @@ pub async fn run_agent_with_plugins(
         });
     }
 
-    let engine = if let Some(policy_path) = &policy {
-        PolicyEngine::from_file(policy_path)?
-    } else if let Some(cfg) = &config {
-        let policies = cfg.to_policies();
-        if policies.is_empty() {
-            PolicyEngine::default()
-        } else {
-            PolicyEngine::new(vigil_core::PolicyConfig { policies })?
-        }
-    } else {
-        PolicyEngine::default()
-    };
-    let engine = Arc::new(engine);
+    let engine = Arc::new(ArcSwap::from_pointee(build_engine(&policy, &config)?));
 
     // Warn when no enforcement is active. Check the compiled policy count rather
     // than the raw config lists so defaults (blocked_commands) are counted too.
-    let observational_only = config.is_none() || engine.policy_count() == 0;
+    let observational_only = config.is_none() || engine.load().policy_count() == 0;
 
     let budget_enforcer = config.as_ref().map(|c| BudgetEnforcer::new(c.budget.clone()));
     let burn_rate_limit = config.as_ref().and_then(|c| c.budget.max_burn_rate_usd_per_min);
@@ -1999,6 +2430,33 @@ pub async fn run_agent_with_plugins(
     tracing::info!(port, "starting vigil proxy");
 
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let confirm_approvals: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let fleet_tx_agent: Option<tokio::sync::mpsc::Sender<vigil_fleet::FleetMsg>> = if let Some(ref hub_addr_str) = hub {
+        match hub_addr_str.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let (ftx, mut frx) = vigil_fleet::spawn_fleet_client(addr, session_id, agent_name.clone());
+                let dtx = decision_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = frx.recv().await {
+                        if let vigil_fleet::FleetMsg::ConfirmDecision { approval_id, approved } = msg {
+                            dtx.send((approval_id, approved)).await.ok();
+                        }
+                    }
+                });
+                eprintln!("[vigil] Reporting to fleet hub at {}", addr);
+                Some(ftx)
+            }
+            Err(e) => {
+                eprintln!("[vigil] Warning: invalid --hub address '{}': {} — running standalone", hub_addr_str, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -2021,22 +2479,42 @@ pub async fn run_agent_with_plugins(
         }
     });
 
+    let confirm_approvals_resolver = confirm_approvals.clone();
+    let pending_denials_resolver = pending_denials.clone();
+    let filtered_tx_resolver = filtered_tx.clone();
+    let resolver_session_id = session_id;
     let resolver_handle = tokio::spawn(async move {
         while let Some((approval_id, approved)) = decision_rx.recv().await {
-            let tx = {
-                let mut map = pending_approvals_for_resolver.lock().unwrap();
-                map.remove(&approval_id)
-            };
-            match tx {
-                Some(tx) => {
-                    if tx.send(approved).is_err() {
-                        tracing::warn!(%approval_id, "approval receiver dropped before decision reached proxy");
-                    }
+            let write_tx = { pending_approvals_for_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(tx) = write_tx {
+                if tx.send(approved).is_err() {
+                    tracing::warn!(%approval_id, "write approval receiver dropped before decision reached proxy");
                 }
-                None => tracing::warn!(%approval_id, "approval ID not found in pending map"),
+                continue;
+            }
+            let tool_use_id = { confirm_approvals_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(ref id) = tool_use_id {
+                if approved {
+                    pending_denials_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                }
+                filtered_tx_resolver.send(vigil_core::TimestampedEvent::new(vigil_core::Event::ConfirmApprovalDecision {
+                    approval_id,
+                    approved,
+                    session_id: resolver_session_id,
+                })).ok();
+            } else {
+                tracing::warn!(%approval_id, "approval ID not found in any pending map");
             }
         }
     });
+
+    let _watcher_handle = spawn_config_watcher(
+        policy.clone(),
+        config_path.as_ref().map(PathBuf::from),
+        engine.clone(),
+        filtered_tx.clone(),
+        session_id,
+    );
 
     // Extract window layout config if present.
     let window_cfg = config.as_ref().and_then(|c| c.window.clone());
@@ -2213,6 +2691,8 @@ pub async fn run_agent_with_plugins(
     let notifier_filter = webhook_notifier.clone();
     let plugin_host_filter = plugin_host.clone();
     let pending_denials_filter = pending_denials.clone();
+    let confirm_approvals_filter = confirm_approvals.clone();
+    let confirm_timeout_secs_agent = config.as_ref().map(|c| c.confirm.timeout_secs).unwrap_or(30);
     let tui_rx = filtered_tx.subscribe();
 
     if let Some(dashboard_port) = config.as_ref().and_then(|c| c.web.port)
@@ -2228,6 +2708,7 @@ pub async fn run_agent_with_plugins(
         println!("Dashboard: http://127.0.0.1:{}", dashboard_port);
     }
 
+    let fleet_tx_agent_filter = fleet_tx_agent;
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
@@ -2238,6 +2719,10 @@ pub async fn run_agent_with_plugins(
         let mut cred_tracker = CredentialTracker::new();
         let mut sub_agent_depth: u32 = 0;
         while let Some(event) = raw_rx.recv().await {
+            // Forward raw events to fleet hub.
+            if let Some(ref ftx) = fleet_tx_agent_filter {
+                ftx.try_send(vigil_fleet::fleet_event(session_id, event.clone())).ok();
+            }
             // Tool timeout tracking: arm on ToolCall, disarm on LlmRequest
             if let Event::ToolCall { tool_name, .. } = &event.event {
                 if let Ok(mut g) = last_tool_call_filter.lock() {
@@ -2550,7 +3035,7 @@ pub async fn run_agent_with_plugins(
                 }
             }
 
-            let decision = engine_clone.evaluate(&event.event, session_tokens);
+            let decision = engine_clone.load().evaluate(&event.event, session_tokens);
             tracing::debug!(
                 action = ?decision.action,
                 policy = ?decision.policy_name,
@@ -2558,38 +3043,85 @@ pub async fn run_agent_with_plugins(
             );
 
             match decision.action {
-                vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm => {
-                    tracing::warn!(
-                        policy = ?decision.policy_name,
-                        reason = ?decision.reason,
-                        "event denied by policy"
-                    );
-                    if matches!(decision.action, vigil_core::PolicyAction::Confirm) {
-                        eprintln!(
-                            "[POLICY CONFIRM] {} — interactive gate not yet available; denying to be safe",
-                            decision.policy_name.as_deref().unwrap_or("unnamed")
-                        );
-                    } else {
-                        eprintln!(
-                            "[POLICY DENY] {} — {}",
-                            decision.policy_name.as_deref().unwrap_or("hardcoded"),
-                            decision.reason.as_deref().unwrap_or("")
-                        );
-                    }
-                    if let Event::ToolCall {
-                        agent,
-                        tool_name,
-                        input,
-                        session_id,
-                        tool_use_id,
-                        ..
-                    } = &event.event
-                    {
+                vigil_core::PolicyAction::Confirm => {
+                    if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
                         let input_summary = input.to_string().chars().take(200).collect::<String>();
-                        // Record the denial so the proxy rewrites the matching tool_result
-                        // with a structured error, letting the agent continue on safe work.
+                        let policy_name = decision.policy_name.clone().unwrap_or_else(|| "unnamed".to_string());
                         if let Some(id) = tool_use_id {
-                            pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
+                                tool_name: tool_name.clone(),
+                                policy_name: Some(policy_name.clone()),
+                                reason: Some(format!("Awaiting human approval (policy: {})", policy_name)),
+                                input_summary,
+                            });
+                            let approval_id = uuid::Uuid::new_v4();
+                            confirm_approvals_filter.lock().unwrap_or_else(|e| e.into_inner())
+                                .insert(approval_id, id.clone());
+                            eprintln!("[POLICY CONFIRM] {} — waiting for human approval ({timeout_secs}s)", policy_name, timeout_secs = confirm_timeout_secs_agent);
+                            let confirm_ev = TimestampedEvent::new(Event::ConfirmApprovalRequired {
+                                approval_id,
+                                tool_name: tool_name.clone(),
+                                policy_name: policy_name.clone(),
+                                timeout_secs: confirm_timeout_secs_agent,
+                                session_id: *session_id,
+                            });
+                            filtered_tx.send(confirm_ev).ok();
+                            if let Some(ref ftx) = fleet_tx_agent_filter {
+                                ftx.send(vigil_fleet::FleetMsg::ConfirmRequest {
+                                    agent_id: *session_id,
+                                    approval_id,
+                                    tool_name: tool_name.clone(),
+                                    policy_name: policy_name.clone(),
+                                    timeout_secs: confirm_timeout_secs_agent,
+                                }).await.ok();
+                            }
+                            let ca = confirm_approvals_filter.clone();
+                            let ftx2 = filtered_tx.clone();
+                            let sid = *session_id;
+                            let tout = confirm_timeout_secs_agent;
+                            let pn = policy_name.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(tout as u64)).await;
+                                let still_pending = ca.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id).is_some();
+                                if still_pending {
+                                    eprintln!("[POLICY CONFIRM] {} — timed out after {}s, denying", pn, tout);
+                                    ftx2.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
+                                        approval_id,
+                                        approved: false,
+                                        session_id: sid,
+                                    })).ok();
+                                }
+                            });
+                        }
+                        let detail = serde_json::json!({"tool_name": tool_name, "policy": &policy_name, "reason": "awaiting confirmation"});
+                        if let Some(ref n) = notifier_filter {
+                            n.send("DENY", &session_id.to_string(), detail.clone());
+                        }
+                        let ctx = make_plugin_ctx(*session_id);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
+                        let blocked = TimestampedEvent::new(Event::ToolCallResult {
+                            agent: agent.clone(), tool_name: tool_name.clone(),
+                            blocked: true, session_id: *session_id,
+                            correlation_id: None, duration_ms: None, is_error: false,
+                        });
+                        plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_agent_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
+                        filtered_tx.send(blocked).ok();
+                    }
+                }
+                vigil_core::PolicyAction::Deny => {
+                    tracing::warn!(policy = ?decision.policy_name, reason = ?decision.reason, "event denied by policy");
+                    eprintln!(
+                        "[POLICY DENY] {} — {}",
+                        decision.policy_name.as_deref().unwrap_or("hardcoded"),
+                        decision.reason.as_deref().unwrap_or("")
+                    );
+                    if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
+                        let input_summary = input.to_string().chars().take(200).collect::<String>();
+                        if let Some(id) = tool_use_id {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
                                 tool_name: tool_name.clone(),
                                 policy_name: decision.policy_name.clone(),
                                 reason: decision.reason.clone(),
@@ -2616,6 +3148,9 @@ pub async fn run_agent_with_plugins(
                             is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_agent_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
                         filtered_tx.send(blocked).ok();
                     }
                 }
@@ -3039,6 +3574,9 @@ fn generate_vigil_toml() -> String {
 # yolo_paths    = ["tests/", "*.md", "docs/"]   # never need approval
 # watch_paths   = ["src/"]                       # always need approval
 # lockdown_paths = [".env", "*.pem", "*.key"]   # approval + elevated warning
+
+[confirm]
+# timeout_secs = 30                             # seconds to wait before auto-deny
 
 # [[policies]]
 # name = "block-bash"

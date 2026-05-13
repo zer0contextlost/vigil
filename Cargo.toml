@@ -2,6 +2,7 @@
 members = [
     "crates/vigil-cli",
     "crates/vigil-core",
+    "crates/vigil-fleet",
     "crates/vigil-plugin",
     "crates/vigil-proxy",
     "crates/vigil-mcp",
@@ -16,7 +17,7 @@ default-members = ["crates/vigil-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["zer0contextlost <zer0contextlost@proton.me>"]
 license = "MIT"
