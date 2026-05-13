@@ -129,7 +129,7 @@ fn build_report(session: &Session, config: &ReportConfig) -> Result<Report> {
 
     Ok(Report {
         session_id: session.id.to_string(),
-        scorecard_version: 1,
+        scorecard_version: 2,
         headline,
         hygiene,
         alerts,
@@ -283,6 +283,15 @@ fn compute_hygiene_signals(events: &[vigil_core::envelope::TimestampedEvent], co
         verdict,
         note,
     });
+
+    // i. Cache efficiency
+    if let Some((verdict, note)) = signal_cache_efficiency(events) {
+        signals.push(HygieneSignal {
+            signal: "cache_efficiency".to_string(),
+            verdict,
+            note,
+        });
+    }
 
     signals
 }
@@ -520,6 +529,40 @@ fn signal_alert_clustering(
         ("WATCH".to_string(), format!("Alert rate increased {:.1}x in second half", ratio))
     } else {
         ("GOOD".to_string(), "Alert rate stable or improving".to_string())
+    };
+
+    Some((verdict, note))
+}
+
+fn signal_cache_efficiency(events: &[vigil_core::envelope::TimestampedEvent]) -> Option<(String, String)> {
+    let mut input_tokens: u64 = 0;
+    let mut cache_read: u64 = 0;
+    let mut cache_creation: u64 = 0;
+    let mut turns: u32 = 0;
+
+    for env in events {
+        if let Event::LlmResponse { input_tokens: it, cache_read_input_tokens: cr, cache_creation_input_tokens: cw, .. } = &env.event {
+            input_tokens += *it as u64;
+            cache_read += *cr as u64;
+            cache_creation += *cw as u64;
+            turns += 1;
+        }
+    }
+
+    // Skip sessions too short to have meaningful cache patterns
+    if turns < 3 || (input_tokens + cache_read + cache_creation) == 0 {
+        return None;
+    }
+
+    let total = input_tokens + cache_read + cache_creation;
+    let hit_rate = cache_read as f64 / total as f64;
+
+    let (verdict, note) = if hit_rate >= 0.60 {
+        ("GOOD".to_string(), format!("{:.0}% of input served from cache — prompt caching is working well", hit_rate * 100.0))
+    } else if hit_rate >= 0.10 {
+        ("WATCH".to_string(), format!("{:.0}% cache hit rate — consider structuring prompts to maximise cache reuse", hit_rate * 100.0))
+    } else {
+        ("FLAG".to_string(), format!("{:.0}% cache hit rate — nearly all input is billed at full price; check that system prompt is cacheable", hit_rate * 100.0))
     };
 
     Some((verdict, note))
@@ -1274,6 +1317,8 @@ mod tests {
             ended_at: Some(now + chrono::Duration::seconds(timestamped_events.len() as i64)),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             total_cost_usd: 0.0,
             policy_violations: 0,
             pii_detections: 0,

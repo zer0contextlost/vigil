@@ -112,7 +112,11 @@ enum Commands {
     Sessions,
 
     /// Browse past sessions in an interactive TUI
-    Browse,
+    Browse {
+        /// Replay speed multiplier (2.0 = twice as fast, 0.5 = half speed)
+        #[arg(long, default_value = "1.0")]
+        speed: f64,
+    },
 
     /// Tag a session with a human-readable name
     Tag {
@@ -139,6 +143,9 @@ enum Commands {
         /// What to do on a cache miss in mock mode: error (default) or stub
         #[arg(long, default_value = "error")]
         on_miss: String,
+        /// Replay speed multiplier (2.0 = twice as fast, 0.5 = half speed)
+        #[arg(long, default_value = "1.0")]
+        speed: f64,
     },
 
     /// Verify hash chain integrity of a recorded session
@@ -236,6 +243,13 @@ enum Commands {
         /// Skip the confirmation prompt and delete immediately
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+
+    /// Recompute and rewrite .meta.json stats from NDJSON event logs
+    RepairMeta {
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Show cost breakdown by branch and day
@@ -690,7 +704,8 @@ async fn main() -> Result<()> {
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
         }
-        Some(Commands::Browse) => {
+        Some(Commands::Browse { speed }) => {
+            let speed = speed.max(0.01);
             loop {
                 let summaries = Session::list_all()?;
                 match vigil_tui::run_session_browser(summaries).await? {
@@ -703,7 +718,7 @@ async fn main() -> Result<()> {
                                 if i > 0 {
                                     let prev_ts = envelopes_clone[i - 1].timestamp;
                                     let delta = env.timestamp.signed_duration_since(prev_ts);
-                                    let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                                    let ms = (delta.num_milliseconds().max(0) as f64 / speed).min(500.0) as u64;
                                     if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
                                 }
                                 if tx.send(env.clone()).is_err() { break; }
@@ -800,7 +815,8 @@ async fn main() -> Result<()> {
             }
             run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name, None).await?;
         }
-        Some(Commands::Replay { session_id, mock, on_miss }) => {
+        Some(Commands::Replay { session_id, mock, on_miss, speed }) => {
+            let speed = speed.max(0.01);
             if mock {
                 let on_miss_mode = match on_miss.to_ascii_lowercase().as_str() {
                     "stub" => fake_upstream::OnMiss::Stub,
@@ -821,7 +837,7 @@ async fn main() -> Result<()> {
                         if i > 0 {
                             let prev_ts = envelopes_clone[i - 1].timestamp;
                             let delta = event.timestamp.signed_duration_since(prev_ts);
-                            let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                            let ms = (delta.num_milliseconds().max(0) as f64 / speed).min(500.0) as u64;
                             if ms > 0 {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
                             }
@@ -844,14 +860,28 @@ async fn main() -> Result<()> {
                 let session = vigil_core::session::Session::load(&uuid)?;
                 println!("Replaying session {} ({} events, JSON)...", session_id, session.events.len());
                 let (tx, rx) = tokio::sync::broadcast::channel(session.events.len().max(1));
-                for event in &session.events {
-                    tx.send(event.clone()).ok();
-                }
-                drop(tx);
+                let events_clone = session.events.clone();
+                let replay_task = tokio::spawn(async move {
+                    for (i, event) in events_clone.iter().enumerate() {
+                        if i > 0 {
+                            let prev_ts = events_clone[i - 1].timestamp;
+                            let delta = event.timestamp.signed_duration_since(prev_ts);
+                            let ms = (delta.num_milliseconds().max(0) as f64 / speed).min(500.0) as u64;
+                            if ms > 0 {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
+                            }
+                        }
+                        if tx.send(event.clone()).is_err() { break; }
+                    }
+                });
                 let mut app = App::new(session);
                 app.is_replay = true;
                 vigil_tui::run_tui(app, rx).await?;
+                let _ = replay_task.await;
             }
+        }
+        Some(Commands::RepairMeta { dry_run }) => {
+            run_repair_meta(dry_run)?;
         }
         Some(Commands::Prune { older_than, dry_run }) => {
             run_prune(older_than, dry_run)?;
@@ -879,6 +909,8 @@ async fn main() -> Result<()> {
                 ended_at: meta.ended_at,
                 total_input_tokens: meta.total_input_tokens,
                 total_output_tokens: meta.total_output_tokens,
+                total_cache_read_tokens: meta.total_cache_read_tokens,
+                total_cache_creation_tokens: meta.total_cache_creation_tokens,
                 total_cost_usd: meta.total_cost_usd,
                 policy_violations: meta.policy_violations,
                 pii_detections: meta.pii_detections,
@@ -1365,7 +1397,7 @@ async fn run_interactive() -> Result<()> {
         return Ok(());
     }
     let watchlist = load_pii_watchlist(None);
-    run_agent(8877, None, None, args, watchlist, None, None).await
+    run_agent(find_available_port(8877)?, None, None, args, watchlist, None, None).await
 }
 
 /// Load PII watchlist terms: explicit file path first, then auto-load ~/.vigil/watchlist.txt.
@@ -1532,6 +1564,8 @@ pub async fn run_proxy_mode(
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
         }))
     };
+
+    let port = find_available_port(port)?;
 
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
@@ -1906,17 +1940,11 @@ pub async fn run_agent_with_plugins(
         println!("Log file: {} (tail -f to watch in another terminal)", lf.display());
     }
     println!();
-    println!("Starting proxy on port {}...", port);
-    println!("Routing agent traffic via ANTHROPIC_BASE_URL=http://127.0.0.1:{}", port);
-    println!();
     println!("Press 'q' in the dashboard to quit");
     if observational_only {
         println!("NOTE: running in observational mode — no blocked_commands or policies configured.");
     }
     println!();
-
-    let proxy_url = format!("http://127.0.0.1:{}", port);
-    tracing::info!(port, "starting vigil proxy");
 
     let write_approval_threshold = config.as_ref()
         .and_then(|c| c.proxy.write_approval_threshold.as_deref())
@@ -1941,6 +1969,15 @@ pub async fn run_agent_with_plugins(
                 as std::pin::Pin<Box<dyn std::future::Future<Output = Option<serde_json::Value>> + Send>>
         }))
     };
+
+    let port = find_available_port(port)?;
+
+    println!("Starting proxy on port {}...", port);
+    println!("Routing agent traffic via ANTHROPIC_BASE_URL=http://127.0.0.1:{}", port);
+    println!();
+
+    let proxy_url = format!("http://127.0.0.1:{}", port);
+    tracing::info!(port, "starting vigil proxy");
 
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
@@ -2321,8 +2358,8 @@ pub async fn run_agent_with_plugins(
                 }
             }
 
-            if let Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } = &event.event {
-                session_tokens = session_tokens.saturating_add(input_tokens.saturating_add(*output_tokens));
+            if let Event::LlmResponse { input_tokens: _, output_tokens, cost_usd, .. } = &event.event {
+                session_tokens = session_tokens.saturating_add(*output_tokens);
                 session_cost += cost_usd;
                 if let Some(ref path) = lock_path {
                     vigil_core::update_active(path, |s| {
@@ -2647,6 +2684,13 @@ pub async fn run_agent_with_plugins(
     if let Some(mut app) = final_app {
         app.session.finish();
         if let Some(ref mut store) = app.store {
+            store.meta.total_input_tokens = app.session.total_input_tokens;
+            store.meta.total_output_tokens = app.session.total_output_tokens;
+            store.meta.total_cache_read_tokens = app.session.total_cache_read_tokens;
+            store.meta.total_cache_creation_tokens = app.session.total_cache_creation_tokens;
+            store.meta.total_cost_usd = app.session.total_cost_usd;
+            store.meta.policy_violations = app.session.policy_violations;
+            store.meta.pii_detections = app.session.pii_detections;
             match store.finish() {
                 Ok(()) => {
                     tracing::info!(path = %store.ndjson_path.display(), "session saved");
@@ -3436,6 +3480,137 @@ fn confirm_delete_session(id: &uuid::Uuid) -> anyhow::Result<()> {
         println!("Session {} deleted.", id);
     } else {
         println!("Cancelled.");
+    }
+    Ok(())
+}
+
+fn run_repair_meta(dry_run: bool) -> anyhow::Result<()> {
+    use vigil_core::store::{SessionMeta, SessionStore, sessions_dir};
+    use vigil_core::Event;
+
+    let dir = sessions_dir()?;
+    if !dir.exists() {
+        println!("No sessions directory found.");
+        return Ok(());
+    }
+
+    let mut repaired = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+
+    let mut ndjson_files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ndjson"))
+        .collect();
+    ndjson_files.sort();
+
+    for ndjson_path in &ndjson_files {
+        let stem = ndjson_path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let meta_path = dir.join(format!("{}.meta.json", stem));
+
+        let mut meta: SessionMeta = match std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(m) => m,
+            None => {
+                eprintln!("  skip {}: no meta.json", stem);
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let envelopes = match SessionStore::load_envelopes(&meta.session_id) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("  error {}: {}", stem, err);
+                errors += 1;
+                continue;
+            }
+        };
+
+        // Recompute stats from events
+        let mut input_tokens: u32 = 0;
+        let mut output_tokens: u32 = 0;
+        let mut cache_read_tokens: u32 = 0;
+        let mut cache_creation_tokens: u32 = 0;
+        let mut cost_usd: f64 = 0.0;
+        let mut policy_violations: u32 = 0;
+        let mut pii_detections: u32 = 0;
+
+        for env in &envelopes {
+            match &env.event {
+                Event::LlmResponse {
+                    input_tokens: it,
+                    output_tokens: ot,
+                    cache_read_input_tokens: cr,
+                    cache_creation_input_tokens: cw,
+                    cost_usd: c,
+                    ..
+                } => {
+                    input_tokens += it;
+                    output_tokens += ot;
+                    cache_read_tokens += cr;
+                    cache_creation_tokens += cw;
+                    cost_usd += c;
+                }
+                Event::ToolCallResult { blocked, .. } if *blocked => {
+                    policy_violations += 1;
+                }
+                Event::PiiAlert { .. } => {
+                    pii_detections += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let changed = meta.total_input_tokens != input_tokens
+            || meta.total_output_tokens != output_tokens
+            || meta.total_cache_read_tokens != cache_read_tokens
+            || meta.total_cache_creation_tokens != cache_creation_tokens
+            || (meta.total_cost_usd - cost_usd).abs() > 1e-9
+            || meta.policy_violations != policy_violations
+            || meta.pii_detections != pii_detections;
+
+        if !changed {
+            continue;
+        }
+
+        let label = meta.name.as_deref().unwrap_or(&stem[..8.min(stem.len())]);
+        println!(
+            "  {} [{}]  cost ${:.4}→${:.4}  in {}→{}  out {}→{}  c_r {}→{}  c_w {}→{}",
+            label, stem,
+            meta.total_cost_usd, cost_usd,
+            meta.total_input_tokens, input_tokens,
+            meta.total_output_tokens, output_tokens,
+            meta.total_cache_read_tokens, cache_read_tokens,
+            meta.total_cache_creation_tokens, cache_creation_tokens,
+        );
+
+        if !dry_run {
+            meta.total_input_tokens = input_tokens;
+            meta.total_output_tokens = output_tokens;
+            meta.total_cache_read_tokens = cache_read_tokens;
+            meta.total_cache_creation_tokens = cache_creation_tokens;
+            meta.total_cost_usd = cost_usd;
+            meta.policy_violations = policy_violations;
+            meta.pii_detections = pii_detections;
+
+            let tmp = meta_path.with_extension("tmp");
+            std::fs::write(&tmp, serde_json::to_vec_pretty(&meta)?)?;
+            std::fs::rename(&tmp, &meta_path)?;
+            repaired += 1;
+        } else {
+            repaired += 1;
+        }
+    }
+
+    println!();
+    if dry_run {
+        println!("{} session(s) would be updated, {} skipped, {} errors. Remove --dry-run to apply.", repaired, skipped, errors);
+    } else {
+        println!("{} session(s) repaired, {} skipped, {} errors.", repaired, skipped, errors);
     }
     Ok(())
 }

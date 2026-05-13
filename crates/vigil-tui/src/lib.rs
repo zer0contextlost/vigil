@@ -98,9 +98,11 @@ impl App {
             vigil_core::Event::LlmRequest { .. } => {
                 self.counts.requests += 1;
             }
-            vigil_core::Event::LlmResponse { input_tokens, output_tokens, cost_usd, .. } => {
+            vigil_core::Event::LlmResponse { input_tokens, output_tokens, cost_usd, cache_read_input_tokens, cache_creation_input_tokens, .. } => {
                 self.session.total_input_tokens += input_tokens;
                 self.session.total_output_tokens += output_tokens;
+                self.session.total_cache_read_tokens += cache_read_input_tokens;
+                self.session.total_cache_creation_tokens += cache_creation_input_tokens;
                 self.session.total_cost_usd += cost_usd;
                 self.counts.responses += 1;
             }
@@ -634,6 +636,12 @@ fn stats_lines(app: &App) -> Vec<Line<'static>> {
     out.push(stat_row("cost", format!("${:.4}", app.session.total_cost_usd), cost_color));
     out.push(stat_row("in", fmt_num(app.session.total_input_tokens) + " tok", Color::White));
     out.push(stat_row("out", fmt_num(app.session.total_output_tokens) + " tok", Color::White));
+    if app.session.total_cache_read_tokens > 0 {
+        out.push(stat_row("c_r", fmt_num(app.session.total_cache_read_tokens) + " tok", Color::DarkGray));
+    }
+    if app.session.total_cache_creation_tokens > 0 {
+        out.push(stat_row("c_w", fmt_num(app.session.total_cache_creation_tokens) + " tok", Color::DarkGray));
+    }
     out.push(Line::from(""));
     out.push(Line::from(Span::styled("--------------------", Style::default().fg(Color::DarkGray))));
 

@@ -13,6 +13,10 @@ pub struct Session {
     pub ended_at: Option<DateTime<Utc>>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
+    #[serde(default)]
+    pub total_cache_read_tokens: u32,
+    #[serde(default)]
+    pub total_cache_creation_tokens: u32,
     pub total_cost_usd: f64,
     pub policy_violations: u32,
     #[serde(default)]
@@ -30,6 +34,10 @@ pub struct SessionSummary {
     pub ended_at: Option<DateTime<Utc>>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
+    #[serde(default)]
+    pub total_cache_read_tokens: u32,
+    #[serde(default)]
+    pub total_cache_creation_tokens: u32,
     pub total_cost_usd: f64,
     pub policy_violations: u32,
     pub event_count: usize,
@@ -46,6 +54,8 @@ impl Session {
             ended_at: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             total_cost_usd: 0.0,
             policy_violations: 0,
             pii_detections: 0,
@@ -59,10 +69,21 @@ impl Session {
     }
 
     pub fn cost_summary(&self) -> String {
-        format!(
-            "${:.4} ({} in / {} out)",
-            self.total_cost_usd, self.total_input_tokens, self.total_output_tokens
-        )
+        if self.total_cache_read_tokens > 0 || self.total_cache_creation_tokens > 0 {
+            format!(
+                "${:.4} ({} in / {} out / {} c_r / {} c_w)",
+                self.total_cost_usd,
+                self.total_input_tokens,
+                self.total_output_tokens,
+                self.total_cache_read_tokens,
+                self.total_cache_creation_tokens,
+            )
+        } else {
+            format!(
+                "${:.4} ({} in / {} out)",
+                self.total_cost_usd, self.total_input_tokens, self.total_output_tokens
+            )
+        }
     }
 
     pub fn finish(&mut self) {
@@ -77,6 +98,8 @@ impl Session {
             ended_at: self.ended_at,
             total_input_tokens: self.total_input_tokens,
             total_output_tokens: self.total_output_tokens,
+            total_cache_read_tokens: self.total_cache_read_tokens,
+            total_cache_creation_tokens: self.total_cache_creation_tokens,
             total_cost_usd: self.total_cost_usd,
             policy_violations: self.policy_violations,
             event_count: self.events.len(),
@@ -126,6 +149,8 @@ impl Session {
                             ended_at: meta.ended_at,
                             total_input_tokens: meta.total_input_tokens,
                             total_output_tokens: meta.total_output_tokens,
+                            total_cache_read_tokens: meta.total_cache_read_tokens,
+                            total_cache_creation_tokens: meta.total_cache_creation_tokens,
                             total_cost_usd: meta.total_cost_usd,
                             policy_violations: meta.policy_violations,
                             event_count: meta.event_count as usize,

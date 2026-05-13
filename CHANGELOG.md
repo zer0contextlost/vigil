@@ -5,6 +5,33 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.8.0] - 2026-05-13
+
+### Added
+- `cache_efficiency` hygiene signal (signal i) in `vigil report` scorecard — grades cache hit rate (cache_read / total input tokens): GOOD ≥60%, WATCH 10–60%, FLAG <10%; only emitted for sessions with ≥3 turns; scorecard version bumped to 2
+- `total_cache_read_tokens` and `total_cache_creation_tokens` fields added to `SessionSummary`, populated from `SessionMeta` in `list_all()` and from `Session` in `to_summary()`
+- `--speed <f64>` flag on `vigil browse` and `vigil replay` — multiplier applied to inter-event delay (default 1.0; 2.0 = twice as fast, 0.5 = half speed); floor-clamped to 0.01 to prevent divide-by-zero
+
+---
+
+## [0.7.9] - 2026-05-13
+
+### Added
+- `vigil repair-meta` — recomputes and rewrites `.meta.json` stats (tokens, cost, policy violations, PII detections) from NDJSON event logs for all existing sessions; fixes historical sessions that were recorded before the meta-sync bug was corrected; `--dry-run` shows what would change without writing
+
+### Fixed
+- Cache token counts (`cache_read_input_tokens`, `cache_creation_input_tokens`) are now accumulated in `Session` and `SessionMeta` alongside regular input tokens; the TUI sidebar shows `c_r` and `c_w` rows when non-zero; `cost_summary()` includes cache counts in its output
+- Session meta files (`.meta.json`) previously always recorded 0 tokens and $0.0000 cost because stats were never synced from the TUI app state before `store.finish()` — `vigil sessions`, `vigil status`, and the web dashboard now show correct post-session token and cost totals
+- Legacy JSON replay path (old `.json` session format) now applies the same timestamp-based pacing as the NDJSON path (delta capped at 500ms), instead of dumping all events instantly
+
+---
+
+## [0.7.8] - 2026-05-03
+
+### Fixed
+- Running multiple concurrent sessions no longer causes proxy bind failures; all entry points (`vigil run`, `vigil proxy`, interactive launcher) now auto-scan for an available port starting from the configured value instead of failing hard when the default port is in use
+- Session token counts no longer double-count input tokens; `LlmResponse` events now accumulate only output tokens, while `LlmRequest` events account for input tokens — previously input tokens were added twice per turn
+
 ## [0.7.7] - 2026-05-03
 
 ### Fixed
