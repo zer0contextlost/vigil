@@ -5,6 +5,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.7.9] - 2026-05-13
+
+### Added
+- `vigil repair-meta` — recomputes and rewrites `.meta.json` stats (tokens, cost, policy violations, PII detections) from NDJSON event logs for all existing sessions; fixes historical sessions that were recorded before the meta-sync bug was corrected; `--dry-run` shows what would change without writing
+
+### Fixed
+- Cache token counts (`cache_read_input_tokens`, `cache_creation_input_tokens`) are now accumulated in `Session` and `SessionMeta` alongside regular input tokens; the TUI sidebar shows `c_r` and `c_w` rows when non-zero; `cost_summary()` includes cache counts in its output
+- Session meta files (`.meta.json`) previously always recorded 0 tokens and $0.0000 cost because stats were never synced from the TUI app state before `store.finish()` — `vigil sessions`, `vigil status`, and the web dashboard now show correct post-session token and cost totals
+- Legacy JSON replay path (old `.json` session format) now applies the same timestamp-based pacing as the NDJSON path (delta capped at 500ms), instead of dumping all events instantly
+
+---
+
 ## [0.7.8] - 2026-05-03
 
 ### Fixed

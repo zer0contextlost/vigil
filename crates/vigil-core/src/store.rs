@@ -21,6 +21,10 @@ pub struct SessionMeta {
     pub total_cost_usd: f64,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
+    #[serde(default)]
+    pub total_cache_read_tokens: u32,
+    #[serde(default)]
+    pub total_cache_creation_tokens: u32,
     pub event_count: u64,
     pub pii_detections: u32,
     pub policy_violations: u32,
@@ -120,6 +124,8 @@ impl SessionStore {
             total_cost_usd: 0.0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             event_count: 0,
             pii_detections: 0,
             policy_violations: 0,
@@ -363,6 +369,8 @@ mod tests {
             total_cost_usd: 0.0,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            total_cache_creation_tokens: 0,
             event_count: 0,
             pii_detections: 0,
             policy_violations: 0,
