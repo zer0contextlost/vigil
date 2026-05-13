@@ -33,6 +33,8 @@ pub struct VigilConfig {
     pub approval: ApprovalSection,
     #[serde(default)]
     pub policy_stack: PolicyStackSection,
+    #[serde(default)]
+    pub confirm: ConfirmSection,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -217,6 +219,20 @@ pub struct PolicyStackSection {
 }
 
 fn default_true() -> bool { true }
+fn default_confirm_timeout() -> u32 { 30 }
+
+/// Configuration for the interactive Confirm policy gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmSection {
+    /// Seconds to wait for a human decision before auto-denying. Default: 30.
+    #[serde(default = "default_confirm_timeout")]
+    pub timeout_secs: u32,
+}
+
+impl Default for ConfirmSection {
+    fn default() -> Self { Self { timeout_secs: 30 } }
+}
 
 impl Default for PolicyStackSection {
     fn default() -> Self {

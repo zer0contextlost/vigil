@@ -215,4 +215,21 @@ pub enum Event {
         /// Source path(s) that triggered the reload, semicolon-separated.
         sources: String,
     },
+    /// Emitted by the filter task when a ToolCall matches a Confirm policy.
+    /// The TUI shows an approval prompt; the user has `timeout_secs` to decide.
+    /// If no decision arrives in time the request is automatically denied.
+    ConfirmApprovalRequired {
+        approval_id: Uuid,
+        tool_name: String,
+        policy_name: String,
+        /// Seconds until automatic denial.
+        timeout_secs: u32,
+        session_id: Uuid,
+    },
+    /// Emitted by the resolver after the user approves, denies, or the timeout fires.
+    ConfirmApprovalDecision {
+        approval_id: Uuid,
+        approved: bool,
+        session_id: Uuid,
+    },
 }

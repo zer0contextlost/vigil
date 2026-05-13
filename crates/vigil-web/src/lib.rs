@@ -378,6 +378,8 @@ fn event_type_name(event: &TimestampedEvent) -> &'static str {
         Event::PolicyReloaded { .. } => "PolicyReloaded",
         Event::WriteApprovalRequired { .. } => "WriteApprovalRequired",
         Event::WriteApprovalDecision { .. } => "WriteApprovalDecision",
+        Event::ConfirmApprovalRequired { .. } => "ConfirmApprovalRequired",
+        Event::ConfirmApprovalDecision { .. } => "ConfirmApprovalDecision",
         Event::PiiAlert { .. } => "PiiAlert",
         Event::ToolTimeout { .. } => "ToolTimeout",
         Event::CostAlert { .. } => "CostAlert",

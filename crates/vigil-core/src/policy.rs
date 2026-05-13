@@ -20,8 +20,8 @@ pub struct Policy {
 pub enum PolicyAction {
     Allow,
     Deny,
-    /// Reserved for future interactive approval gate. Currently treated as Deny
-    /// with a console warning. Do not use in production policies expecting approval prompts.
+    /// Interactive approval gate. Blocks the tool call in the proxy until the
+    /// user approves or denies in the TUI. Auto-denies after `[confirm] timeout_secs`.
     Confirm,
     LogOnly,
 }

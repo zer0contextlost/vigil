@@ -1666,6 +1666,10 @@ pub async fn run_proxy_mode(
     let port = find_available_port(port)?;
 
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    // Maps confirm approval_id → tool_use_id. Filter task inserts on Confirm match;
+    // resolver removes and clears pending_denials on approval, or leaves for timeout denial.
+    let confirm_approvals: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -1687,16 +1691,33 @@ pub async fn run_proxy_mode(
         }
     });
 
+    let confirm_approvals_resolver = confirm_approvals.clone();
+    let pending_denials_resolver = pending_denials.clone();
+    let filtered_tx_resolver = filtered_tx.clone();
+    let resolver_session_id = session_id;
     let resolver_handle = tokio::spawn(async move {
         while let Some((approval_id, approved)) = decision_rx.recv().await {
-            let tx = { pending_approvals_for_resolver.lock().unwrap().remove(&approval_id) };
-            match tx {
-                Some(tx) => {
-                    if tx.send(approved).is_err() {
-                        tracing::warn!(%approval_id, "approval receiver dropped before decision reached proxy");
-                    }
+            // Write approval: proxy is awaiting a oneshot — forward the decision.
+            let write_tx = { pending_approvals_for_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(tx) = write_tx {
+                if tx.send(approved).is_err() {
+                    tracing::warn!(%approval_id, "write approval receiver dropped before decision reached proxy");
                 }
-                None => tracing::warn!(%approval_id, "approval ID not found in pending map"),
+                continue;
+            }
+            // Policy Confirm approval: remove from confirm_approvals; if approved clear pending_denials.
+            let tool_use_id = { confirm_approvals_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(ref id) = tool_use_id {
+                if approved {
+                    pending_denials_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                }
+                filtered_tx_resolver.send(vigil_core::TimestampedEvent::new(vigil_core::Event::ConfirmApprovalDecision {
+                    approval_id,
+                    approved,
+                    session_id: resolver_session_id,
+                })).ok();
+            } else {
+                tracing::warn!(%approval_id, "approval ID not found in any pending map");
             }
         }
     });
@@ -1745,9 +1766,11 @@ pub async fn run_proxy_mode(
     let loop_threshold = config.as_ref().and_then(|c| c.budget.loop_detect_threshold).unwrap_or(5);
     let sub_agent_depth_limit_proxy = config.as_ref().and_then(|c| c.budget.max_sub_agent_depth);
     let drift_cfg_proxy = config.as_ref().map(|c| c.drift.to_drift_config()).unwrap_or_default();
+    let confirm_timeout_secs_proxy = config.as_ref().map(|c| c.confirm.timeout_secs).unwrap_or(30);
     let plugin_host_filter = plugin_host.clone();
     let engine_clone = engine.clone();
     let pending_denials_filter = pending_denials.clone();
+    let confirm_approvals_filter = confirm_approvals.clone();
     let tui_rx = filtered_tx.subscribe();
 
     if let Some(dashboard_port) = config.as_ref().and_then(|c| c.web.port)
@@ -1884,18 +1907,70 @@ pub async fn run_proxy_mode(
 
             let decision = engine_clone.load().evaluate(&event.event, 0);
             match decision.action {
-                vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm => {
-                    if matches!(decision.action, vigil_core::PolicyAction::Confirm) {
-                        eprintln!(
-                            "[POLICY CONFIRM] {} — interactive gate not yet available; denying to be safe",
-                            decision.policy_name.as_deref().unwrap_or("unnamed")
-                        );
+                vigil_core::PolicyAction::Confirm => {
+                    if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
+                        let input_summary = input.to_string().chars().take(200).collect::<String>();
+                        let policy_name = decision.policy_name.clone().unwrap_or_else(|| "unnamed".to_string());
+                        // Pre-populate denial (default deny while awaiting human decision).
+                        if let Some(id) = tool_use_id {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
+                                tool_name: tool_name.clone(),
+                                policy_name: Some(policy_name.clone()),
+                                reason: Some(format!("Awaiting human approval (policy: {})", policy_name)),
+                                input_summary,
+                            });
+                            // Register in confirm_approvals so the resolver can clear the denial on approval.
+                            let approval_id = uuid::Uuid::new_v4();
+                            confirm_approvals_filter.lock().unwrap_or_else(|e| e.into_inner())
+                                .insert(approval_id, id.clone());
+                            // Notify TUI.
+                            eprintln!("[POLICY CONFIRM] {} — waiting for human approval ({timeout_secs}s)", policy_name, timeout_secs = confirm_timeout_secs_proxy);
+                            filtered_tx.send(TimestampedEvent::new(Event::ConfirmApprovalRequired {
+                                approval_id,
+                                tool_name: tool_name.clone(),
+                                policy_name: policy_name.clone(),
+                                timeout_secs: confirm_timeout_secs_proxy,
+                                session_id: *session_id,
+                            })).ok();
+                            // Spawn timeout task — auto-denies if no decision arrives in time.
+                            let ca = confirm_approvals_filter.clone();
+                            let ftx = filtered_tx.clone();
+                            let sid = *session_id;
+                            let tout = confirm_timeout_secs_proxy;
+                            let pn = policy_name.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(tout as u64)).await;
+                                // Only emit if still unresolved.
+                                let still_pending = ca.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id).is_some();
+                                if still_pending {
+                                    eprintln!("[POLICY CONFIRM] {} — timed out after {}s, denying", pn, tout);
+                                    ftx.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
+                                        approval_id,
+                                        approved: false,
+                                        session_id: sid,
+                                    })).ok();
+                                }
+                            });
+                        }
+                        // Emit a blocked ToolCallResult so the TUI shows it blocked.
+                        let detail = serde_json::json!({"tool_name": tool_name, "policy": &policy_name, "reason": "awaiting confirmation"});
+                        let ctx = make_plugin_ctx(*session_id);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
+                        let blocked = TimestampedEvent::new(Event::ToolCallResult {
+                            agent: agent.clone(), tool_name: tool_name.clone(),
+                            blocked: true, session_id: *session_id,
+                            correlation_id: None, duration_ms: None, is_error: false,
+                        });
+                        plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        filtered_tx.send(blocked).ok();
                     }
+                }
+                vigil_core::PolicyAction::Deny => {
                     if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
                         let input_summary = input.to_string().chars().take(200).collect::<String>();
                         // Record denial so the proxy can inject a typed error into the next tool_result.
                         if let Some(id) = tool_use_id {
-                            pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
                                 tool_name: tool_name.clone(),
                                 policy_name: decision.policy_name.clone(),
                                 reason: decision.reason.clone(),
@@ -1920,7 +1995,7 @@ pub async fn run_proxy_mode(
                         if let PluginDecision::Deny(reason) = plugin_host_filter.dispatch_tool_call(&ctx, tool_name, input).await {
                             let input_summary = input.to_string().chars().take(200).collect::<String>();
                             if let Some(id) = tool_use_id {
-                                pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                                pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
                                     tool_name: tool_name.clone(),
                                     policy_name: Some("plugin".to_string()),
                                     reason: Some(reason.clone()),
@@ -2080,6 +2155,8 @@ pub async fn run_agent_with_plugins(
     tracing::info!(port, "starting vigil proxy");
 
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let confirm_approvals: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -2102,19 +2179,31 @@ pub async fn run_agent_with_plugins(
         }
     });
 
+    let confirm_approvals_resolver = confirm_approvals.clone();
+    let pending_denials_resolver = pending_denials.clone();
+    let filtered_tx_resolver = filtered_tx.clone();
+    let resolver_session_id = session_id;
     let resolver_handle = tokio::spawn(async move {
         while let Some((approval_id, approved)) = decision_rx.recv().await {
-            let tx = {
-                let mut map = pending_approvals_for_resolver.lock().unwrap();
-                map.remove(&approval_id)
-            };
-            match tx {
-                Some(tx) => {
-                    if tx.send(approved).is_err() {
-                        tracing::warn!(%approval_id, "approval receiver dropped before decision reached proxy");
-                    }
+            let write_tx = { pending_approvals_for_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(tx) = write_tx {
+                if tx.send(approved).is_err() {
+                    tracing::warn!(%approval_id, "write approval receiver dropped before decision reached proxy");
                 }
-                None => tracing::warn!(%approval_id, "approval ID not found in pending map"),
+                continue;
+            }
+            let tool_use_id = { confirm_approvals_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id) };
+            if let Some(ref id) = tool_use_id {
+                if approved {
+                    pending_denials_resolver.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                }
+                filtered_tx_resolver.send(vigil_core::TimestampedEvent::new(vigil_core::Event::ConfirmApprovalDecision {
+                    approval_id,
+                    approved,
+                    session_id: resolver_session_id,
+                })).ok();
+            } else {
+                tracing::warn!(%approval_id, "approval ID not found in any pending map");
             }
         }
     });
@@ -2302,6 +2391,8 @@ pub async fn run_agent_with_plugins(
     let notifier_filter = webhook_notifier.clone();
     let plugin_host_filter = plugin_host.clone();
     let pending_denials_filter = pending_denials.clone();
+    let confirm_approvals_filter = confirm_approvals.clone();
+    let confirm_timeout_secs_agent = config.as_ref().map(|c| c.confirm.timeout_secs).unwrap_or(30);
     let tui_rx = filtered_tx.subscribe();
 
     if let Some(dashboard_port) = config.as_ref().and_then(|c| c.web.port)
@@ -2647,38 +2738,72 @@ pub async fn run_agent_with_plugins(
             );
 
             match decision.action {
-                vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm => {
-                    tracing::warn!(
-                        policy = ?decision.policy_name,
-                        reason = ?decision.reason,
-                        "event denied by policy"
-                    );
-                    if matches!(decision.action, vigil_core::PolicyAction::Confirm) {
-                        eprintln!(
-                            "[POLICY CONFIRM] {} — interactive gate not yet available; denying to be safe",
-                            decision.policy_name.as_deref().unwrap_or("unnamed")
-                        );
-                    } else {
-                        eprintln!(
-                            "[POLICY DENY] {} — {}",
-                            decision.policy_name.as_deref().unwrap_or("hardcoded"),
-                            decision.reason.as_deref().unwrap_or("")
-                        );
-                    }
-                    if let Event::ToolCall {
-                        agent,
-                        tool_name,
-                        input,
-                        session_id,
-                        tool_use_id,
-                        ..
-                    } = &event.event
-                    {
+                vigil_core::PolicyAction::Confirm => {
+                    if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
                         let input_summary = input.to_string().chars().take(200).collect::<String>();
-                        // Record the denial so the proxy rewrites the matching tool_result
-                        // with a structured error, letting the agent continue on safe work.
+                        let policy_name = decision.policy_name.clone().unwrap_or_else(|| "unnamed".to_string());
                         if let Some(id) = tool_use_id {
-                            pending_denials_filter.lock().unwrap().insert(id.clone(), DenialRecord {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
+                                tool_name: tool_name.clone(),
+                                policy_name: Some(policy_name.clone()),
+                                reason: Some(format!("Awaiting human approval (policy: {})", policy_name)),
+                                input_summary,
+                            });
+                            let approval_id = uuid::Uuid::new_v4();
+                            confirm_approvals_filter.lock().unwrap_or_else(|e| e.into_inner())
+                                .insert(approval_id, id.clone());
+                            eprintln!("[POLICY CONFIRM] {} — waiting for human approval ({timeout_secs}s)", policy_name, timeout_secs = confirm_timeout_secs_agent);
+                            filtered_tx.send(TimestampedEvent::new(Event::ConfirmApprovalRequired {
+                                approval_id,
+                                tool_name: tool_name.clone(),
+                                policy_name: policy_name.clone(),
+                                timeout_secs: confirm_timeout_secs_agent,
+                                session_id: *session_id,
+                            })).ok();
+                            let ca = confirm_approvals_filter.clone();
+                            let ftx = filtered_tx.clone();
+                            let sid = *session_id;
+                            let tout = confirm_timeout_secs_agent;
+                            let pn = policy_name.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(tout as u64)).await;
+                                let still_pending = ca.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id).is_some();
+                                if still_pending {
+                                    eprintln!("[POLICY CONFIRM] {} — timed out after {}s, denying", pn, tout);
+                                    ftx.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
+                                        approval_id,
+                                        approved: false,
+                                        session_id: sid,
+                                    })).ok();
+                                }
+                            });
+                        }
+                        let detail = serde_json::json!({"tool_name": tool_name, "policy": &policy_name, "reason": "awaiting confirmation"});
+                        if let Some(ref n) = notifier_filter {
+                            n.send("DENY", &session_id.to_string(), detail.clone());
+                        }
+                        let ctx = make_plugin_ctx(*session_id);
+                        plugin_host_filter.dispatch_alert(&ctx, AlertLabel::Deny, &detail).await;
+                        let blocked = TimestampedEvent::new(Event::ToolCallResult {
+                            agent: agent.clone(), tool_name: tool_name.clone(),
+                            blocked: true, session_id: *session_id,
+                            correlation_id: None, duration_ms: None, is_error: false,
+                        });
+                        plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        filtered_tx.send(blocked).ok();
+                    }
+                }
+                vigil_core::PolicyAction::Deny => {
+                    tracing::warn!(policy = ?decision.policy_name, reason = ?decision.reason, "event denied by policy");
+                    eprintln!(
+                        "[POLICY DENY] {} — {}",
+                        decision.policy_name.as_deref().unwrap_or("hardcoded"),
+                        decision.reason.as_deref().unwrap_or("")
+                    );
+                    if let Event::ToolCall { agent, tool_name, input, session_id, tool_use_id, .. } = &event.event {
+                        let input_summary = input.to_string().chars().take(200).collect::<String>();
+                        if let Some(id) = tool_use_id {
+                            pending_denials_filter.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone(), DenialRecord {
                                 tool_name: tool_name.clone(),
                                 policy_name: decision.policy_name.clone(),
                                 reason: decision.reason.clone(),
@@ -3128,6 +3253,9 @@ fn generate_vigil_toml() -> String {
 # yolo_paths    = ["tests/", "*.md", "docs/"]   # never need approval
 # watch_paths   = ["src/"]                       # always need approval
 # lockdown_paths = [".env", "*.pem", "*.key"]   # approval + elevated warning
+
+[confirm]
+# timeout_secs = 30                             # seconds to wait before auto-deny
 
 # [[policies]]
 # name = "block-bash"

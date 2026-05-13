@@ -45,6 +45,15 @@ pub struct PendingApprovalInfo {
     pub after: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingPolicyConfirmInfo {
+    pub approval_id: uuid::Uuid,
+    pub tool_name: String,
+    pub policy_name: String,
+    pub timeout_secs: u32,
+    pub started_at: std::time::Instant,
+}
+
 pub struct App {
     pub session: Session,
     pub store: Option<vigil_core::store::SessionStore>,
@@ -67,6 +76,8 @@ pub struct App {
     pub decision_tx: Option<tokio::sync::mpsc::Sender<(uuid::Uuid, bool)>>,
     /// Pending write approval waiting for user input.
     pub pending_approval: Option<PendingApprovalInfo>,
+    /// Pending policy Confirm gate waiting for user decision.
+    pub pending_policy_confirm: Option<PendingPolicyConfirmInfo>,
 }
 
 impl App {
@@ -90,6 +101,7 @@ impl App {
             last_burn_rate: None,
             decision_tx: None,
             pending_approval: None,
+            pending_policy_confirm: None,
         }
     }
 
@@ -169,6 +181,20 @@ impl App {
                 self.counts.injection_alerts += 1;
             }
             vigil_core::Event::PolicyReloaded { .. } => {}
+            vigil_core::Event::ConfirmApprovalRequired { approval_id, tool_name, policy_name, timeout_secs, .. } => {
+                self.pending_policy_confirm = Some(PendingPolicyConfirmInfo {
+                    approval_id: *approval_id,
+                    tool_name: tool_name.clone(),
+                    policy_name: policy_name.clone(),
+                    timeout_secs: *timeout_secs,
+                    started_at: std::time::Instant::now(),
+                });
+            }
+            vigil_core::Event::ConfirmApprovalDecision { approval_id, .. } => {
+                if self.pending_policy_confirm.as_ref().map(|p| p.approval_id == *approval_id).unwrap_or(false) {
+                    self.pending_policy_confirm = None;
+                }
+            }
         }
         if !self.is_replay {
             if let Some(ref mut store) = self.store {
@@ -288,6 +314,13 @@ impl App {
                         tokio::spawn(async move { let _ = tx.send((id, true)).await; });
                     }
                     self.pending_approval = None;
+                } else if let Some(ref info) = self.pending_policy_confirm {
+                    let id = info.approval_id;
+                    if let Some(ref tx) = self.decision_tx {
+                        let tx = tx.clone();
+                        tokio::spawn(async move { let _ = tx.send((id, true)).await; });
+                    }
+                    self.pending_policy_confirm = None;
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -298,6 +331,13 @@ impl App {
                         tokio::spawn(async move { let _ = tx.send((id, false)).await; });
                     }
                     self.pending_approval = None;
+                } else if let Some(ref info) = self.pending_policy_confirm {
+                    let id = info.approval_id;
+                    if let Some(ref tx) = self.decision_tx {
+                        let tx = tx.clone();
+                        tokio::spawn(async move { let _ = tx.send((id, false)).await; });
+                    }
+                    self.pending_policy_confirm = None;
                 }
             }
             _ => {}
@@ -355,6 +395,10 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("PINJ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
         vigil_core::Event::PolicyReloaded { .. } =>
             ("RLOD", Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)),
+        vigil_core::Event::ConfirmApprovalRequired { .. } =>
+            ("CONF", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::ConfirmApprovalDecision { .. } =>
+            ("CDEC", Style::default().fg(Color::Magenta)),
     };
 
     let summary = event_summary(event);
@@ -443,6 +487,10 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("Prompt injection: {}", category),
         vigil_core::Event::PolicyReloaded { policy_count, sources, .. } =>
             format!("Policy reload: {} policies from {}", policy_count, truncate(sources, 40)),
+        vigil_core::Event::ConfirmApprovalRequired { tool_name, policy_name, timeout_secs, .. } =>
+            format!("CONFIRM required: {} (policy: {}, {}s)", tool_name, policy_name, timeout_secs),
+        vigil_core::Event::ConfirmApprovalDecision { approved, .. } =>
+            if *approved { "Confirm: approved".to_string() } else { "Confirm: denied".to_string() },
     }
 }
 
@@ -609,6 +657,18 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(header_line("POLICY RELOADED".to_string(), Color::Yellow));
             out.push(body_line(&format!("policies: {}", policy_count)));
             out.push(body_line(&format!("sources:  {}", sources)));
+        }
+        vigil_core::Event::ConfirmApprovalRequired { tool_name, policy_name, timeout_secs, approval_id, .. } => {
+            out.push(header_line("POLICY CONFIRM REQUIRED".to_string(), Color::Magenta));
+            out.push(body_line(&format!("tool:    {}", tool_name)));
+            out.push(body_line(&format!("policy:  {}", policy_name)));
+            out.push(body_line(&format!("timeout: {}s", timeout_secs)));
+            out.push(body_line(&format!("id:      {}", approval_id)));
+        }
+        vigil_core::Event::ConfirmApprovalDecision { approved, approval_id, .. } => {
+            out.push(header_line("POLICY CONFIRM DECISION".to_string(), Color::Magenta));
+            out.push(body_line(if *approved { "decision: APPROVED" } else { "decision: DENIED" }));
+            out.push(body_line(&format!("id:      {}", approval_id)));
         }
     }
 
@@ -946,6 +1006,64 @@ fn draw_detail_pane(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Policy Confirm gate overlay — shown when write approval is not active.
+    if let Some(ref info) = app.pending_policy_confirm {
+        let elapsed = info.started_at.elapsed().as_secs();
+        let remaining = (info.timeout_secs as u64).saturating_sub(elapsed);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "  POLICY CONFIRM REQUIRED",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  ------------------------",
+            Style::default().fg(Color::Magenta),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("  Tool:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.tool_name.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Policy: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(info.policy_name.clone(), Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  Time:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}s remaining", remaining),
+                if remaining <= 5 {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Allow this tool call to proceed?",
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  [y] Approve   ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("[n] Deny", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let confirm_pane = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(Span::styled(
+                        "POLICY CONFIRM  y=approve  n=deny",
+                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    ))
+                    .border_style(Style::default().fg(Color::Magenta)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(confirm_pane, area);
+        return;
+    }
+
     let content = if app.raw_events.is_empty() {
         vec![Line::from(Span::styled(
             "  Select an event with up/down to inspect it here",
@@ -983,6 +1101,8 @@ fn draw_detail_pane(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = if app.pending_approval.is_some() {
         "y=approve write  n=reject write"
+    } else if app.pending_policy_confirm.is_some() {
+        "y=approve tool call  n=deny tool call"
     } else if app.detail_focused {
         "TAB=back  up/dn PgUp/PgDn Home=scroll detail  Esc=list"
     } else {

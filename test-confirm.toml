@@ -1,0 +1,12 @@
+[proxy]
+port = 8878
+
+[confirm]
+timeout_secs = 10
+
+[[policies]]
+name = "confirm-bash"
+action = "Confirm"
+[policies.matcher]
+type = "ToolCall"
+tool_name_pattern = "Bash"
