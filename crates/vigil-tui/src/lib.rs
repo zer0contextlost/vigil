@@ -168,6 +168,7 @@ impl App {
             vigil_core::Event::PromptInjectionAlert { .. } => {
                 self.counts.injection_alerts += 1;
             }
+            vigil_core::Event::PolicyReloaded { .. } => {}
         }
         if !self.is_replay {
             if let Some(ref mut store) = self.store {
@@ -352,6 +353,8 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
             ("TASK", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         vigil_core::Event::PromptInjectionAlert { .. } =>
             ("PINJ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        vigil_core::Event::PolicyReloaded { .. } =>
+            ("RLOD", Style::default().fg(Color::Yellow).add_modifier(Modifier::DIM)),
     };
 
     let summary = event_summary(event);
@@ -368,6 +371,7 @@ fn format_event_line(event: &TimestampedEvent) -> Line<'static> {
         | vigil_core::Event::DriftAlert { .. }
         | vigil_core::Event::SubAgentSpawned { .. }
         | vigil_core::Event::PromptInjectionAlert { .. }
+        | vigil_core::Event::PolicyReloaded { .. }
     );
     let summary_style = if is_alert {
         Style::default().fg(Color::Red)
@@ -437,6 +441,8 @@ fn event_summary(event: &TimestampedEvent) -> String {
             format!("Sub-agent spawned (depth {})", depth),
         vigil_core::Event::PromptInjectionAlert { category, .. } =>
             format!("Prompt injection: {}", category),
+        vigil_core::Event::PolicyReloaded { policy_count, sources, .. } =>
+            format!("Policy reload: {} policies from {}", policy_count, truncate(sources, 40)),
     }
 }
 
@@ -598,6 +604,11 @@ fn detail_lines(event: &TimestampedEvent) -> Vec<Line<'static>> {
             out.push(body_line(&format!("tool_use_id: {}", tool_name)));
             out.push(body_line(&format!("category:    {}", category)));
             out.push(body_line(&format!("snippet:     {}", snippet)));
+        }
+        vigil_core::Event::PolicyReloaded { policy_count, sources, .. } => {
+            out.push(header_line("POLICY RELOADED".to_string(), Color::Yellow));
+            out.push(body_line(&format!("policies: {}", policy_count)));
+            out.push(body_line(&format!("sources:  {}", sources)));
         }
     }
 

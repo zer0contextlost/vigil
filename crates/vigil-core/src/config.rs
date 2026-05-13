@@ -31,6 +31,8 @@ pub struct VigilConfig {
     pub web: WebSection,
     #[serde(default)]
     pub approval: ApprovalSection,
+    #[serde(default)]
+    pub policy_stack: PolicyStackSection,
 }
 
 fn default_blocked_commands() -> Vec<String> {
@@ -203,6 +205,25 @@ pub struct ApprovalSection {
     pub lockdown_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyStackSection {
+    /// Load ~/.vigil/vigil.toml as the base policy layer. Default: true.
+    #[serde(default = "default_true")]
+    pub inherit_global: bool,
+    /// Load the nearest vigil.toml walking up from cwd as a policy layer. Default: true.
+    #[serde(default = "default_true")]
+    pub inherit_repo: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for PolicyStackSection {
+    fn default() -> Self {
+        Self { inherit_global: true, inherit_repo: true }
+    }
+}
+
 impl DriftSection {
     pub fn to_drift_config(&self) -> crate::drift::DriftConfig {
         let d = crate::drift::DriftConfig::default();
@@ -295,5 +316,96 @@ impl VigilConfig {
         }
         policies.extend(self.policies.iter().cloned().map(Into::into));
         policies
+    }
+
+    /// Return the list of config file paths that vigil should watch for hot-reload.
+    /// Includes ~/.vigil/vigil.toml (if present) and the explicit --config path.
+    pub fn find_config_paths(explicit: Option<&Path>) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        // Global config layer
+        let home = if cfg!(target_os = "windows") {
+            std::env::var("USERPROFILE").ok()
+        } else {
+            std::env::var("HOME").ok()
+        };
+        if let Some(global) = home.map(|h| PathBuf::from(h).join(".vigil").join("vigil.toml")) {
+            if global.exists() {
+                paths.push(global);
+            }
+        }
+
+        // Repo config layer: nearest vigil.toml walking up from cwd
+        if let Ok(cwd) = std::env::current_dir() {
+            let mut dir: &Path = cwd.as_path();
+            loop {
+                let candidate = dir.join("vigil.toml");
+                if candidate.exists() {
+                    let is_explicit = explicit.map(|e| {
+                        std::fs::canonicalize(e).ok() == std::fs::canonicalize(&candidate).ok()
+                    }).unwrap_or(false);
+                    if !is_explicit && !paths.contains(&candidate) {
+                        paths.push(candidate);
+                    }
+                    break;
+                }
+                match dir.parent() {
+                    Some(p) => dir = p,
+                    None => break,
+                }
+            }
+        }
+
+        // Explicit --config layer
+        if let Some(exp) = explicit {
+            let exp_pb = exp.to_path_buf();
+            if exp_pb.exists() && !paths.contains(&exp_pb) {
+                paths.push(exp_pb);
+            }
+        }
+
+        paths
+    }
+
+    /// Merge multiple config layers into one. Later layers override scalars;
+    /// policies from all layers are concatenated (global-first order).
+    pub fn merge_layers(layers: Vec<Self>) -> Self {
+        let mut merged = Self::default();
+        for layer in layers {
+            if layer.proxy.port.is_some()                       { merged.proxy.port = layer.proxy.port; }
+            if layer.proxy.dashboard_port.is_some()             { merged.proxy.dashboard_port = layer.proxy.dashboard_port; }
+            if layer.proxy.write_approval_threshold.is_some()   { merged.proxy.write_approval_threshold = layer.proxy.write_approval_threshold; }
+            if !layer.proxy.blocked_commands.is_empty()         { merged.proxy.blocked_commands = layer.proxy.blocked_commands; }
+            if layer.proxy.tool_timeout_secs.is_some()          { merged.proxy.tool_timeout_secs = layer.proxy.tool_timeout_secs; }
+            if layer.proxy.tool_timeout_kill_secs.is_some()     { merged.proxy.tool_timeout_kill_secs = layer.proxy.tool_timeout_kill_secs; }
+            if layer.session.store_raw.is_some()                { merged.session.store_raw = layer.session.store_raw; }
+            if layer.session.sessions_dir.is_some()             { merged.session.sessions_dir = layer.session.sessions_dir; }
+            if layer.pii.watchlist_file.is_some()               { merged.pii.watchlist_file = layer.pii.watchlist_file; }
+            if layer.budget.max_cost_usd.is_some()              { merged.budget.max_cost_usd = layer.budget.max_cost_usd; }
+            if layer.budget.max_tokens.is_some()                { merged.budget.max_tokens = layer.budget.max_tokens; }
+            if layer.budget.allowed_hours.is_some()             { merged.budget.allowed_hours = layer.budget.allowed_hours; }
+            if layer.budget.max_burn_rate_usd_per_min.is_some() { merged.budget.max_burn_rate_usd_per_min = layer.budget.max_burn_rate_usd_per_min; }
+            if layer.budget.loop_detect_threshold.is_some()     { merged.budget.loop_detect_threshold = layer.budget.loop_detect_threshold; }
+            if layer.budget.cost_alert_usd.is_some()            { merged.budget.cost_alert_usd = layer.budget.cost_alert_usd; }
+            if layer.budget.max_session_duration_mins.is_some() { merged.budget.max_session_duration_mins = layer.budget.max_session_duration_mins; }
+            if layer.budget.max_sub_agent_depth.is_some()       { merged.budget.max_sub_agent_depth = layer.budget.max_sub_agent_depth; }
+            if layer.notify.webhook.is_some()                   { merged.notify.webhook = layer.notify.webhook; }
+            if !layer.notify.webhook_events.is_empty()          { merged.notify.webhook_events = layer.notify.webhook_events; }
+            if layer.drift.baseline_turns.is_some()             { merged.drift.baseline_turns = layer.drift.baseline_turns; }
+            if layer.drift.window_turns.is_some()               { merged.drift.window_turns = layer.drift.window_turns; }
+            if layer.drift.acceleration_multiplier.is_some()    { merged.drift.acceleration_multiplier = layer.drift.acceleration_multiplier; }
+            if layer.drift.acceleration_min_tokens.is_some()    { merged.drift.acceleration_min_tokens = layer.drift.acceleration_min_tokens; }
+            if layer.drift.stall_threshold.is_some()            { merged.drift.stall_threshold = layer.drift.stall_threshold; }
+            if layer.drift.debounce_events.is_some()            { merged.drift.debounce_events = layer.drift.debounce_events; }
+            if layer.report.is_some()                           { merged.report = layer.report; }
+            if layer.window.is_some()                           { merged.window = layer.window; }
+            if layer.web.port.is_some()                         { merged.web.port = layer.web.port; }
+            if !layer.approval.yolo_paths.is_empty()            { merged.approval.yolo_paths = layer.approval.yolo_paths; }
+            if !layer.approval.watch_paths.is_empty()           { merged.approval.watch_paths = layer.approval.watch_paths; }
+            if !layer.approval.lockdown_paths.is_empty()        { merged.approval.lockdown_paths = layer.approval.lockdown_paths; }
+            // Policies are additive: global → repo → explicit, in order.
+            merged.policies.extend(layer.policies);
+        }
+        merged
     }
 }

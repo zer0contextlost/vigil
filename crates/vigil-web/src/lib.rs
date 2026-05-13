@@ -375,6 +375,7 @@ fn event_type_name(event: &TimestampedEvent) -> &'static str {
         Event::DriftAlert { .. } => "DriftAlert",
         Event::ExfilAlert { .. } => "ExfilAlert",
         Event::PromptInjectionAlert { .. } => "PromptInjectionAlert",
+        Event::PolicyReloaded { .. } => "PolicyReloaded",
         Event::WriteApprovalRequired { .. } => "WriteApprovalRequired",
         Event::WriteApprovalDecision { .. } => "WriteApprovalDecision",
         Event::PiiAlert { .. } => "PiiAlert",

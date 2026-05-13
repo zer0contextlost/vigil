@@ -207,4 +207,12 @@ pub enum Event {
         category: String,
         snippet: String,
     },
+    /// Emitted when vigil hot-reloads the policy engine mid-session.
+    PolicyReloaded {
+        session_id: Uuid,
+        /// Number of policies now active after reload.
+        policy_count: usize,
+        /// Source path(s) that triggered the reload, semicolon-separated.
+        sources: String,
+    },
 }

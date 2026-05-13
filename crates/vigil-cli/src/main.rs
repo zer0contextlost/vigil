@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1515,6 +1516,99 @@ fn get_user_env_var(name: &str) -> Option<String> {
 /// Start the proxy and TUI without spawning an agent process.
 /// Use this with IDEs (Cursor, etc.) that connect to vigil via their own
 /// "Override Base URL" setting rather than being launched by vigil.
+/// Build a PolicyEngine from an optional --policy file or VigilConfig.
+fn build_engine(
+    policy: &Option<PathBuf>,
+    config: &Option<vigil_core::VigilConfig>,
+) -> Result<PolicyEngine> {
+    if let Some(p) = policy {
+        Ok(PolicyEngine::from_file(p)?)
+    } else if let Some(cfg) = config {
+        let policies = cfg.to_policies();
+        if policies.is_empty() {
+            Ok(PolicyEngine::default())
+        } else {
+            Ok(PolicyEngine::new(vigil_core::PolicyConfig { policies })?)
+        }
+    } else {
+        Ok(PolicyEngine::default())
+    }
+}
+
+/// Watch config files for changes and hot-reload the policy engine.
+/// Uses notify's file-system watcher; emits PolicyReloaded events to the TUI.
+fn spawn_config_watcher(
+    policy_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    engine: Arc<ArcSwap<PolicyEngine>>,
+    filtered_tx: tokio::sync::broadcast::Sender<TimestampedEvent>,
+    session_id: uuid::Uuid,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let watched = vigil_core::VigilConfig::find_config_paths(config_path.as_deref());
+        if watched.is_empty() && policy_path.is_none() {
+            return;
+        }
+
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(32);
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = notify_tx.blocking_send(res);
+        }) {
+            Ok(w) => w,
+            Err(e) => { tracing::warn!(err=%e, "config watcher init failed"); return; }
+        };
+
+        use notify::Watcher;
+        for path in &watched {
+            let _ = watcher.watch(path, notify::RecursiveMode::NonRecursive);
+        }
+        if let Some(ref p) = policy_path {
+            if p.exists() { let _ = watcher.watch(p, notify::RecursiveMode::NonRecursive); }
+        }
+
+        let sources_label = watched.iter()
+            .map(|p| p.display().to_string())
+            .chain(policy_path.iter().map(|p| p.display().to_string()))
+            .collect::<Vec<_>>()
+            .join(";");
+
+        while let Some(event) = notify_rx.recv().await {
+            match event {
+                Ok(e) if matches!(
+                    e.kind,
+                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                ) => {
+                    // Debounce: editors often write via temp file rename
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                    // Drain any further events that piled up during the debounce
+                    while notify_rx.try_recv().is_ok() {}
+
+                    let new_config = config_path.as_deref().and_then(|p| {
+                        vigil_core::VigilConfig::load(p).ok()
+                    });
+                    match build_engine(&policy_path, &new_config) {
+                        Ok(new_engine) => {
+                            let count = new_engine.policy_count();
+                            engine.store(Arc::new(new_engine));
+                            let reload_event = TimestampedEvent::new(Event::PolicyReloaded {
+                                session_id,
+                                policy_count: count,
+                                sources: sources_label.clone(),
+                            });
+                            filtered_tx.send(reload_event).ok();
+                            eprintln!("[vigil] Policy hot-reloaded: {} rules active", count);
+                        }
+                        Err(err) => {
+                            eprintln!("[vigil] Policy reload failed (keeping previous rules): {}", err);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
 pub async fn run_proxy_mode(
     port: u16,
     policy: Option<PathBuf>,
@@ -1537,16 +1631,7 @@ pub async fn run_proxy_mode(
     }
     session.name = store.as_ref().map(|s| s.meta.name.clone()).flatten();
 
-    let engine = if let Some(policy_path) = &policy {
-        PolicyEngine::from_file(policy_path)?
-    } else if let Some(cfg) = &config {
-        let policies = cfg.to_policies();
-        if policies.is_empty() { PolicyEngine::default() }
-        else { PolicyEngine::new(vigil_core::PolicyConfig { policies })? }
-    } else {
-        PolicyEngine::default()
-    };
-    let engine = Arc::new(engine);
+    let engine = Arc::new(ArcSwap::from_pointee(build_engine(&policy, &config)?));
 
     let plugin_host = Arc::new(plugins);
     let ctx_start = make_plugin_ctx(session_id);
@@ -1615,6 +1700,14 @@ pub async fn run_proxy_mode(
             }
         }
     });
+
+    let _watcher_handle = spawn_config_watcher(
+        policy.clone(),
+        config_path.as_ref().map(PathBuf::from),
+        engine.clone(),
+        filtered_tx.clone(),
+        session_id,
+    );
 
     println!("vigil v{} — proxy mode", env!("CARGO_PKG_VERSION"));
     println!("Session ID: {}", session_id);
@@ -1789,7 +1882,7 @@ pub async fn run_proxy_mode(
                 continue;
             }
 
-            let decision = engine_clone.evaluate(&event.event, 0);
+            let decision = engine_clone.load().evaluate(&event.event, 0);
             match decision.action {
                 vigil_core::PolicyAction::Deny | vigil_core::PolicyAction::Confirm => {
                     if matches!(decision.action, vigil_core::PolicyAction::Confirm) {
@@ -1913,23 +2006,11 @@ pub async fn run_agent_with_plugins(
         });
     }
 
-    let engine = if let Some(policy_path) = &policy {
-        PolicyEngine::from_file(policy_path)?
-    } else if let Some(cfg) = &config {
-        let policies = cfg.to_policies();
-        if policies.is_empty() {
-            PolicyEngine::default()
-        } else {
-            PolicyEngine::new(vigil_core::PolicyConfig { policies })?
-        }
-    } else {
-        PolicyEngine::default()
-    };
-    let engine = Arc::new(engine);
+    let engine = Arc::new(ArcSwap::from_pointee(build_engine(&policy, &config)?));
 
     // Warn when no enforcement is active. Check the compiled policy count rather
     // than the raw config lists so defaults (blocked_commands) are counted too.
-    let observational_only = config.is_none() || engine.policy_count() == 0;
+    let observational_only = config.is_none() || engine.load().policy_count() == 0;
 
     let budget_enforcer = config.as_ref().map(|c| BudgetEnforcer::new(c.budget.clone()));
     let burn_rate_limit = config.as_ref().and_then(|c| c.budget.max_burn_rate_usd_per_min);
@@ -2037,6 +2118,14 @@ pub async fn run_agent_with_plugins(
             }
         }
     });
+
+    let _watcher_handle = spawn_config_watcher(
+        policy.clone(),
+        config_path.as_ref().map(PathBuf::from),
+        engine.clone(),
+        filtered_tx.clone(),
+        session_id,
+    );
 
     // Extract window layout config if present.
     let window_cfg = config.as_ref().and_then(|c| c.window.clone());
@@ -2550,7 +2639,7 @@ pub async fn run_agent_with_plugins(
                 }
             }
 
-            let decision = engine_clone.evaluate(&event.event, session_tokens);
+            let decision = engine_clone.load().evaluate(&event.event, session_tokens);
             tracing::debug!(
                 action = ?decision.action,
                 policy = ?decision.policy_name,
