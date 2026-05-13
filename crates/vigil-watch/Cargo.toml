@@ -11,3 +11,4 @@ vigil-core = { path = "../vigil-core" }
 chrono = { version = "0.4", features = ["serde"] }
 sysinfo = "0.30"
 tracing = "0.1"
+notify = { version = "6", features = ["macos_fsevent"] }

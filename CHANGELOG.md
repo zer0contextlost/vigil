@@ -5,6 +5,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.0.0] - 2026-05-13
+
+### Added
+- **vigil-fleet** — new crate for multi-agent fleet coordination: TCP hub server, 4-byte LE length-prefix + NDJSON framing, `FleetMsg` protocol (`Register`, `AgentEvent`, `ConfirmRequest`, `ConfirmDecision`, `Ack`)
+- `vigil hub --bind <addr> [--policy <path>] [--config <path>]` — start a fleet hub that aggregates events from multiple agent proxies, shows a live ratatui TUI (agent table + event stream + confirm overlay), evaluates hub-side policy, and records a fleet session to `~/.vigil/sessions/`
+- `vigil proxy --hub <addr>` — connect a proxy instance to a fleet hub; forwards all events and routes hub `ConfirmDecision` messages back into the local approval gate
+- `vigil run --hub <addr>` — same fleet client integration for agent-managed proxy mode
+- `vigil proxy --no-tui` — run proxy headless (no ratatui); useful in scripts and CI where a terminal is unavailable
+- **vigil-watch fs monitoring** — `vigil-watch` now uses the `notify` crate (v6, cross-platform) to watch the project directory for shell-executed file writes that are not captured by proxy tool calls; emits `Event::FsWrite` with byte size; de-duplicates against proxy-layer tool-call writes using a 2-second TTL window
+
+### Changed
+- Workspace version bumped to `2.0.0`; all crates follow workspace version
+
+### Notes
+- Hub policy enforcement is advisory at the hub side: `Deny` is logged, `Confirm` opens the hub TUI overlay and sends `ConfirmDecision` back to the agent (effective only when the agent-side policy also has a `Confirm` gate for the same tool), `LogOnly` is logged
+- `vigil-watch` fs monitoring requires a platform with inotify (Linux), FSEvents (macOS), or ReadDirectoryChangesW (Windows); the `macos_fsevent` feature is compiled in for macOS builds
+
+---
+
 ## [0.8.0] - 2026-05-13
 
 ### Added

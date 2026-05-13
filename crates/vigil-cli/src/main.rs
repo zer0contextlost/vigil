@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use vigil_core::{session::Session, store::SessionStore, AlertLabel, BashExfilFinding, CredentialTracker, Event, PolicyEngine, TimestampedEvent, BudgetEnforcer, BudgetStatus, BurnRateTracker, DriftDetector, LoopDetector, PluginHost, PluginContext, PluginDecision, scan_bash_for_exfil};
+use vigil_fleet;
 use vigil_mcp::run_mcp_server;
 use vigil_proxy::{Proxy, DenialRecord, PendingDenials};
 use vigil_tui::{App, BrowseAction};
@@ -93,6 +94,10 @@ enum Commands {
         /// Human-readable label for this session (shown in vigil sessions / browse)
         #[arg(long)]
         name: Option<String>,
+
+        /// Fleet hub address to forward events to (e.g. 127.0.0.1:9900)
+        #[arg(long)]
+        hub: Option<String>,
 
         /// Agent command and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -227,6 +232,29 @@ enum Commands {
         /// Human-readable label for this session
         #[arg(long)]
         name: Option<String>,
+
+        /// Fleet hub address to forward events to (e.g. 127.0.0.1:9900)
+        #[arg(long)]
+        hub: Option<String>,
+
+        /// Suppress the local TUI when reporting to a fleet hub
+        #[arg(long)]
+        no_tui: bool,
+    },
+
+    /// Start a fleet hub — aggregates events from multiple agent proxies into a single TUI
+    Hub {
+        /// Address to listen on (default: 127.0.0.1:9900)
+        #[arg(long, default_value = "127.0.0.1:9900")]
+        bind: String,
+
+        /// Policy configuration file (optional — hub can also enforce policy)
+        #[arg(long)]
+        policy: Option<PathBuf>,
+
+        /// vigil.toml configuration file
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Run a recorded session through a policy engine and report which events would be blocked.
@@ -712,6 +740,7 @@ async fn main() -> Result<()> {
             pii_watchlist,
             plugins,
             name,
+            hub,
             agent_and_args,
         }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
@@ -729,7 +758,7 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("Warning: {}", e),
                 }
             }
-            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host, name).await?;
+            run_agent_with_plugins(port, policy, log_file.as_ref(), agent_and_args, watchlist, vigil_config, config_path_str, plugin_host, name, hub).await?;
         }
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
@@ -828,7 +857,7 @@ async fn main() -> Result<()> {
         Some(Commands::Fork { session_id, prefix_events, agent_and_args }) => {
             run_fork(&session_id, prefix_events, agent_and_args).await?;
         }
-        Some(Commands::Proxy { port, policy, config, log_file, pii_watchlist, plugins, name }) => {
+        Some(Commands::Proxy { port, policy, config, log_file, pii_watchlist, plugins, name, hub, no_tui }) => {
             let watchlist = load_pii_watchlist(pii_watchlist.as_deref());
             let config_path_str = config.as_deref().map(|p| p.display().to_string());
             let vigil_config = config.as_deref()
@@ -843,7 +872,14 @@ async fn main() -> Result<()> {
                     Err(e) => eprintln!("Warning: {}", e),
                 }
             }
-            run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name, None).await?;
+            run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name, None, hub, no_tui).await?;
+        }
+        Some(Commands::Hub { bind, policy, config }) => {
+            let bind_addr: std::net::SocketAddr = bind.parse()
+                .context("invalid --bind address (expected host:port, e.g. 127.0.0.1:9900)")?;
+            let vigil_config = config.as_deref()
+                .and_then(|p| vigil_core::VigilConfig::load(p).ok());
+            vigil_fleet::run_hub(bind_addr, policy, vigil_config).await?;
         }
         Some(Commands::Replay { session_id, mock, on_miss, speed }) => {
             let speed = speed.max(0.01);
@@ -1484,6 +1520,8 @@ async fn run_replay_mock(session_id_str: &str, on_miss: fake_upstream::OnMiss) -
         PluginHost::new(),
         Some(session_name),
         Some(fake_url),
+        None,
+        false,
     ).await?;
 
     let h = hits.load(Ordering::Relaxed);
@@ -1651,7 +1689,7 @@ async fn run_agent(
     config: Option<vigil_core::VigilConfig>,
     config_path: Option<String>,
 ) -> Result<()> {
-    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None).await
+    run_agent_with_plugins(port, policy, log_file, agent_and_args, pii_watchlist, config, config_path, PluginHost::new(), None, None).await
 }
 
 /// Read a user-scoped (non-inherited) environment variable from the Windows registry.
@@ -1797,6 +1835,8 @@ pub async fn run_proxy_mode(
     plugins: PluginHost,
     session_name: Option<String>,
     upstream_override: Option<String>,
+    hub: Option<String>,
+    no_tui: bool,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -1848,6 +1888,32 @@ pub async fn run_proxy_mode(
     // resolver removes and clears pending_denials on approval, or leaves for timeout denial.
     let confirm_approvals: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Fleet hub integration — forward events and pipe confirm decisions back.
+    let fleet_tx_opt: Option<tokio::sync::mpsc::Sender<vigil_fleet::FleetMsg>> = if let Some(ref hub_addr_str) = hub {
+        match hub_addr_str.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let (ftx, mut frx) = vigil_fleet::spawn_fleet_client(addr, session_id, label.clone());
+                let dtx = decision_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = frx.recv().await {
+                        if let vigil_fleet::FleetMsg::ConfirmDecision { approval_id, approved } = msg {
+                            dtx.send((approval_id, approved)).await.ok();
+                        }
+                    }
+                });
+                eprintln!("[vigil] Reporting to fleet hub at {}", addr);
+                Some(ftx)
+            }
+            Err(e) => {
+                eprintln!("[vigil] Warning: invalid --hub address '{}': {} — running standalone", hub_addr_str, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -1964,12 +2030,18 @@ pub async fn run_proxy_mode(
         println!("Dashboard: http://127.0.0.1:{}", dashboard_port);
     }
 
+    let fleet_tx_filter = fleet_tx_opt;
     let filter_handle = tokio::spawn(async move {
         let mut loop_detector = LoopDetector::new(loop_threshold);
         let mut drift_detector = DriftDetector::with_config(drift_cfg_proxy);
         let mut cred_tracker = CredentialTracker::new();
         let mut sub_agent_depth: u32 = 0;
+
         while let Some(event) = raw_rx.recv().await {
+            // Forward raw events to fleet hub.
+            if let Some(ref ftx) = fleet_tx_filter {
+                ftx.try_send(vigil_fleet::fleet_event(session_id, event.clone())).ok();
+            }
             if let Event::FsRead { path, .. } = &event.event {
                 if let Ok(content) = std::fs::read_to_string(path) {
                     cred_tracker.ingest_file(&content, path);
@@ -2103,16 +2175,28 @@ pub async fn run_proxy_mode(
                                 .insert(approval_id, id.clone());
                             // Notify TUI.
                             eprintln!("[POLICY CONFIRM] {} — waiting for human approval ({timeout_secs}s)", policy_name, timeout_secs = confirm_timeout_secs_proxy);
-                            filtered_tx.send(TimestampedEvent::new(Event::ConfirmApprovalRequired {
+                            let confirm_event = TimestampedEvent::new(Event::ConfirmApprovalRequired {
                                 approval_id,
                                 tool_name: tool_name.clone(),
                                 policy_name: policy_name.clone(),
                                 timeout_secs: confirm_timeout_secs_proxy,
                                 session_id: *session_id,
-                            })).ok();
+                            });
+                            filtered_tx.send(confirm_event.clone()).ok();
+                            // If reporting to a fleet hub, delegate the confirm prompt there.
+                            // Use .send().await (not try_send) — control-plane messages must not drop.
+                            if let Some(ref ftx) = fleet_tx_filter {
+                                ftx.send(vigil_fleet::FleetMsg::ConfirmRequest {
+                                    agent_id: *session_id,
+                                    approval_id,
+                                    tool_name: tool_name.clone(),
+                                    policy_name: policy_name.clone(),
+                                    timeout_secs: confirm_timeout_secs_proxy,
+                                }).await.ok();
+                            }
                             // Spawn timeout task — auto-denies if no decision arrives in time.
                             let ca = confirm_approvals_filter.clone();
-                            let ftx = filtered_tx.clone();
+                            let ftx2 = filtered_tx.clone();
                             let sid = *session_id;
                             let tout = confirm_timeout_secs_proxy;
                             let pn = policy_name.clone();
@@ -2122,7 +2206,7 @@ pub async fn run_proxy_mode(
                                 let still_pending = ca.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id).is_some();
                                 if still_pending {
                                     eprintln!("[POLICY CONFIRM] {} — timed out after {}s, denying", pn, tout);
-                                    ftx.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
+                                    ftx2.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
                                         approval_id,
                                         approved: false,
                                         session_id: sid,
@@ -2140,6 +2224,9 @@ pub async fn run_proxy_mode(
                             correlation_id: None, duration_ms: None, is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
                         filtered_tx.send(blocked).ok();
                     }
                 }
@@ -2164,6 +2251,9 @@ pub async fn run_proxy_mode(
                             correlation_id: None, duration_ms: None, is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
                         filtered_tx.send(blocked).ok();
                     }
                 }
@@ -2202,11 +2292,17 @@ pub async fn run_proxy_mode(
         }
     });
 
-    let mut app = App::new(session);
-    app.store = store;
-    app.config_path = config_path;
-    app.decision_tx = Some(decision_tx);
-    vigil_tui::run_tui(app, tui_rx).await?;
+    if no_tui {
+        // Fleet mode without local TUI — wait for Ctrl+C.
+        eprintln!("[vigil] Running headless (--no-tui). Press Ctrl+C to stop.");
+        tokio::signal::ctrl_c().await.ok();
+    } else {
+        let mut app = App::new(session);
+        app.store = store;
+        app.config_path = config_path;
+        app.decision_tx = Some(decision_tx);
+        vigil_tui::run_tui(app, tui_rx).await?;
+    }
 
     proxy_handle.abort();
     filter_handle.abort();
@@ -2226,6 +2322,7 @@ pub async fn run_agent_with_plugins(
     config_path: Option<String>,
     plugins: PluginHost,
     session_name: Option<String>,
+    hub: Option<String>,
 ) -> Result<()> {
     init_logging(log_file);
 
@@ -2335,6 +2432,31 @@ pub async fn run_agent_with_plugins(
     let pending_denials: PendingDenials = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let confirm_approvals: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, String>>> =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let fleet_tx_agent: Option<tokio::sync::mpsc::Sender<vigil_fleet::FleetMsg>> = if let Some(ref hub_addr_str) = hub {
+        match hub_addr_str.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let (ftx, mut frx) = vigil_fleet::spawn_fleet_client(addr, session_id, agent_name.clone());
+                let dtx = decision_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = frx.recv().await {
+                        if let vigil_fleet::FleetMsg::ConfirmDecision { approval_id, approved } = msg {
+                            dtx.send((approval_id, approved)).await.ok();
+                        }
+                    }
+                });
+                eprintln!("[vigil] Reporting to fleet hub at {}", addr);
+                Some(ftx)
+            }
+            Err(e) => {
+                eprintln!("[vigil] Warning: invalid --hub address '{}': {} — running standalone", hub_addr_str, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let proxy_config = vigil_proxy::ProxyConfig {
         port,
         ca_cert_path: None,
@@ -2586,6 +2708,7 @@ pub async fn run_agent_with_plugins(
         println!("Dashboard: http://127.0.0.1:{}", dashboard_port);
     }
 
+    let fleet_tx_agent_filter = fleet_tx_agent;
     let filter_handle = tokio::spawn(async move {
         let mut session_tokens = 0u32;
         let mut session_cost = 0f64;
@@ -2596,6 +2719,10 @@ pub async fn run_agent_with_plugins(
         let mut cred_tracker = CredentialTracker::new();
         let mut sub_agent_depth: u32 = 0;
         while let Some(event) = raw_rx.recv().await {
+            // Forward raw events to fleet hub.
+            if let Some(ref ftx) = fleet_tx_agent_filter {
+                ftx.try_send(vigil_fleet::fleet_event(session_id, event.clone())).ok();
+            }
             // Tool timeout tracking: arm on ToolCall, disarm on LlmRequest
             if let Event::ToolCall { tool_name, .. } = &event.event {
                 if let Ok(mut g) = last_tool_call_filter.lock() {
@@ -2931,15 +3058,25 @@ pub async fn run_agent_with_plugins(
                             confirm_approvals_filter.lock().unwrap_or_else(|e| e.into_inner())
                                 .insert(approval_id, id.clone());
                             eprintln!("[POLICY CONFIRM] {} — waiting for human approval ({timeout_secs}s)", policy_name, timeout_secs = confirm_timeout_secs_agent);
-                            filtered_tx.send(TimestampedEvent::new(Event::ConfirmApprovalRequired {
+                            let confirm_ev = TimestampedEvent::new(Event::ConfirmApprovalRequired {
                                 approval_id,
                                 tool_name: tool_name.clone(),
                                 policy_name: policy_name.clone(),
                                 timeout_secs: confirm_timeout_secs_agent,
                                 session_id: *session_id,
-                            })).ok();
+                            });
+                            filtered_tx.send(confirm_ev).ok();
+                            if let Some(ref ftx) = fleet_tx_agent_filter {
+                                ftx.send(vigil_fleet::FleetMsg::ConfirmRequest {
+                                    agent_id: *session_id,
+                                    approval_id,
+                                    tool_name: tool_name.clone(),
+                                    policy_name: policy_name.clone(),
+                                    timeout_secs: confirm_timeout_secs_agent,
+                                }).await.ok();
+                            }
                             let ca = confirm_approvals_filter.clone();
-                            let ftx = filtered_tx.clone();
+                            let ftx2 = filtered_tx.clone();
                             let sid = *session_id;
                             let tout = confirm_timeout_secs_agent;
                             let pn = policy_name.clone();
@@ -2948,7 +3085,7 @@ pub async fn run_agent_with_plugins(
                                 let still_pending = ca.lock().unwrap_or_else(|e| e.into_inner()).remove(&approval_id).is_some();
                                 if still_pending {
                                     eprintln!("[POLICY CONFIRM] {} — timed out after {}s, denying", pn, tout);
-                                    ftx.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
+                                    ftx2.send(TimestampedEvent::new(Event::ConfirmApprovalDecision {
                                         approval_id,
                                         approved: false,
                                         session_id: sid,
@@ -2968,6 +3105,9 @@ pub async fn run_agent_with_plugins(
                             correlation_id: None, duration_ms: None, is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_agent_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
                         filtered_tx.send(blocked).ok();
                     }
                 }
@@ -3008,6 +3148,9 @@ pub async fn run_agent_with_plugins(
                             is_error: false,
                         });
                         plugin_host_filter.dispatch_event(&ctx, &blocked).await;
+                        if let Some(ref ftx) = fleet_tx_agent_filter {
+                            ftx.try_send(vigil_fleet::fleet_event(*session_id, blocked.clone())).ok();
+                        }
                         filtered_tx.send(blocked).ok();
                     }
                 }
