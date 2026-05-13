@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.8.0] - 2026-05-13
+
+### Added
+- `cache_efficiency` hygiene signal (signal i) in `vigil report` scorecard — grades cache hit rate (cache_read / total input tokens): GOOD ≥60%, WATCH 10–60%, FLAG <10%; only emitted for sessions with ≥3 turns; scorecard version bumped to 2
+- `total_cache_read_tokens` and `total_cache_creation_tokens` fields added to `SessionSummary`, populated from `SessionMeta` in `list_all()` and from `Session` in `to_summary()`
+- `--speed <f64>` flag on `vigil browse` and `vigil replay` — multiplier applied to inter-event delay (default 1.0; 2.0 = twice as fast, 0.5 = half speed); floor-clamped to 0.01 to prevent divide-by-zero
+
+---
+
 ## [0.7.9] - 2026-05-13
 
 ### Added

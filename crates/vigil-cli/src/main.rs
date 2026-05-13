@@ -112,7 +112,11 @@ enum Commands {
     Sessions,
 
     /// Browse past sessions in an interactive TUI
-    Browse,
+    Browse {
+        /// Replay speed multiplier (2.0 = twice as fast, 0.5 = half speed)
+        #[arg(long, default_value = "1.0")]
+        speed: f64,
+    },
 
     /// Tag a session with a human-readable name
     Tag {
@@ -139,6 +143,9 @@ enum Commands {
         /// What to do on a cache miss in mock mode: error (default) or stub
         #[arg(long, default_value = "error")]
         on_miss: String,
+        /// Replay speed multiplier (2.0 = twice as fast, 0.5 = half speed)
+        #[arg(long, default_value = "1.0")]
+        speed: f64,
     },
 
     /// Verify hash chain integrity of a recorded session
@@ -697,7 +704,8 @@ async fn main() -> Result<()> {
         Some(Commands::Init { output, force }) => {
             vigil_init(output, force).await?;
         }
-        Some(Commands::Browse) => {
+        Some(Commands::Browse { speed }) => {
+            let speed = speed.max(0.01);
             loop {
                 let summaries = Session::list_all()?;
                 match vigil_tui::run_session_browser(summaries).await? {
@@ -710,7 +718,7 @@ async fn main() -> Result<()> {
                                 if i > 0 {
                                     let prev_ts = envelopes_clone[i - 1].timestamp;
                                     let delta = env.timestamp.signed_duration_since(prev_ts);
-                                    let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                                    let ms = (delta.num_milliseconds().max(0) as f64 / speed).min(500.0) as u64;
                                     if ms > 0 { tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await; }
                                 }
                                 if tx.send(env.clone()).is_err() { break; }
@@ -807,7 +815,8 @@ async fn main() -> Result<()> {
             }
             run_proxy_mode(port, policy, log_file.as_ref(), watchlist, vigil_config, config_path_str, plugin_host, name, None).await?;
         }
-        Some(Commands::Replay { session_id, mock, on_miss }) => {
+        Some(Commands::Replay { session_id, mock, on_miss, speed }) => {
+            let speed = speed.max(0.01);
             if mock {
                 let on_miss_mode = match on_miss.to_ascii_lowercase().as_str() {
                     "stub" => fake_upstream::OnMiss::Stub,
@@ -828,7 +837,7 @@ async fn main() -> Result<()> {
                         if i > 0 {
                             let prev_ts = envelopes_clone[i - 1].timestamp;
                             let delta = event.timestamp.signed_duration_since(prev_ts);
-                            let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                            let ms = (delta.num_milliseconds().max(0) as f64 / speed).min(500.0) as u64;
                             if ms > 0 {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
                             }
@@ -857,7 +866,7 @@ async fn main() -> Result<()> {
                         if i > 0 {
                             let prev_ts = events_clone[i - 1].timestamp;
                             let delta = event.timestamp.signed_duration_since(prev_ts);
-                            let ms = delta.num_milliseconds().max(0).min(500) as u64;
+                            let ms = (delta.num_milliseconds().max(0) as f64 / speed).min(500.0) as u64;
                             if ms > 0 {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
                             }
