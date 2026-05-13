@@ -390,7 +390,7 @@ fn next_turn_for_session(session_id: Uuid) -> u32 {
     use std::sync::OnceLock;
     static COUNTERS: OnceLock<Mutex<HashMap<Uuid, u32>>> = OnceLock::new();
     let map = COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap();
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
     let count = guard.entry(session_id).or_insert(0);
     *count += 1;
     *count
@@ -873,7 +873,7 @@ async fn stream_sse_response(
                 let approval_id = Uuid::new_v4();
                 let (approval_tx, approval_rx) = oneshot::channel::<bool>();
                 {
-                    let mut map = pending_approvals.lock().unwrap();
+                    let mut map = pending_approvals.lock().unwrap_or_else(|e| e.into_inner());
                     map.insert(approval_id, approval_tx);
                 }
                 // Use send (not try_send) so the approval request is guaranteed to reach the TUI.
@@ -1425,7 +1425,7 @@ fn emit_pii_alert_if_found(
 /// The rewritten content tells the LLM the tool was denied by policy so it can
 /// continue on safe work rather than waiting for a result that will never arrive.
 fn rewrite_denied_tool_results(body: bytes::Bytes, pending_denials: &PendingDenials) -> bytes::Bytes {
-    let mut denials = pending_denials.lock().unwrap();
+    let mut denials = pending_denials.lock().unwrap_or_else(|e| e.into_inner());
     if denials.is_empty() {
         return body;
     }

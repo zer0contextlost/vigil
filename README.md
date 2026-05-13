@@ -1,6 +1,6 @@
 # vigil
 
-**v0.7.7** — Runtime observability and policy enforcement for AI coding agents.
+**v0.8.0** — Runtime observability and policy enforcement for AI coding agents.
 
 vigil intercepts every LLM API call your AI coding agent makes, shows a live ratatui TUI, serves a browser dashboard, records tamper-evident NDJSON session files, and enforces budget, policy, and safety rules in real time. Works with Claude Code, Cursor, Aider, Codex, Gemini CLI, and any agent that respects `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, or `GOOGLE_GEMINI_BASE_URL`.
 
@@ -65,13 +65,14 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 | `vigil ps` | Show all currently active vigil sessions on this machine |
 | `vigil status [--recent N]` | One-line-per-session status dump (live + last N completed); scriptable |
 | `vigil sessions` | Print a text table of all recorded sessions (ID, name, agent, cost, tokens, violations) |
-| `vigil browse` | Interactive TUI session browser (arrow keys / j·k, Enter to replay, d to delete) |
-| `vigil replay <session-id>` | Replay a session in the TUI |
+| `vigil browse [--speed N]` | Interactive TUI session browser (arrow keys / j·k, Enter to replay, d to delete) |
+| `vigil replay <session-id> [--speed N]` | Replay a session in the TUI; `--speed 2.0` plays back at 2× real time |
 | `vigil replay <session-id> --mock [--on-miss error\|stub]` | Replay against a fake upstream — no real API calls, cost-free regression testing |
 | `vigil fork <session-id> [--prefix-events N] -- <agent>` | Replay a session prefix, then continue live |
 | `vigil tag <session-id> <name>` | Assign a human-readable label to a session |
 | `vigil clear [-y]` | Delete all session files (prompts for confirmation unless `-y`) |
 | `vigil prune [--older-than N]` | Delete session files older than N days (default 30) |
+| `vigil repair-meta [--dry-run]` | Recompute `.meta.json` stats from NDJSON event logs; use after upgrades to backfill historical sessions |
 | `vigil export <session-id> [--output FILE]` | Export session to NDJSON with PII redacted |
 | `vigil export --all [--output-dir DIR]` | Export all sessions to a directory |
 | `vigil diff <session-a> <session-b> [--brief]` | Compare tool-call sequences of two sessions |
@@ -81,7 +82,7 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 
 | Command | Description |
 |---------|-------------|
-| `vigil report <id> [--json] [--html] [--html-fragment]` | Generate session audit report with hygiene scorecard. `<id>` accepts full UUID, prefix, or session name |
+| `vigil report <id> [--json] [--html] [--html-fragment]` | Generate session audit report with hygiene scorecard (9 signals, scorecard_version 2). `<id>` accepts full UUID, prefix, or session name |
 | `vigil verify <id>` | Verify hash chain and ed25519 signature; exits 0 (PASS) or 1 (FAIL) |
 | `vigil audit <id>` | Hash chain audit: ULID order, meta count, chain integrity |
 | `vigil diff <id-a> <id-b> [--brief]` | Compare tool-call sequences of two sessions |
@@ -100,7 +101,8 @@ Traffic interception works by setting `ANTHROPIC_BASE_URL=http://127.0.0.1:8877`
 
 | Command | Description |
 |---------|-------------|
-| `vigil init [--output FILE] [--force]` | Initialize a policy file for this project; exits 1 if file already exists without `--force` |
+| `vigil init [--output FILE] [--force]` | Initialize a policy file and `vigil.toml` for this project; exits 1 if files already exist without `--force` |
+| `vigil pricing [--write [--force]]` | Show the current effective pricing table. `--write` dumps defaults to `~/.vigil/pricing.toml` |
 | `vigil mcp` | Start vigil as an MCP server (JSON-RPC over stdio) |
 
 ## vigil.toml reference
@@ -325,7 +327,7 @@ The `vigil-mcp-shim` binary is also available as a transparent proxy for wrappin
 
 ## Pricing
 
-Model pricing is loaded from `~/.vigil/pricing.toml` if present, otherwise built-in defaults apply:
+Model pricing is loaded from `~/.vigil/pricing.toml` if present, otherwise built-in defaults apply. Use `vigil pricing` to inspect the active table and `vigil pricing --write` to seed the file with defaults for local overrides.
 
 ```toml
 [[model]]

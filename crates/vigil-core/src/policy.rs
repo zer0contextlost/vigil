@@ -339,3 +339,163 @@ impl PolicyEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn tool_call(name: &str) -> Event {
+        Event::ToolCall {
+            agent: "test".to_string(),
+            tool_name: name.to_string(),
+            tool_use_id: None,
+            correlation_id: None,
+            input: Default::default(),
+            session_id: Uuid::new_v4(),
+        }
+    }
+
+    fn fs_write(path: &str) -> Event {
+        Event::FsWrite {
+            path: path.to_string(),
+            bytes: 0,
+            lines_added: 0,
+            lines_removed: 0,
+            hunk_count: 0,
+            session_id: Uuid::new_v4(),
+        }
+    }
+
+    fn make_engine(policies: Vec<Policy>) -> PolicyEngine {
+        PolicyEngine::new(PolicyConfig { policies }).expect("valid engine")
+    }
+
+    #[test]
+    fn test_empty_engine_allows_all() {
+        let e = PolicyEngine::default();
+        let decision = e.evaluate(&tool_call("Bash"), 0);
+        assert!(matches!(decision.action, PolicyAction::Allow));
+    }
+
+    #[test]
+    fn test_tool_call_deny() {
+        let e = make_engine(vec![Policy {
+            name: "no-bash".into(),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::ToolCall { tool_name_pattern: "Bash".into() },
+        }]);
+        let d = e.evaluate(&tool_call("Bash"), 0);
+        assert!(matches!(d.action, PolicyAction::Deny));
+        assert_eq!(d.policy_name.as_deref(), Some("no-bash"));
+    }
+
+    #[test]
+    fn test_tool_call_allows_non_matching() {
+        let e = make_engine(vec![Policy {
+            name: "no-bash".into(),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::ToolCall { tool_name_pattern: "Bash".into() },
+        }]);
+        let d = e.evaluate(&tool_call("Read"), 0);
+        assert!(matches!(d.action, PolicyAction::Allow));
+    }
+
+    #[test]
+    fn test_tool_call_case_insensitive() {
+        let e = make_engine(vec![Policy {
+            name: "no-bash".into(),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::ToolCall { tool_name_pattern: "bash".into() },
+        }]);
+        let d = e.evaluate(&tool_call("Bash"), 0);
+        assert!(matches!(d.action, PolicyAction::Deny));
+    }
+
+    #[test]
+    fn test_first_match_wins() {
+        let e = make_engine(vec![
+            Policy {
+                name: "allow-bash".into(),
+                action: PolicyAction::Allow,
+                matcher: PolicyMatcher::ToolCall { tool_name_pattern: "Bash".into() },
+            },
+            Policy {
+                name: "deny-bash".into(),
+                action: PolicyAction::Deny,
+                matcher: PolicyMatcher::ToolCall { tool_name_pattern: "Bash".into() },
+            },
+        ]);
+        let d = e.evaluate(&tool_call("Bash"), 0);
+        assert!(matches!(d.action, PolicyAction::Allow));
+        assert_eq!(d.policy_name.as_deref(), Some("allow-bash"));
+    }
+
+    #[test]
+    fn test_fs_path_deny() {
+        let e = make_engine(vec![Policy {
+            name: "no-env".into(),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::FsPath { path_pattern: ".env".into() },
+        }]);
+        let d = e.evaluate(&fs_write("/project/.env"), 0);
+        assert!(matches!(d.action, PolicyAction::Deny));
+    }
+
+    #[test]
+    fn test_fs_write_outside_root() {
+        let e = make_engine(vec![Policy {
+            name: "confine".into(),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::FsWriteOutside { root: "/project".into() },
+        }]);
+        let d_outside = e.evaluate(&fs_write("/tmp/evil"), 0);
+        assert!(matches!(d_outside.action, PolicyAction::Deny));
+        let d_inside = e.evaluate(&fs_write("/project/src/main.rs"), 0);
+        assert!(matches!(d_inside.action, PolicyAction::Allow));
+    }
+
+    #[test]
+    fn test_token_budget() {
+        let e = make_engine(vec![Policy {
+            name: "token-limit".into(),
+            action: PolicyAction::LogOnly,
+            matcher: PolicyMatcher::TokenBudget { max_tokens: 1000 },
+        }]);
+        assert!(matches!(e.evaluate(&tool_call("Read"), 999).action, PolicyAction::Allow));
+        assert!(matches!(e.evaluate(&tool_call("Read"), 1000).action, PolicyAction::LogOnly));
+        assert!(matches!(e.evaluate(&tool_call("Read"), 1001).action, PolicyAction::LogOnly));
+    }
+
+    #[test]
+    fn test_tool_call_input_match() {
+        let e = make_engine(vec![Policy {
+            name: "no-rm-rf".into(),
+            action: PolicyAction::Deny,
+            matcher: PolicyMatcher::ToolCallInput {
+                tool_name_pattern: "Bash".into(),
+                input_field: "command".into(),
+                value_pattern: "rm -rf".into(),
+            },
+        }]);
+        let dangerous = Event::ToolCall {
+            agent: "test".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_use_id: None,
+            correlation_id: None,
+            input: json!({"command": "rm -rf /"}),
+            session_id: Uuid::new_v4(),
+        };
+        let safe = Event::ToolCall {
+            agent: "test".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_use_id: None,
+            correlation_id: None,
+            input: json!({"command": "ls -la"}),
+            session_id: Uuid::new_v4(),
+        };
+        assert!(matches!(e.evaluate(&dangerous, 0).action, PolicyAction::Deny));
+        assert!(matches!(e.evaluate(&safe, 0).action, PolicyAction::Allow));
+    }
+}

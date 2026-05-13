@@ -46,6 +46,10 @@ pub use async_trait::async_trait;
 
 /// ABI version. Bumped whenever `VigilPlugin`, `PluginContext`, `PluginDecision`,
 /// `AlertLabel`, `Envelope`, or the FFI contract changes in a breaking way.
+///
+/// **v4 is frozen for the 1.0 release.** Do NOT increment this constant without
+/// a corresponding bump in `vigil-core/src/plugin.rs` and a CHANGELOG entry.
+/// Incrementing ABI_VERSION invalidates all existing compiled plugins.
 pub const ABI_VERSION: u32 = 4;
 
 /// The rustc version vigil-plugin was compiled with, baked in at build time.

@@ -71,3 +71,87 @@ impl BudgetEnforcer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget(max_cost: Option<f64>, max_tokens: Option<u32>) -> BudgetEnforcer {
+        BudgetEnforcer::new(BudgetSection {
+            max_cost_usd: max_cost,
+            max_tokens: max_tokens,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_ok_when_no_limits() {
+        let e = budget(None, None);
+        assert_eq!(e.check(999.0, 999_999), BudgetStatus::Ok);
+    }
+
+    #[test]
+    fn test_cost_exceeded() {
+        let e = budget(Some(5.0), None);
+        assert_eq!(
+            e.check(5.01, 0),
+            BudgetStatus::CostExceeded { limit: 5.0, actual: 5.01 }
+        );
+    }
+
+    #[test]
+    fn test_cost_at_limit_is_ok() {
+        let e = budget(Some(5.0), None);
+        assert_eq!(e.check(5.0, 0), BudgetStatus::Ok);
+    }
+
+    #[test]
+    fn test_tokens_exceeded() {
+        let e = budget(None, Some(1000));
+        assert_eq!(
+            e.check(0.0, 1001),
+            BudgetStatus::TokensExceeded { limit: 1000, actual: 1001 }
+        );
+    }
+
+    #[test]
+    fn test_tokens_at_limit_is_ok() {
+        let e = budget(None, Some(1000));
+        assert_eq!(e.check(0.0, 1000), BudgetStatus::Ok);
+    }
+
+    #[test]
+    fn test_cost_checked_before_tokens() {
+        let e = budget(Some(1.0), Some(100));
+        // Both limits exceeded — cost fires first
+        assert_eq!(
+            e.check(2.0, 200),
+            BudgetStatus::CostExceeded { limit: 1.0, actual: 2.0 }
+        );
+    }
+
+    #[test]
+    fn test_malformed_allowed_hours_passes() {
+        let mut e = BudgetEnforcer::new(BudgetSection {
+            allowed_hours: Some("bad-format".to_string()),
+            ..Default::default()
+        });
+        // Malformed window → allow always
+        assert_eq!(e.check(0.0, 0), BudgetStatus::Ok);
+        // Restore fields to avoid unused-mut warning
+        e.budget.allowed_hours = None;
+        assert_eq!(e.check(0.0, 0), BudgetStatus::Ok);
+    }
+
+    #[test]
+    fn test_always_allowed_window() {
+        // "00:00-23:59" spans the entire day — should always be in window
+        let e = BudgetEnforcer::new(BudgetSection {
+            allowed_hours: Some("00:00-23:59".to_string()),
+            max_cost_usd: None,
+            max_tokens: None,
+            ..Default::default()
+        });
+        assert_eq!(e.check(0.0, 0), BudgetStatus::Ok);
+    }
+}
